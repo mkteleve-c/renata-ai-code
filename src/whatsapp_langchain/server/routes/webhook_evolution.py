@@ -28,8 +28,14 @@ O nome do evento varia entre versões da Evolution (`messages.upsert`,
 normalizados antes da comparação.
 
 Só vira linha na fila o que o agente consegue processar: evento sem texto
-nem mídia utilizável (reação, enquete, mensagem apagada) é descartado com
-200. Sem esse corte o agente seria invocado com conteúdo vazio.
+nem mídia (reação, enquete, mensagem apagada, protocolo) é descartado com
+200, antes do gate. Sem esse corte o agente seria invocado com conteúdo
+vazio e um emoji criaria lead novo em `leads_crm`.
+
+Mídia sem `url` NÃO é descarte: a URL do payload aponta para conteúdo
+cifrado e `download_media` nem a lê neste canal — quem baixa é a
+`provider_message_key`. Basta `media_type` para a mensagem entrar na fila
+como mídia.
 
 Reentrega é esperada: a Evolution repete o POST em timeout ou resposta
 >= 400. `enqueue_or_buffer` deduplica por (canal, message_id) e a rota
@@ -175,10 +181,38 @@ async def _processar_mensagem(
     agent: str,
     instance: Any,
 ) -> dict[str, Any]:
-    """Roda gate, rate limit e enfileiramento para uma mensagem do payload."""
+    """Roda gate, rate limit e enfileiramento para uma mensagem do payload.
+
+    Ordem: extração e guard de conteúdo → rate limit → gate → fila. Tudo que
+    não vai virar linha na fila é cortado ANTES do gate, que escreve em
+    leads_crm. `fromMe` é a única exceção — ele nunca é aceito pelo gate, mas
+    precisa chegar lá para desligar o agente (handover do atendente).
+    """
     bruto = data.get("key")
     key: dict[str, Any] = bruto if isinstance(bruto, dict) else {}
     message_id = key.get("id") if isinstance(key.get("id"), str) else None
+    eh_from_me = key.get("fromMe") is True
+
+    texto, media_url, media_type = _extrair_conteudo(data)
+
+    # Nem texto nem mídia: reação, enquete, mensagem apagada, protocolo.
+    # Enfileirar isso invocaria o agente com conteúdo vazio. O corte é por
+    # `media_type` e não por `media_url` porque na Evolution a URL aponta
+    # para conteúdo cifrado e o download é feito pela key — mídia sem URL é
+    # normal aqui, e descartá-la perderia áudio de lead em silêncio.
+    #
+    # Antes do gate: uma reação de lead que passasse por ele renovaria
+    # last_interaction_at e zeraria followup_count, criando ou "reengajando"
+    # um lead por um emoji que o agente nunca vê.
+    if not texto and not media_type and not eh_from_me:
+        logger.info(
+            "evolution_conteudo_nao_suportado",
+            phone=key.get("remoteJid"),
+            message_type=data.get("messageType"),
+            message_key_id=message_id,
+            instance=instance,
+        )
+        return {"status": "ignorado", "motivo": "conteudo_nao_suportado"}
 
     # Rate limit antes do gate: o gate escreve (renova last_interaction_at,
     # zera followup_count) e mensagem barrada aqui nunca chega ao agente —
@@ -191,7 +225,7 @@ async def _processar_mensagem(
     # precisa vê-lo para desligar o agente. Barrar aqui deixaria o bot
     # respondendo por cima do atendente.
     canonico_previo = resolver_telefone(key)
-    if canonico_previo and key.get("fromMe") is not True:
+    if canonico_previo and not eh_from_me:
         try:
             await check_rate_limit(to_e164(canonico_previo))
         except HTTPException:
@@ -225,19 +259,6 @@ async def _processar_mensagem(
         raise RuntimeError("gate aceitou mensagem sem telefone canônico")
 
     phone_e164 = to_e164(resultado.canonico)
-    texto, media_url, media_type = _extrair_conteudo(data)
-
-    # Nem texto nem mídia baixável: reação, enquete, mensagem apagada,
-    # mídia sem URL. Enfileirar isso invocaria o agente com conteúdo vazio.
-    if not texto and not media_url:
-        logger.info(
-            "evolution_conteudo_nao_suportado",
-            phone=phone_e164,
-            message_type=data.get("messageType"),
-            message_key_id=message_id,
-            instance=instance,
-        )
-        return {"status": "ignorado", "motivo": "conteudo_nao_suportado"}
 
     enfileirado = await enqueue_or_buffer(
         pool=pool,

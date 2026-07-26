@@ -83,8 +83,10 @@ async def enqueue_or_buffer(
     """Insere mensagem na fila ou agrupa com mensagem pendente (debounce).
 
     Regras de debounce (Fase 3):
-    - Debounce somente para texto (media_url IS NULL).
-    - Mensagem com mídia não faz debounce (entrada imediata).
+    - Debounce somente para texto (sem media_url e sem media_type).
+    - Mensagem com mídia não faz debounce (entrada imediata). Basta
+      `media_type` para a mensagem contar como mídia — a Evolution baixa
+      pela `provider_message_key` e não depende da URL.
     - Antes de inserir mídia, flush de texto pendente do mesmo phone+agent
       para que o worker processe o texto ANTES da mídia (ordenação por created_at).
     - Concorrência protegida por pg_advisory_xact_lock(hash(phone+agent)).
@@ -118,7 +120,12 @@ async def enqueue_or_buffer(
         EnqueueResult com message_id, se foi buffered e se era duplicata.
     """
     thread_id = f"{phone_number}:{agent_id}"
-    has_media = media_url is not None
+    # `media_type` sozinho já caracteriza mídia: na Evolution a URL do payload
+    # aponta para conteúdo cifrado e o download é feito pela
+    # `provider_message_key`, então mídia sem URL é normal, não defeito. Se
+    # essas mensagens caíssem no branch de texto, gravariam media_url e
+    # media_type nulos e o worker nunca as trataria como mídia.
+    has_media = media_url is not None or media_type is not None
     # "" é ausência de id disfarçada (a uazapi manda string vazia quando o
     # payload não traz messageid) e não pode participar da deduplicação.
     message_id = message_id or None
