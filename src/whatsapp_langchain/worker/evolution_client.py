@@ -2,7 +2,9 @@
 
 A instância desta conta roda integração WHATSAPP-BUSINESS — por baixo é a
 Meta Cloud API oficial, com a Evolution fazendo de proxy. A superfície REST
-é a mesma da integração Baileys.
+é a mesma da integração Baileys. Por rodar sobre a Cloud API oficial, o teto
+de 4096 caracteres por mensagem de texto é confirmado (não uma estimativa
+prática como na uazapi) — mensagens acima disso são quebradas em partes.
 
 O parâmetro `delay` do sendText é nativo e em milissegundos: ele mostra
 "digitando…" durante a espera. Por isso send_typing é no-op — chamar um
@@ -15,14 +17,21 @@ Suporta `delivery_mode="mock"` para simular envio sem consumir a API real.
 """
 
 import base64
+import binascii
 from typing import Any
 
 import httpx
 import structlog
 
+from whatsapp_langchain.worker.uazapi_client import split_message_body
+
 logger = structlog.get_logger()
 
 TIMEOUT = httpx.Timeout(30.0)
+
+# A integração WHATSAPP-BUSINESS é proxy direto da Cloud API oficial da Meta,
+# que tem teto confirmado de 4096 caracteres por mensagem de texto.
+EVOLUTION_TEXT_BODY_LIMIT = 4096
 
 
 class EvolutionSendError(Exception):
@@ -79,6 +88,11 @@ class EvolutionClient:
     ) -> str | None:
         """Envia mensagem de texto via /message/sendText. Retorna key.id.
 
+        Mensagens acima de `EVOLUTION_TEXT_BODY_LIMIT` são quebradas em
+        partes e enviadas em sequência, preservando a ordem. O retorno é o
+        `id` da última parte enviada — mesmo precedente do `last_id` em
+        `uazapi_client.send_message`.
+
         `token` é ignorado — a Evolution autentica pela apikey da instância,
         não por um token entregue por mensagem como a uazapi. O parâmetro
         existe só para manter a assinatura compatível com os outros clientes
@@ -88,33 +102,84 @@ class EvolutionClient:
             logger.info("evolution_mock_send", to=to, body=body[:80])
             return None
 
-        payload: dict[str, Any] = {"number": to.lstrip("+"), "text": body}
-        if delay_ms:
-            payload["delay"] = delay_ms
+        chunks = split_message_body(body, limit=EVOLUTION_TEXT_BODY_LIMIT)
+        chunk_count = len(chunks)
+
+        if chunk_count > 1:
+            logger.info(
+                "evolution_message_chunked",
+                to=to,
+                original_length=len(body),
+                chunk_count=chunk_count,
+            )
+
+        normalized_to = to.lstrip("+")
+        last_id: str | None = None
 
         async with httpx.AsyncClient(
             transport=self._transport, timeout=TIMEOUT
         ) as client:
-            response = await client.post(
-                f"{self.base_url}/message/sendText/{self.instance}",
-                headers=self._headers(),
-                json=payload,
-            )
+            for idx, chunk in enumerate(chunks, start=1):
+                payload: dict[str, Any] = {"number": normalized_to, "text": chunk}
+                if delay_ms:
+                    payload["delay"] = delay_ms
 
-        if response.status_code >= 400:
-            detail = response.text[:300]
-            logger.error(
-                "evolution_send_failed",
-                to=payload["number"],
-                status_code=response.status_code,
-                detail=detail,
-            )
-            raise EvolutionSendError(response.status_code, detail)
+                response = await client.post(
+                    f"{self.base_url}/message/sendText/{self.instance}",
+                    headers=self._headers(),
+                    json=payload,
+                )
 
-        dados = response.json()
-        msg_id = (dados.get("key") or {}).get("id")
-        logger.info("evolution_message_sent", to=payload["number"], id=msg_id)
-        return msg_id
+                if response.status_code >= 400:
+                    detail = response.text[:500]
+                    logger.error(
+                        "evolution_send_failed",
+                        to=normalized_to,
+                        status_code=response.status_code,
+                        detail=detail,
+                        chunk_index=idx,
+                        chunk_count=chunk_count,
+                    )
+                    raise EvolutionSendError(response.status_code, detail)
+
+                dados = _safe_json(response)
+                if not isinstance(dados, dict):
+                    detail = (
+                        f"corpo inesperado (não é objeto JSON): {response.text[:500]!r}"
+                    )
+                    logger.error(
+                        "evolution_send_invalid_response",
+                        to=normalized_to,
+                        status_code=response.status_code,
+                        detail=detail,
+                        chunk_index=idx,
+                        chunk_count=chunk_count,
+                    )
+                    raise EvolutionSendError(response.status_code, detail)
+
+                chunk_id = _extract_message_id(dados)
+                if chunk_id is None:
+                    detail = f"resposta sem key.id: {response.text[:500]!r}"
+                    logger.error(
+                        "evolution_send_missing_id",
+                        to=normalized_to,
+                        status_code=response.status_code,
+                        detail=detail,
+                        chunk_index=idx,
+                        chunk_count=chunk_count,
+                    )
+                    raise EvolutionSendError(response.status_code, detail)
+
+                last_id = chunk_id
+                logger.info(
+                    "evolution_message_sent",
+                    to=normalized_to,
+                    id=last_id,
+                    chunk_index=idx,
+                    chunk_count=chunk_count,
+                )
+
+        return last_id
 
     async def send_typing(
         self,
@@ -141,7 +206,7 @@ class EvolutionClient:
             )
 
         if response.status_code >= 400:
-            detail = response.text[:300]
+            detail = response.text[:500]
             logger.error(
                 "evolution_download_failed",
                 status_code=response.status_code,
@@ -149,4 +214,48 @@ class EvolutionClient:
             )
             raise EvolutionSendError(response.status_code, detail)
 
-        return base64.b64decode(response.json()["base64"])
+        dados = _safe_json(response)
+        if not isinstance(dados, dict):
+            detail = f"corpo inesperado (não é objeto JSON): {response.text[:500]!r}"
+            logger.error(
+                "evolution_download_invalid_response",
+                status_code=response.status_code,
+                detail=detail,
+            )
+            raise EvolutionSendError(response.status_code, detail)
+
+        b64 = dados.get("base64")
+        if not isinstance(b64, str) or not b64:
+            detail = f"resposta sem campo base64: {response.text[:500]!r}"
+            logger.error(
+                "evolution_download_missing_base64",
+                status_code=response.status_code,
+                detail=detail,
+            )
+            raise EvolutionSendError(response.status_code, detail)
+
+        try:
+            return base64.b64decode(b64, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            detail = f"base64 inválido: {exc}"
+            logger.error(
+                "evolution_download_invalid_base64",
+                status_code=response.status_code,
+                detail=detail,
+            )
+            raise EvolutionSendError(response.status_code, detail) from exc
+
+
+def _safe_json(response: httpx.Response) -> dict[str, Any] | list[Any] | None:
+    try:
+        return response.json()
+    except Exception:
+        return None
+
+
+def _extract_message_id(dados: dict[str, Any]) -> str | None:
+    key = dados.get("key")
+    if not isinstance(key, dict):
+        return None
+    msg_id = key.get("id")
+    return msg_id if isinstance(msg_id, str) and msg_id else None
