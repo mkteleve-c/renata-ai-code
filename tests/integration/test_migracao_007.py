@@ -35,6 +35,31 @@ async def test_phone_rejeita_formato_invalido():
 
 
 @pytest.mark.asyncio
+async def test_colunas_de_pausa_sao_not_null():
+    """NULL em agent_active significava coisas opostas em dois lugares.
+
+    O gate (`is False`) lia NULL como ativo; o índice parcial de follow-up
+    (`WHERE followup_active AND agent_active`) excluía a linha, ou seja lia
+    NULL como pausado. Sem NULL possível, não há duas leituras.
+    """
+    pool = await get_pool()
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            "select column_name, is_nullable from information_schema.columns "
+            "where table_name = 'leads_crm' and column_name in "
+            "('agent_active', 'followup_active', 'followup_count', 'metadata')"
+        )
+        nulabilidade = dict(await cur.fetchall())
+
+    assert nulabilidade == {
+        "agent_active": "NO",
+        "followup_active": "NO",
+        "followup_count": "NO",
+        "metadata": "NO",
+    }
+
+
+@pytest.mark.asyncio
 async def test_phone_aceita_canonico():
     pool = await get_pool()
     async with pool.connection() as conn:
