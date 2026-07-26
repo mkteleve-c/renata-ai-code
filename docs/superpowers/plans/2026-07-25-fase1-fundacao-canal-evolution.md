@@ -115,7 +115,13 @@ Módulo puro — sem banco, sem rede. É a peça de que todas as outras dependem
 - Produces:
   - `canonicalizar(bruto: str | None) -> str | None` — dígitos, BR sem o 9; `None` se não converge.
   - `variacoes(canonico: str) -> tuple[str, str]` — `(com_9, sem_9)`; para não-BR devolve `(canonico, canonico)`.
-  - `resolver_telefone(key: dict) -> str | None` — escolhe entre `remoteJid`/`remoteJidAlt` por score e devolve canônico.
+  - `resolver_telefone(key: dict) -> str | None` — valida e canonicaliza `key["remoteJid"]`.
+
+> **Resultado da Task 1:** `remoteJidAlt` está **ausente em 50 de 50** mensagens
+> reais desta instância — a integração `WHATSAPP-BUSINESS` não popula esse campo
+> herdado do Baileys. O score entre dois candidatos, previsto originalmente,
+> seria código morto. `resolver_telefone` lê apenas `remoteJid`, mantendo a
+> validação de formato e a rejeição de grupos.
   - `to_e164(canonico: str) -> str` — prefixa `+`.
   - `from_e164(e164: str) -> str` — remove `+`.
 
@@ -171,12 +177,13 @@ def test_variacoes_estrangeiro_sao_iguais():
     assert variacoes("14155550123") == ("14155550123", "14155550123")
 
 
-def test_score_prefere_jid_oficial():
-    key = {
-        "remoteJid": "551187654321@s.whatsapp.net",
-        "remoteJidAlt": "551187654321",
-    }
+def test_resolve_jid_com_sufixo_whatsapp():
+    key = {"remoteJid": "5511987654321@s.whatsapp.net", "fromMe": False}
     assert resolver_telefone(key) == "551187654321"
+
+
+def test_resolve_jid_sem_sufixo():
+    assert resolver_telefone({"remoteJid": "5511987654321"}) == "551187654321"
 
 
 def test_resolver_ignora_grupo():
@@ -184,7 +191,17 @@ def test_resolver_ignora_grupo():
 
 
 def test_resolver_sem_candidato_valido():
-    assert resolver_telefone({"remoteJid": "", "remoteJidAlt": None}) is None
+    assert resolver_telefone({"remoteJid": ""}) is None
+    assert resolver_telefone({}) is None
+
+
+def test_resolver_ignora_remote_jid_alt():
+    """A integração WHATSAPP-BUSINESS não popula remoteJidAlt (50/50 ausente).
+
+    Se um dia aparecer, não pode influenciar o resultado sem decisão explícita.
+    """
+    key = {"remoteJid": "5511987654321@s.whatsapp.net", "remoteJidAlt": "5599999999999"}
+    assert resolver_telefone(key) == "551187654321"
 
 
 def test_conversao_e164_ida_e_volta():
@@ -256,8 +273,14 @@ def variacoes(canonico: str) -> tuple[str, str]:
     return canonico, canonico
 
 
-def _score(valor: str | None) -> tuple[str, int] | None:
-    """Pontua um candidato a JID. Maior score vence."""
+def resolver_telefone(key: dict) -> str | None:
+    """Canonicaliza o remoteJid do payload da Evolution.
+
+    Só `remoteJid` é lido: `remoteJidAlt` não é populado pela integração
+    WHATSAPP-BUSINESS (verificado em 50 de 50 mensagens reais da instância).
+    Grupos (@g.us) e JIDs fora do tamanho esperado são rejeitados.
+    """
+    valor = key.get("remoteJid")
     if not valor:
         return None
 
@@ -269,23 +292,7 @@ def _score(valor: str | None) -> tuple[str, int] | None:
     if not 12 <= len(digitos) <= 14:
         return None
 
-    score = 2
-    if "@s.whatsapp.net" in texto:
-        score += 2
-    if digitos.startswith("55"):
-        score += 1
-    return digitos, score
-
-
-def resolver_telefone(key: dict) -> str | None:
-    """Escolhe o melhor JID do payload da Evolution e devolve o canônico."""
-    melhor: tuple[str, int] | None = None
-    for campo in ("remoteJidAlt", "remoteJid"):
-        if pontuado := _score(key.get(campo)):
-            if melhor is None or pontuado[1] > melhor[1]:
-                melhor = pontuado
-
-    return canonicalizar(melhor[0]) if melhor else None
+    return canonicalizar(digitos)
 
 
 def to_e164(canonico: str) -> str:
@@ -299,7 +306,7 @@ def from_e164(e164: str) -> str:
 - [ ] **Step 4: Rodar os testes**
 
 Run: `uv run pytest tests/unit/test_phone.py -v`
-Expected: PASS — 19 testes (7 + 5 vêm de `parametrize`).
+Expected: PASS — 21 testes (7 + 5 vêm de `parametrize`).
 
 Se `test_numero_estrangeiro_nao_perde_digito` falhar, a ordem das regexes está
 errada: `LOCAL_COM_9`/`LOCAL_SEM_9` só podem casar números de 10–11 dígitos, e
