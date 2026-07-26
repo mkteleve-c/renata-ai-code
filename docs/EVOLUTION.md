@@ -115,7 +115,8 @@ Payload típico:
 
 Roda na API, **antes** de enfileirar, e replica o SQL que o n8n usava:
 
-1. **Resolver telefone** a partir de `remoteJid`; rejeita grupos (`@g.us`)
+1. **Resolver telefone** a partir de `remoteJid`; rejeita grupos (`@g.us`) e
+   LIDs (`@lid`)
 2. **Blocklist** — igualdade sobre o telefone canônico
 3. **Variações do 9º dígito** — gera as formas com e sem o 9
 4. **`fromMe = true`** → desliga agente e follow-up, descarta
@@ -136,11 +137,36 @@ Roda na API, **antes** de enfileirar, e replica o SQL que o n8n usava:
 
 A conversão é sempre explícita, via `to_e164()` / `from_e164()`.
 
+Nem todo `remoteJid` é telefone. O **`@lid`** (LinkedID) está em rollout no
+WhatsApp e é identificador opaco: `551188654321@lid` tem o formato exato de um
+brasileiro sem o 9 e viraria a chave primária de um lead real — duas pessoas na
+mesma linha de `leads_crm`. É recusado na entrada, junto com `@g.us`.
+
+Também é recusado o que **se declara brasileiro e não fecha com forma válida**:
+DDI 55 sem correspondência, e 0 de tronco que sobra em número inexistente
+(`011187654321` → 11 dígitos sem o 9 do celular). Vai para `leads_descartados`,
+não vira identidade nova.
+
+### O que fica em `leads_descartados`
+
+Toda mensagem que o gate recusa por telefone é retida com o payload completo do
+webhook — `agent` (query string), `instance` (topo do corpo) e `data` (a
+mensagem). É o suficiente para reconstruir o POST original e reprocessar o
+descarte depois de corrigir a causa.
+
 ### Deduplicação
 
 A Evolution reentrega o webhook em timeout ou resposta ≥400. Um índice único
-parcial em `(channel, agent_id, message_id)` impede que a reentrega vire
-segunda linha na fila; a rota responde 200 com motivo `duplicata`.
+parcial em `(channel, agent_id, phone_number, message_id)` impede que a
+reentrega vire segunda linha na fila; a rota responde 200 com motivo
+`duplicata`. Rajada absorvida pelo debounce entra em
+`message_queue.message_ids_absorvidos`, que o lookup também consulta.
+
+> **Antes de deployar uma versão que mude essa chave**, leia
+> [DATABASE.md → migração que troca índice de `ON CONFLICT`](DATABASE.md#migração-que-troca-índice-de-on-conflict-exige-parada-não-rolling-deploy).
+> A migração dropa o índice que o código antigo usa no `ON CONFLICT`, e API
+> velha servindo depois das migrações = parada total de ingestão nos quatro
+> canais.
 
 O lookup de duplicata roda **antes do rate limit e antes do gate**. Reentrega é
 o mesmo evento: contá-la como mensagem nova consumia cota (com
