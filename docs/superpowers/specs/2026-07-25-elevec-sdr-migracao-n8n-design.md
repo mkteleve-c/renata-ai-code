@@ -272,7 +272,7 @@ determinística e nesta ordem:
 
 | Campo | Regra |
 |---|---|
-| `phase` | a mais avançada vence, pela ordem do enum (`agendou_sessao` > `qualificado` > `iniciou_conversa` > `formulario_preenchido`); `desqualificado` e `perdido` vencem tudo |
+| `phase` | `agendou_sessao` > `desqualificado` = `perdido` > `qualificado` > `iniciou_conversa` > `formulario_preenchido`. `NULL` perde de qualquer fase |
 | `last_interaction_at`, `created_at` | mais recente / mais antigo, respectivamente |
 | `pipedriveid`, `email`, `name`, `username`, `source` | primeiro valor não-nulo, priorizando a linha de fase mais avançada |
 | `followup_count` | o maior |
@@ -282,6 +282,16 @@ determinística e nesta ordem:
 `agent_active = false` vencendo é deliberado: errar para o lado de não mandar
 mensagem é recuperável; errar para o lado de mandar para quem pediu silêncio,
 não.
+
+**`agent_reactivate_at` não entra no coalesce.** Ali o `NULL` é estado
+significativo — "nenhuma reativação agendada" — e não ausência de dado.
+Preenchê-lo com o valor da linha perdedora ressuscita um handover expirado.
+Ele acompanha a linha que ganhou o `agent_active`.
+
+**`agendou_sessao` vence `perdido` e `desqualificado`** porque reunião agendada
+é fato verificável — existe evento no Google Calendar — enquanto as duas fases
+terminais são julgamento. Um `perdido` velho não pode enterrar um lead que
+marcou reunião depois.
 
 **3. Histórico** — últimas **12 mensagens** por `session_id` →
 `legacy_chat_history`, com o telefone já canonicalizado. Verificado: as 736

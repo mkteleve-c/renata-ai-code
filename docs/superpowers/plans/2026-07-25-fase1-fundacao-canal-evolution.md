@@ -649,6 +649,14 @@ Expected: FAIL — `ModuleNotFoundError: No module named 'whatsapp_langchain.sha
 
 - [ ] **Step 3: Implementar o gate**
 
+> **O código abaixo é o ponto de partida, não a versão final.** A revisão desta
+> tarefa encontrou três Críticos de concorrência que ele não trata, e a
+> implementação entregue é mais completa: adquire `pg_advisory_xact_lock` como
+> primeira operação da transação, busca **todas** as variações do telefone (sem
+> `limit 1`) e consolida duplicatas legadas antes de renomear a chave.
+> **A fonte de verdade é `src/whatsapp_langchain/shared/leads.py` no repositório**,
+> não este trecho.
+
 Arquivo `src/whatsapp_langchain/shared/leads.py`:
 
 ```python
