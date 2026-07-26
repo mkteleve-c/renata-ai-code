@@ -38,9 +38,16 @@ cifrado e `download_media` nem a lê neste canal — quem baixa é a
 como mídia.
 
 Reentrega é esperada: a Evolution repete o POST em timeout ou resposta
->= 400. `enqueue_or_buffer` deduplica por (canal, message_id) e a rota
-responde 200 com motivo `duplicata` — responder erro faria a Evolution
-reentregar de novo, em loop.
+>= 400. A rota reconhece a reentrega ANTES do rate limit e do gate (ambos
+gastam algo por mensagem) e responde 200 com motivo `duplicata` — responder
+erro faria a Evolution reentregar de novo, em loop. `enqueue_or_buffer`
+mantém a mesma checagem sob lock, como rede de segurança para POSTs
+simultâneos do mesmo id.
+
+Nada aqui responde 4xx por erro de configuração — agente inexistente e body
+malformado saem com 200 e log de erro. Reentrega não conserta typo na URL
+do webhook nem JSON quebrado; 4xx só produziria loop infinito. A exceção é
+o 401 do secret, em `verify_evolution_webhook_secret`.
 
 Mídia recebida pela Evolution só é baixável via getBase64FromMediaMessage,
 que exige a key completa (remoteJid + fromMe + id), não só o id. Por isso
@@ -54,7 +61,7 @@ from typing import Any
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
-from whatsapp_langchain.agents.loader import AgentNotFoundError, list_agents
+from whatsapp_langchain.agents.loader import list_agents
 from whatsapp_langchain.server.dependencies import (
     check_rate_limit,
     verify_evolution_webhook_secret,
@@ -64,7 +71,7 @@ from whatsapp_langchain.shared.db import get_pool
 from whatsapp_langchain.shared.leads import aplicar_gate
 from whatsapp_langchain.shared.models import MessagingChannel
 from whatsapp_langchain.shared.phone import resolver_telefone, to_e164
-from whatsapp_langchain.shared.queue import enqueue_or_buffer
+from whatsapp_langchain.shared.queue import buscar_duplicata, enqueue_or_buffer
 
 logger = structlog.get_logger()
 
@@ -72,27 +79,29 @@ router = APIRouter(tags=["webhook"])
 
 EVENTOS_DE_MENSAGEM = {"messages.upsert", "messages"}
 
-# messageType (lowercase) -> MIME usado pelo preprocessor de mídia.
-MEDIA_TYPE_MAP: dict[str, str] = {
-    "imagemessage": "image/jpeg",
-    "stickermessage": "image/webp",
-    "audiomessage": "audio/ogg",
-    "pttmessage": "audio/ogg",
-    "videomessage": "video/mp4",
-    "documentmessage": "application/octet-stream",
-}
-
-# Campo dentro de `message` -> MIME de fallback. É o conteúdo que manda, não
-# o `messageType`: em mensagem embrulhada (viewOnce, efêmera, documento com
-# legenda) o tipo declarado é o do envelope, não o da mídia de dentro.
+# Campo dentro de `message` -> MIME de fallback, usado só quando o nó não
+# traz `mimetype`. É o conteúdo que manda, não o `messageType`: em mensagem
+# embrulhada (viewOnce, efêmera, documento com legenda) o tipo declarado é o
+# do envelope, não o da mídia de dentro — um `messageType=documentMessage`
+# com `imageMessage` dentro viraria `application/octet-stream`, que o
+# preprocessor classifica como mídia não suportada.
+#
+# `pttMessage` não está aqui porque não existe: no Baileys, áudio de voz é
+# `audioMessage` com `ptt: true`.
 CAMPOS_DE_MIDIA: dict[str, str] = {
     "imageMessage": "image/jpeg",
-    "stickerMessage": "image/webp",
     "audioMessage": "audio/ogg",
-    "pttMessage": "audio/ogg",
     "videoMessage": "video/mp4",
     "documentMessage": "application/octet-stream",
 }
+
+# Figurinha não vira mídia: tratá-la como imagem custava um download mais
+# uma chamada multimodal ao LLM por figurinha, para descrever uma figurinha
+# — e webp animado provavelmente nem seria aceito pelo modelo. Vira marcador
+# de texto: o agente sabe o que chegou, responde no fluxo, e o gate roda
+# normalmente (a mensagem existe no chat, diferente de uma reação).
+CAMPO_DE_FIGURINHA = "stickerMessage"
+TEXTO_DE_FIGURINHA = "[figurinha]"
 
 # Envelopes que aninham a mensagem real em `message.<envelope>.message`.
 ENVELOPES = (
@@ -137,16 +146,25 @@ def _extrair_conteudo(data: dict[str, Any]) -> tuple[str, str | None, str | None
     Tudo que não é texto nem mídia conhecida sai como `("", None, None)` —
     a rota trata isso como evento a ignorar. Reação, atualização de enquete
     e `protocolMessage` de mensagem apagada caem aqui.
+
+    O `media_type` vem do `mimetype` do próprio nó de mídia — todo nó
+    Baileys o carrega (`audioMessage.mimetype: "audio/ogg; codecs=opus"`) e
+    ele estava sendo ignorado ao lado do `url` e do `caption`, que são lidos
+    do mesmo dicionário. Os consumidores aguentam o parâmetro do MIME:
+    `_media_kind` testa `startswith("audio/")` e
+    `_audio_format_from_media_type` acha `"ogg"` dentro da string inteira.
     """
     bruto = data.get("message")
     msg = _desembrulhar(bruto) if isinstance(bruto, dict) else {}
-    tipo = str(data.get("messageType") or "").strip().lower()
 
     texto = msg.get("conversation")
     if not isinstance(texto, str) or not texto:
         estendida = msg.get("extendedTextMessage")
         candidato = estendida.get("text") if isinstance(estendida, dict) else None
         texto = candidato if isinstance(candidato, str) else ""
+
+    if isinstance(msg.get(CAMPO_DE_FIGURINHA), dict):
+        return texto or TEXTO_DE_FIGURINHA, None, None
 
     for campo, mime_padrao in CAMPOS_DE_MIDIA.items():
         conteudo = msg.get(campo)
@@ -157,10 +175,14 @@ def _extrair_conteudo(data: dict[str, Any]) -> tuple[str, str | None, str | None
         legenda = conteudo.get("caption")
         if not texto and isinstance(legenda, str):
             texto = legenda
+
+        mimetype = conteudo.get("mimetype")
+        declarado = mimetype.strip() if isinstance(mimetype, str) else ""
+
         return (
             texto,
             url if isinstance(url, str) and url else None,
-            MEDIA_TYPE_MAP.get(tipo) or mime_padrao,
+            declarado or mime_padrao,
         )
 
     return texto, None, None
@@ -183,10 +205,11 @@ async def _processar_mensagem(
 ) -> dict[str, Any]:
     """Roda gate, rate limit e enfileiramento para uma mensagem do payload.
 
-    Ordem: extração e guard de conteúdo → rate limit → gate → fila. Tudo que
-    não vai virar linha na fila é cortado ANTES do gate, que escreve em
-    leads_crm. `fromMe` é a única exceção — ele nunca é aceito pelo gate, mas
-    precisa chegar lá para desligar o agente (handover do atendente).
+    Ordem: extração e guard de conteúdo → duplicata → rate limit → gate →
+    fila. Cada passo é mais caro que o anterior, e tudo que não vai virar
+    linha na fila é cortado ANTES do gate, que escreve em leads_crm.
+    `fromMe` é a única exceção — ele nunca é aceito pelo gate, mas precisa
+    chegar lá para desligar o agente (handover do atendente).
     """
     bruto = data.get("key")
     key: dict[str, Any] = bruto if isinstance(bruto, dict) else {}
@@ -214,31 +237,61 @@ async def _processar_mensagem(
         )
         return {"status": "ignorado", "motivo": "conteudo_nao_suportado"}
 
-    # Rate limit antes do gate: o gate escreve (renova last_interaction_at,
-    # zera followup_count) e mensagem barrada aqui nunca chega ao agente —
-    # deixar o gate rodar antes contaria como engajamento o que foi jogado
-    # fora. Sem telefone resolvível não há chave de rate limit; o gate
-    # devolve `telefone_invalido` logo abaixo.
+    pool = await get_pool()
+
+    # Reentrega antes de tudo que gasta: cota de rate limit e escrita do
+    # gate. A Evolution repete o POST em timeout ou resposta >= 400, e o
+    # evento é o mesmo — contá-lo de novo estoura a janela (com
+    # RATE_LIMIT_PER_HOUR=30, 15 mensagens do lead mais uma reentrega de
+    # cada já bastam) e a partir daí a mensagem seguinte, legítima, some com
+    # 200 e sem reentrega. Ficar antes do gate também impede que uma
+    # reentrega renove last_interaction_at e zere followup_count.
     #
-    # `fromMe` fica fora do limite de propósito: é eco de humano assumindo a
-    # conversa, nunca vira linha na fila (não há o que limitar) e o gate
-    # precisa vê-lo para desligar o agente. Barrar aqui deixaria o bot
-    # respondendo por cima do atendente.
+    # `fromMe` fica fora: não vira linha na fila, então não há duplicata a
+    # encontrar, e ele precisa chegar ao gate para desligar o agente.
     canonico_previo = resolver_telefone(key)
     if canonico_previo and not eh_from_me:
+        phone_previo = to_e164(canonico_previo)
+
+        duplicada = await buscar_duplicata(
+            pool,
+            phone_number=phone_previo,
+            agent_id=agent,
+            message_id=message_id,
+            channel=MessagingChannel.EVOLUTION,
+        )
+        if duplicada is not None:
+            # 200: a Evolution reentrega tudo que responder >= 400.
+            logger.info(
+                "evolution_duplicata",
+                phone=phone_previo,
+                message_key_id=message_id,
+                queue_id=duplicada,
+                instance=instance,
+            )
+            return {
+                "status": "ignorado",
+                "motivo": "duplicata",
+                "queue_id": duplicada,
+            }
+
+        # Rate limit antes do gate: o gate escreve (renova
+        # last_interaction_at, zera followup_count) e mensagem barrada aqui
+        # nunca chega ao agente — deixar o gate rodar antes contaria como
+        # engajamento o que foi jogado fora. Sem telefone resolvível não há
+        # chave de rate limit; o gate devolve `telefone_invalido` abaixo.
         try:
-            await check_rate_limit(to_e164(canonico_previo))
+            await check_rate_limit(phone_previo)
         except HTTPException:
             # 200 de propósito: 429 faria a Evolution reentregar em loop.
             logger.warning(
                 "evolution_rate_limit",
-                phone=to_e164(canonico_previo),
+                phone=phone_previo,
                 message_key_id=message_id,
                 instance=instance,
             )
             return {"status": "ignorado", "motivo": "rate_limit"}
 
-    pool = await get_pool()
     push_name = data.get("pushName")
     resultado = await aplicar_gate(
         pool,
@@ -318,14 +371,25 @@ async def webhook_evolution_receive(
     agent: str = Query(description="ID do agente para processar a mensagem"),
     _secret: None = Depends(verify_evolution_webhook_secret),
 ) -> dict[str, Any]:
+    # Erro de configuração responde 200, não 4xx: um typo no `?agent=` do
+    # webhook da instância é o mesmo POST para sempre, e cada resposta >= 400
+    # faz a Evolution reentregar — loop indefinido por um erro que reentrega
+    # nenhuma vai corrigir. ERROR e não WARNING porque nada vai funcionar até
+    # alguém arrumar a URL.
     if agent not in list_agents():
-        raise AgentNotFoundError(agent)
+        logger.error(
+            "evolution_agente_desconhecido",
+            agent=agent,
+            agentes_disponiveis=sorted(list_agents()),
+        )
+        return {"status": "ignorado", "motivo": "agente_desconhecido"}
 
     try:
         payload = await request.json()
     except Exception:
-        logger.warning("evolution_json_invalido")
-        raise HTTPException(status_code=400, detail="Invalid JSON")
+        # Mesmo raciocínio: body malformado não melhora em retry.
+        logger.error("evolution_json_invalido", agent=agent)
+        return {"status": "ignorado", "motivo": "json_invalido"}
 
     if not isinstance(payload, dict):
         # Body válido como JSON mas fora do formato (lista, string, número).

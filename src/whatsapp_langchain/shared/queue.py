@@ -84,6 +84,34 @@ async def _buscar_por_message_id(
     return row[0] if row is not None else None
 
 
+async def buscar_duplicata(
+    pool: AsyncConnectionPool,
+    phone_number: str,
+    agent_id: str,
+    message_id: str | None,
+    channel: MessagingChannel | str = MessagingChannel.TWILIO,
+) -> int | None:
+    """Id da linha que já ingeriu esse (canal, agente, telefone, message_id).
+
+    Mesma checagem que `enqueue_or_buffer` faz internamente, exposta para a
+    rota poder reconhecer reentrega ANTES de gastar recurso com ela — cota
+    de rate limit e escrita do gate. Reentrega é o mesmo evento: contá-la
+    como mensagem nova estoura a janela e faz a próxima mensagem de verdade
+    do lead evaporar com 200.
+    """
+    if not message_id:
+        return None
+
+    channel_value = (
+        channel.value if isinstance(channel, MessagingChannel) else str(channel)
+    )
+
+    async with pool.connection() as conn:
+        return await _buscar_por_message_id(
+            conn, channel_value, agent_id, phone_number, message_id
+        )
+
+
 async def enqueue_or_buffer(
     pool: AsyncConnectionPool,
     phone_number: str,

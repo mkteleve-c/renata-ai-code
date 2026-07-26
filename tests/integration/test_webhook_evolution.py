@@ -171,11 +171,31 @@ async def test_evento_nao_mensagem_e_ignorado(limpar):
     assert r.json()["status"] == "ignorado"
 
 
-async def test_agente_inexistente_da_erro():
+async def test_agente_inexistente_responde_200(limpar):
+    """Typo no `?agent=` é erro de configuração — 400 põe a Evolution em loop.
+
+    A reentrega nunca vai melhorar: o mesmo POST com o mesmo agente errado
+    volta indefinidamente. 200 + log ruidoso corta o loop.
+    """
     async with await cliente() as c:
         r = await c.post("/webhook/evolution?agent=nao_existe", json=payload())
 
-    assert r.status_code == 400
+    assert r.status_code == 200, r.text
+    assert r.json() == {"status": "ignorado", "motivo": "agente_desconhecido"}
+    assert await linhas_na_fila("id") == []
+
+
+async def test_json_invalido_responde_200(limpar):
+    """Body malformado não melhora em retry — 400 vira loop de reentrega."""
+    async with await cliente() as c:
+        r = await c.post(
+            f"/webhook/evolution?agent={AGENTE}",
+            content=b'{"event": "messages.upsert", "data": {',
+            headers={"content-type": "application/json"},
+        )
+
+    assert r.status_code == 200, r.text
+    assert r.json()["motivo"] == "json_invalido"
 
 
 async def test_evento_messages_sem_sufixo_e_aceito(limpar):
@@ -285,10 +305,24 @@ async def test_mensagem_apagada_nao_invoca_o_agente(limpar):
     assert await linhas_na_fila("id") == []
 
 
-async def test_sticker_entra_como_midia_com_url(limpar):
+async def test_sticker_vira_marcador_de_texto_sem_chamada_multimodal(limpar):
+    """Figurinha não vale uma chamada de visão ao LLM.
+
+    Tratada como mídia, cada figurinha virava download + descrição
+    multimodal — custo por sticker para descrever uma figurinha, e webp
+    animado provavelmente nem seria aceito pelo modelo. Vira marcador de
+    texto: o agente sabe que o lead mandou uma figurinha, responde no fluxo,
+    e o gate roda normalmente.
+    """
     corpo = payload_tipo(
         "stickerMessage",
-        {"stickerMessage": {"url": "https://mmg.whatsapp.net/sticker"}},
+        {
+            "stickerMessage": {
+                "url": "https://mmg.whatsapp.net/sticker",
+                "mimetype": "image/webp",
+                "isAnimated": True,
+            }
+        },
         message_id="MSG-STICKER",
     )
 
@@ -298,10 +332,69 @@ async def test_sticker_entra_como_midia_com_url(limpar):
     assert r.status_code == 200
     assert r.json()["status"] == "ok"
 
-    linha = await unica_linha("media_url, media_type, incoming_message")
-    assert linha[0] == "https://mmg.whatsapp.net/sticker"
-    assert linha[1] == "image/webp"
-    assert linha[2] == ""
+    linha = await unica_linha(
+        "media_url, media_type, incoming_message, provider_message_key"
+    )
+    assert linha[0] is None
+    assert linha[1] is None
+    assert linha[2] == "[figurinha]"
+    assert linha[3] is None
+
+
+async def test_mimetype_do_payload_prevalece_sobre_o_padrao(limpar):
+    """Todo nó de mídia Baileys carrega `mimetype` — inferir é desnecessário."""
+    corpo = payload_tipo(
+        "audioMessage",
+        {"audioMessage": {"mimetype": "audio/ogg; codecs=opus", "seconds": 3}},
+        message_id="MSG-PTT",
+    )
+
+    async with await cliente() as c:
+        r = await c.post(f"/webhook/evolution?agent={AGENTE}", json=corpo)
+
+    assert r.status_code == 200, r.text
+    linha = await unica_linha("media_type")
+    assert linha[0] == "audio/ogg; codecs=opus"
+
+
+async def test_mimetype_de_imagem_nao_e_forcado_para_jpeg(limpar):
+    corpo = payload_tipo(
+        "imageMessage",
+        {"imageMessage": {"mimetype": "image/png", "url": "https://mmg/x.enc"}},
+        message_id="MSG-PNG",
+    )
+
+    async with await cliente() as c:
+        r = await c.post(f"/webhook/evolution?agent={AGENTE}", json=corpo)
+
+    assert r.status_code == 200, r.text
+    linha = await unica_linha("media_type")
+    assert linha[0] == "image/png"
+
+
+async def test_mimetype_ausente_cai_no_campo_e_nao_no_messagetype(limpar):
+    """O envelope declara `documentMessage`; a mídia de dentro é imagem.
+
+    Inferir pelo `messageType` devolvia `application/octet-stream` — que o
+    preprocessor classifica como não suportada — para uma foto que o lead
+    mandou com legenda.
+    """
+    corpo = payload_tipo(
+        "documentMessage",
+        {
+            "documentWithCaptionMessage": {
+                "message": {"imageMessage": {"caption": "planta baixa"}}
+            }
+        },
+        message_id="MSG-SEM-MIME",
+    )
+
+    async with await cliente() as c:
+        r = await c.post(f"/webhook/evolution?agent={AGENTE}", json=corpo)
+
+    assert r.status_code == 200, r.text
+    linha = await unica_linha("media_type")
+    assert linha[0] == "image/jpeg"
 
 
 async def test_audio_sem_url_entra_na_fila_como_midia(limpar):
@@ -576,6 +669,51 @@ async def test_rate_limit_nao_deixa_o_gate_escrever(limpar, monkeypatch):
             "select count(*) from leads_crm where phone = %s", (TELEFONE,)
         )
         assert (await cur.fetchone())[0] == 0
+
+
+async def test_reentrega_nao_consome_cota_de_rate_limit(limpar, monkeypatch):
+    """Reentrega é o mesmo evento — contá-la duas vezes evapora mensagem.
+
+    Com o lookup de duplicata depois do rate limit, 15 mensagens do lead
+    mais uma reentrega de cada estouram uma janela de 30: a partir daí a
+    rota devolve 200 + `rate_limit`, a Evolution não reentrega, e a mensagem
+    do lead some sem rastro.
+    """
+    monkeypatch.setattr(settings, "rate_limit_per_hour", 2)
+
+    async with await cliente() as c:
+        primeira = await c.post(
+            f"/webhook/evolution?agent={AGENTE}", json=payload(message_id="MSG-A")
+        )
+        reentrega = await c.post(
+            f"/webhook/evolution?agent={AGENTE}", json=payload(message_id="MSG-A")
+        )
+        segunda = await c.post(
+            f"/webhook/evolution?agent={AGENTE}",
+            json=payload(texto="segunda", message_id="MSG-B"),
+        )
+
+    assert primeira.json()["status"] == "ok"
+    assert reentrega.json()["motivo"] == "duplicata"
+    assert reentrega.json()["queue_id"] == primeira.json()["queue_id"]
+    assert segunda.json()["status"] == "ok", segunda.text
+
+
+async def test_reentrega_nao_renova_engajamento_do_lead(limpar, monkeypatch):
+    """O lookup antes do rate limit também fica antes do gate — de propósito.
+
+    O gate renova `last_interaction_at` e zera `followup_count`. Uma
+    reentrega do provedor não é interação nova do lead.
+    """
+    colunas = "xmin::text, followup_count, last_interaction_at"
+
+    async with await cliente() as c:
+        await c.post(f"/webhook/evolution?agent={AGENTE}", json=payload())
+        antes = await lead_do_teste(colunas)
+        r = await c.post(f"/webhook/evolution?agent={AGENTE}", json=payload())
+
+    assert r.json()["motivo"] == "duplicata"
+    assert await lead_do_teste(colunas) == antes
 
 
 async def test_rate_limit_nao_barra_handover_do_atendente(limpar, monkeypatch):
