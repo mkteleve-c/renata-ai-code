@@ -37,6 +37,7 @@ class MessagingChannel(str, Enum):
     TWILIO = "twilio"
     META = "meta"
     UAZAPI = "uazapi"
+    EVOLUTION = "evolution"
 
 
 class MessageQueue(BaseModel):

@@ -93,6 +93,13 @@ class Settings(BaseSettings):
     uazapi_base_url: str = ""
     uazapi_instance_token: str = ""
 
+    # --- Evolution API (integração WHATSAPP-BUSINESS: Meta Cloud API por baixo) ---
+    # A instância é fixa por deploy; o apikey autentica tanto o envio quanto o
+    # download de mídia decifrada.
+    evolution_base_url: str = ""
+    evolution_api_key: str = ""
+    evolution_instance: str = ""
+
     # --- Rate Limit ---
     rate_limit_per_hour: int = 30
 
