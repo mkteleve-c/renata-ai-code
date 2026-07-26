@@ -38,3 +38,6 @@ Thumbs.db
 # Logs e dados locais
 *.log
 pgdata/
+
+# Scratch do subagent-driven-development
+.superpowers/
