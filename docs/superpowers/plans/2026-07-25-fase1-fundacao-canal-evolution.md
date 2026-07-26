@@ -667,6 +667,12 @@ import structlog
 from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
 
+# Atenção: NUNCA fazer `conn.row_factory = dict_row` numa conexão emprestada
+# do pool. O AsyncConnectionPool não restaura o atributo ao devolver a conexão
+# (`_reset_connection` só faz rollback), então o estado vaza para o próximo
+# checkout e queries de tupla passam a devolver as chaves em vez dos valores —
+# falha silenciosa. Use `conn.cursor(row_factory=dict_row)` escopado.
+
 from whatsapp_langchain.shared.phone import canonicalizar, resolver_telefone, variacoes
 
 logger = structlog.get_logger()
@@ -692,7 +698,14 @@ async def aplicar_gate(
     com_9, sem_9 = variacoes(canonico)
 
     async with pool.connection() as conn:
-        conn.row_factory = dict_row
+        # Serializa o gate por lead. Sem isso, duas mensagens do mesmo telefone
+        # em paralelo produzem lost update, UniqueViolation no INSERT e
+        # ressurreição de followup_active durante handover. Mesmo idioma de
+        # shared/queue.py:92 — lock de transação, não de sessão, então não
+        # sofre com o reuso de conexões do pool.
+        await conn.execute(
+            "SELECT pg_advisory_xact_lock(hashtext(%s))", (canonico,)
+        )
 
         cur = await conn.execute(
             "select 1 from blocklist where phone = %s", (canonico,)
