@@ -399,6 +399,25 @@ async def enqueue_or_buffer(
         return EnqueueResult(message_id=new_id, is_buffered=False)
 
 
+async def contar_pendentes_por_canal(pool: AsyncConnectionPool) -> dict[str, int]:
+    """Conta mensagens ainda não terminais (queued/processing) por canal.
+
+    Usada no boot do worker para detectar fila que chega por um canal sem
+    cliente outbound configurado — situação em que o inbound aceita tudo e
+    cada mensagem morre em mark_failed.
+    """
+    async with pool.connection() as conn:
+        cursor = await conn.execute(
+            """
+            SELECT channel, COUNT(*)
+            FROM message_queue
+            WHERE status IN ('queued', 'processing')
+            GROUP BY channel
+            """
+        )
+        return {linha[0]: int(linha[1]) for linha in await cursor.fetchall()}
+
+
 async def claim_next(
     pool: AsyncConnectionPool,
     lease_seconds: int = 60,
