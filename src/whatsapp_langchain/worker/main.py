@@ -10,6 +10,7 @@ Uso:
 """
 
 import asyncio
+from collections.abc import Iterable
 
 import structlog
 
@@ -24,6 +25,7 @@ from whatsapp_langchain.shared.db import (
 )
 from whatsapp_langchain.shared.models import MessagingChannel
 from whatsapp_langchain.shared.observability import setup_logging
+from whatsapp_langchain.shared.queue import contar_pendentes_por_canal
 from whatsapp_langchain.worker.consumer import claim_next_message
 from whatsapp_langchain.worker.evolution_client import EvolutionClient
 from whatsapp_langchain.worker.meta_client import MetaClient
@@ -128,6 +130,24 @@ def _build_outbound_clients(
     return clients
 
 
+def _canais_sem_cliente(
+    pendentes: dict[str, int],
+    habilitados: Iterable[MessagingChannel],
+) -> dict[str, int]:
+    """Canais com mensagens pendentes na fila e sem cliente outbound aqui.
+
+    Um webhook inbound aceita mensagens mesmo sem credencial outbound
+    configurada para o canal. Sem este aviso, a fila enche e cada mensagem
+    morre em mark_failed com o worker aparentemente saudável.
+    """
+    ativos = {canal.value for canal in habilitados}
+    return {
+        canal: total
+        for canal, total in pendentes.items()
+        if canal not in ativos and total > 0
+    }
+
+
 async def main() -> None:
     """Loop principal do Worker.
 
@@ -161,6 +181,19 @@ async def main() -> None:
 
     outbound_mode = settings.resolved_outbound_mode
     outbounds = _build_outbound_clients(outbound_mode)
+
+    orfaos = _canais_sem_cliente(await contar_pendentes_por_canal(pool), outbounds)
+    if orfaos:
+        logger.warning(
+            "queued_messages_without_outbound_client",
+            canais=orfaos,
+            enabled_channels=[ch.value for ch in outbounds],
+            hint=(
+                "Há mensagens na fila de canais sem cliente outbound neste "
+                "worker — o inbound aceita, mas cada uma vai falhar no envio. "
+                "Preencha as credenciais do canal ou desabilite o webhook."
+            ),
+        )
 
     logger.info(
         "worker_ready",
