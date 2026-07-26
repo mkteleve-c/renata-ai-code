@@ -6,9 +6,17 @@ Meta Cloud API oficial, com a Evolution fazendo de proxy. A superfície REST
 de 4096 caracteres por mensagem de texto é confirmado (não uma estimativa
 prática como na uazapi) — mensagens acima disso são quebradas em partes.
 
-O parâmetro `delay` do sendText é nativo e em milissegundos: ele mostra
-"digitando…" durante a espera. Por isso send_typing é no-op — chamar um
-endpoint de presença separado duplicaria o efeito.
+Não há "digitando…" neste canal, e isso é uma limitação da integração, não
+uma escolha nossa. Na integração Baileys o `delay` do sendText emite
+presença `composing` durante a espera; na WHATSAPP-BUSINESS o serviço
+equivalente (`whatsapp.business.service.ts`) recebe `{delay, presence}` dos
+callers e **descarta os dois** — `sendMessageWithTyping` posta direto em
+`/messages` — e `sendPresence()` lança
+`BadRequestException('Method not available on WhatsApp Business API')`.
+
+Por isso send_typing é no-op: chamar o endpoint de presença renderia HTTP
+400 por mensagem, e passar `delay` não produziria indicador nenhum. O
+parâmetro `delay_ms` continua exposto porque funciona em instâncias Baileys.
 
 Mídia recebida vem criptografada (herança do Baileys); baixá-la exige
 getBase64FromMediaMessage, não um GET na URL.
@@ -95,6 +103,10 @@ class EvolutionClient:
         não por um token entregue por mensagem como a uazapi. O parâmetro
         existe só para manter a assinatura compatível com os outros clientes
         outbound (duck typing no processor).
+
+        `delay_ms` vai no payload quando maior que zero, mas só tem efeito em
+        instâncias Baileys — a integração WHATSAPP-BUSINESS descarta o campo
+        (ver docstring do módulo). O processor não o passa hoje.
         """
         if self.delivery_mode == "mock":
             logger.info("evolution_mock_send", to=to, body=body[:80])
@@ -185,7 +197,13 @@ class EvolutionClient:
         message_id: str | None = None,
         token: str | None = None,
     ) -> bool:
-        """No-op: o `delay` nativo do sendText já exibe "digitando…"."""
+        """No-op deliberado: a integração WHATSAPP-BUSINESS não tem presença.
+
+        `/chat/sendPresence` lança "Method not available on WhatsApp Business
+        API" nessa integração, então uma chamada real seria HTTP 400 por
+        mensagem. Retorna False (nada enviado) sem tocar a rede — o processor
+        trata typing como best-effort e segue para o envio.
+        """
         return False
 
     async def baixar_midia(self, message_key: dict[str, Any]) -> bytes:

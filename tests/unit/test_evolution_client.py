@@ -73,8 +73,18 @@ async def test_baixa_midia_decifrada(client, monkeypatch):
     assert await client.baixar_midia({"id": "MSG123"}) == conteudo
 
 
-async def test_send_typing_e_noop(client):
-    """False, não None: processor._send_typing é tipado como bool."""
+async def test_send_typing_e_noop(client, monkeypatch):
+    """False, não None: processor._send_typing é tipado como bool.
+
+    E sem tocar a rede: `/chat/sendPresence` lança "Method not available on
+    WhatsApp Business API" nessa integração, então uma chamada real seria
+    HTTP 400 por mensagem enviada.
+    """
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"send_typing não pode fazer requisição: {request.url}")
+
+    monkeypatch.setattr(client, "_transport", httpx.MockTransport(handler))
     assert await client.send_typing("+551187654321") is False
 
 
