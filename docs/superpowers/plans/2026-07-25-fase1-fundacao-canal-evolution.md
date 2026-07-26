@@ -357,6 +357,7 @@ Arquivo `tests/integration/test_migracao_007.py`:
 """Verifica que a migração 007 cria o schema do SDR da EleveC."""
 
 import pytest
+from psycopg import errors
 
 from whatsapp_langchain.shared.db import get_pool
 
@@ -377,9 +378,14 @@ async def test_tabelas_do_sdr_existem():
 
 @pytest.mark.asyncio
 async def test_phone_rejeita_formato_invalido():
+    """Espera CheckViolation, não Exception genérica.
+
+    Com `Exception`, o teste passaria por erro de conexão, coluna inexistente
+    ou qualquer outra falha — sem provar que foi o CHECK de formato.
+    """
     pool = await get_pool()
     async with pool.connection() as conn:
-        with pytest.raises(Exception):
+        with pytest.raises(errors.CheckViolation):
             await conn.execute(
                 "insert into leads_crm (phone) values ('+5511987654321')"
             )
@@ -469,9 +475,14 @@ CREATE TABLE IF NOT EXISTS leads_descartados (
 );
 
 CREATE INDEX IF NOT EXISTS idx_leads_followup
-    ON leads_crm (followup_active, agent_active, last_interaction_at)
+    ON leads_crm (last_interaction_at, phase)
     WHERE followup_active AND agent_active;
 ```
+
+> As colunas do índice **não** repetem `followup_active`/`agent_active`: dentro
+> do predicado parcial elas já são sempre `true` e não discriminam nada. Quem
+> discrimina é `last_interaction_at` (o corte de tempo de cada nível) e `phase`
+> (o `NOT IN` que exclui leads fechados).
 
 - [ ] **Step 4: Aplicar e rodar os testes**
 
