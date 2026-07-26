@@ -54,6 +54,13 @@ CREATE TABLE IF NOT EXISTS leads_descartados (
     created_at     TIMESTAMPTZ DEFAULT now()
 );
 
+-- DROP explícito antes do CREATE: quem já rodou uma versão anterior desta
+-- migração (colunas líder followup_active/agent_active redundantes com o
+-- predicado, sem phase) precisa que a reaplicação troque a definição do
+-- índice. IF NOT EXISTS sozinho não faria isso — só rodaria uma vez e nunca
+-- mais tocaria no índice existente, mesmo com a definição errada.
+DROP INDEX IF EXISTS idx_leads_followup;
+
 CREATE INDEX IF NOT EXISTS idx_leads_followup
-    ON leads_crm (followup_active, agent_active, last_interaction_at)
+    ON leads_crm (last_interaction_at, phase)
     WHERE followup_active AND agent_active;

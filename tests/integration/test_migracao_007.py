@@ -1,5 +1,6 @@
 """Verifica que a migração 007 cria o schema do SDR da EleveC."""
 
+import psycopg
 import pytest
 
 from whatsapp_langchain.shared.db import get_pool
@@ -27,7 +28,7 @@ async def test_tabelas_do_sdr_existem():
 async def test_phone_rejeita_formato_invalido():
     pool = await get_pool()
     async with pool.connection() as conn:
-        with pytest.raises(Exception):
+        with pytest.raises(psycopg.errors.CheckViolation):
             await conn.execute(
                 "insert into leads_crm (phone) values ('+5511987654321')"
             )
