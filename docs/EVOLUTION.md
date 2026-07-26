@@ -33,7 +33,26 @@ a Evolution normaliza os dois casos.
 | `EVOLUTION_BASE_URL` | sim | URL do servidor, sem barra final |
 | `EVOLUTION_API_KEY` | sim | autentica envio e download de mídia |
 | `EVOLUTION_INSTANCE` | sim | nome da instância |
-| `EVOLUTION_WEBHOOK_SECRET` | não | quando preenchida, a rota exige este valor no header |
+| `EVOLUTION_WEBHOOK_SECRET` | **em produção, sim** | valor que a rota exige no header do webhook |
+
+### O secret é obrigatório em produção
+
+Com `ENVIRONMENT=production` e o canal Evolution configurado (qualquer uma das
+três variáveis preenchida), `validate_runtime_settings()` **derruba o boot** se
+`EVOLUTION_WEBHOOK_SECRET` estiver vazia ou tiver menos de 32 caracteres. Vale
+inclusive com `OUTBOUND_MODE=mock` — quem abre a porta é a rota inbound, que não
+olha o modo outbound.
+
+O motivo é o custo de deixá-la aberta. A Evolution não assina o body: o header
+estático é o único gate do inbound. Sem ele, um POST anônimo com texto qualquer
+e `remoteJid` escolhido pelo atacante cria o lead, entra na fila, invoca o
+agente e **faz sair mensagem de WhatsApp pelo número oficial Meta do cliente**
+para o telefone que ele quiser — custo de LLM, `leads_crm` envenenado e risco de
+ban do número. A URL é adivinhável: os ids de agente são públicos neste
+repositório template.
+
+Em dev (`ENVIRONMENT=development`) a variável continua opcional e a rota fica
+aberta.
 
 ### A armadilha de deploy mais provável
 
@@ -62,9 +81,8 @@ independente:
 openssl rand -base64 32
 ```
 
-Com a variável vazia a rota fica aberta — aceitável em dev, **não em produção**:
-um POST com `fromMe: true` e um telefone qualquer desliga o agente para aquele
-lead de forma permanente.
+Reutilizar também não passa no fail-fast por acaso: o boot em produção só checa
+tamanho e presença, então a única proteção contra reuso é a disciplina.
 
 ## Entrada: `POST /webhook/evolution?agent=<id>`
 
@@ -124,6 +142,28 @@ A Evolution reentrega o webhook em timeout ou resposta ≥400. Um índice único
 parcial em `(channel, agent_id, message_id)` impede que a reentrega vire
 segunda linha na fila; a rota responde 200 com motivo `duplicata`.
 
+O lookup de duplicata roda **antes do rate limit e antes do gate**. Reentrega é
+o mesmo evento: contá-la como mensagem nova consumia cota (com
+`RATE_LIMIT_PER_HOUR=30`, 15 mensagens do lead mais uma reentrega de cada já
+estouram a janela — e a partir daí a mensagem seguinte, legítima, sumiria com
+200 e sem reentrega) e ainda renovava `last_interaction_at`/`followup_count` no
+gate.
+
+### Nada nesta rota responde 4xx por erro de configuração
+
+Resposta ≥400 faz a Evolution reentregar, e reentrega não conserta configuração.
+Por isso respondem **200 + log de erro**, não 4xx:
+
+| Situação | Motivo na resposta |
+|---|---|
+| `?agent=` com typo (agente fora do catálogo) | `agente_desconhecido` |
+| Body que não é JSON válido | `json_invalido` |
+| JSON válido fora do formato (lista, string) | `payload_invalido` |
+| Rate limit estourado | `rate_limit` |
+
+O 401 do secret é a exceção deliberada: responder 200 a quem não sabe o segredo
+engoliria em silêncio tanto o ataque quanto o secret trocado por engano.
+
 ## Saída
 
 `POST /message/sendText/{instance}`, header `apikey`, body
@@ -155,6 +195,37 @@ contendo só o `id` devolve `400 TypeError`. Por isso a key inteira é gravada e
 `message_queue.provider_message_key` (JSONB) no momento da ingestão, e o worker
 a propaga até o download.
 
+O download respeita `OUTBOUND_MODE`: em `mock` ele levanta em vez de sair pela
+rede — devolver bytes falsos levaria a uma chamada multimodal ao LLM.
+
+### O `media_type` vem do payload, não de inferência
+
+Todo nó de mídia Baileys carrega `mimetype` (`imageMessage.mimetype:
+"image/jpeg"`, `audioMessage.mimetype: "audio/ogg; codecs=opus"`), e é ele que
+vira `message_queue.media_type`. O mapa por campo (`imageMessage` →
+`image/jpeg`, etc.) só entra quando o `mimetype` não vem.
+
+Inferir pelo `messageType` foi removido: em mensagem embrulhada o tipo declarado
+é o do **envelope**, então um `documentMessage` com `imageMessage` dentro virava
+`application/octet-stream` — que o preprocessor classifica como "mídia não
+suportada" — para uma foto que o lead mandou com legenda.
+
+Os consumidores aguentam o MIME com parâmetro: `_media_kind` testa
+`startswith("audio/")` e `_audio_format_from_media_type` acha `"ogg"` dentro de
+`"audio/ogg; codecs=opus"`.
+
+### Figurinha não é mídia
+
+`stickerMessage` vira o texto `[figurinha]`, sem `media_url` nem `media_type`.
+Tratá-la como imagem custava um download mais uma chamada multimodal ao LLM por
+figurinha — para descrever uma figurinha — e webp animado provavelmente nem
+seria aceito pelo modelo. Como marcador de texto, o agente sabe o que chegou,
+responde no fluxo, e o gate roda normalmente (diferente de uma reação, a
+figurinha é uma mensagem no chat e merece resposta).
+
+Áudio de voz (PTT) não tem campo próprio: no Baileys é `audioMessage` com
+`ptt: true`. Não existe `pttMessage`.
+
 ## Limitações conhecidas
 
 Duas coisas não foram verificadas contra o servidor real e estão cobertas
@@ -164,11 +235,20 @@ apenas por mock. Ambas devem ser exercitadas antes do cutover:
    contra o servidor, mas o envio nunca foi disparado — fazê-lo entregaria uma
    mensagem de WhatsApp a uma pessoa real. Teste manualmente contra o seu
    próprio número antes de considerar o canal pronto.
-2. **A forma da key de mídia e o `MEDIA_TYPE_MAP`.** A instância não tem
-   nenhuma mensagem de mídia armazenada (`findMessages` filtrando por
-   `audioMessage` e `imageMessage` devolve 0), então ambos são **inferidos** da
-   documentação do Baileys. O primeiro áudio real que chegar é o teste de
-   verdade.
+
+   O *shape da resposta* deixou de ser risco: o cliente extrai o id de
+   `{"key":{"id":…}}`, de `{"messages":[{"id":…}]}` (o formato nativo da Cloud
+   API, que a Evolution pode repassar) e de qualquer um dos dois aninhado em
+   `data`. E **2xx sem id reconhecível não é erro** — a mensagem já saiu;
+   levantar ali fazia o processor marcar `failed`, tentar de novo e entregar a
+   mesma mensagem três vezes. Sai um `warning` (`evolution_send_sem_id`) com o
+   corpo recebido: se ele aparecer no log depois do cutover, é sinal de que o
+   parser precisa de mais um shape — não de que a entrega falhou.
+2. **A forma da key de mídia.** A instância não tem nenhuma mensagem de mídia
+   armazenada (`findMessages` filtrando por `audioMessage` e `imageMessage`
+   devolve 0), então ela é **inferida** da documentação do Baileys. O primeiro
+   áudio real que chegar é o teste de verdade. O `media_type` saiu dessa lista:
+   agora vem do `mimetype` do próprio payload.
 
 ## Diagnóstico
 
@@ -179,3 +259,7 @@ apenas por mock. Ambas devem ser exercitadas antes do cutover:
 | Lead parou de receber respostas | `agent_active=false` — humano respondeu pelo aparelho, ou etiqueta de pausa |
 | Resposta duplicada | reentrega fora da janela de dedupe; conferir `message_id` na fila |
 | Áudio vira "mídia não suportada" | sem `provider_message_key` e sem URL utilizável |
+| Boot em produção falha citando `EVOLUTION_WEBHOOK_SECRET` | canal configurado com secret vazia ou com menos de 32 caracteres |
+| Webhook devolve 200 com `motivo: agente_desconhecido` | typo no `?agent=` da URL configurada na instância |
+| `evolution_send_sem_id` no log | envio funcionou; o corpo da resposta traz um shape que o parser não conhece |
+| Mídia falha em dev com "delivery_mode=mock" | esperado — download real exige `OUTBOUND_MODE=real` |
