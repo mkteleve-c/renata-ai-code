@@ -468,6 +468,7 @@ async def claim_next(
                       status,
                       process_after, attempts, max_attempts, lease_until,
                       response, error, outbound_token, channel,
+                      provider_message_key,
                       created_at, updated_at, processed_at
             """,
             (lease_until,),
@@ -500,9 +501,10 @@ async def claim_next(
             error=row[18],
             outbound_token=row[19],
             channel=row[20],
-            created_at=row[21],
-            updated_at=row[22],
-            processed_at=row[23],
+            provider_message_key=row[21],
+            created_at=row[22],
+            updated_at=row[23],
+            processed_at=row[24],
         )
 
         logger.info(
