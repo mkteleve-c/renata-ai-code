@@ -45,6 +45,7 @@ from whatsapp_langchain.shared.queue import (
     mark_failed,
     upsert_conversation,
 )
+from whatsapp_langchain.worker.evolution_client import EvolutionClient
 from whatsapp_langchain.worker.media import (
     AUTO_RESPONSE_MEDIA_FAILURE,
     preprocess_incoming_message,
@@ -55,7 +56,7 @@ from whatsapp_langchain.worker.uazapi_client import UazapiClient
 
 logger = structlog.get_logger()
 
-OutboundClient = TwilioClient | MetaClient | UazapiClient
+OutboundClient = TwilioClient | MetaClient | UazapiClient | EvolutionClient
 
 
 def _normalize_outbounds(
@@ -79,6 +80,8 @@ def _normalize_outbounds(
             return {MessagingChannel.META: outbound}
         if isinstance(outbound, UazapiClient):
             return {MessagingChannel.UAZAPI: outbound}
+        if isinstance(outbound, EvolutionClient):
+            return {MessagingChannel.EVOLUTION: outbound}
         # TwilioClient ou mock genérico — assume Twilio (default histórico).
         return {MessagingChannel.TWILIO: outbound}
     raise ValueError(
@@ -112,12 +115,14 @@ async def _send_message(
     to: str,
     body: str,
     message: MessageQueue,
-) -> str:
+) -> str | None:
     """Wrapper que injeta o token outbound dinâmico para UazapiClient.
 
     Twilio e Meta têm credenciais estáticas no construtor — chamada padrão.
     Uazapi recebe o token da instância via webhook e armazenado em
     message.outbound_token; passamos como kwarg para o cliente usar.
+    A Evolution autentica pela apikey e devolve None em modo mock — daí o
+    retorno opcional.
     """
     if isinstance(outbound, UazapiClient):
         return await outbound.send_message(to, body, token=message.outbound_token)
@@ -200,6 +205,8 @@ async def process_message(
             body=message.incoming_message,
             media_url=message.media_url,
             media_type=message.media_type,
+            canal=message.channel,
+            message_key=message.provider_message_key,
         )
 
         # Se mídia está desabilitada ou falhou, não chama o agente

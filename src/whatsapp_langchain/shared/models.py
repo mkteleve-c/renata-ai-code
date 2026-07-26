@@ -65,7 +65,7 @@ class MessageQueue(BaseModel):
         default=MessagingChannel.TWILIO,
         description=(
             "Canal de origem da mensagem. Define qual cliente outbound o "
-            "worker usa para responder (twilio, meta ou uazapi)."
+            "worker usa para responder (twilio, meta, uazapi ou evolution)."
         ),
     )
     process_after: datetime | None = None

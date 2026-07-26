@@ -3,7 +3,7 @@
 Inicia o Worker que consome mensagens da fila PostgreSQL em loop.
 Cada mensagem é processada pelo agente configurado, e a resposta é
 enviada pelo cliente outbound correspondente ao canal de origem
-(`message.channel`: twilio, meta ou uazapi).
+(`message.channel`: twilio, meta, uazapi ou evolution).
 
 Uso:
     python -m whatsapp_langchain.worker.main
@@ -25,6 +25,7 @@ from whatsapp_langchain.shared.db import (
 from whatsapp_langchain.shared.models import MessagingChannel
 from whatsapp_langchain.shared.observability import setup_logging
 from whatsapp_langchain.worker.consumer import claim_next_message
+from whatsapp_langchain.worker.evolution_client import EvolutionClient
 from whatsapp_langchain.worker.meta_client import MetaClient
 from whatsapp_langchain.worker.processor import OutboundClient, process_message
 from whatsapp_langchain.worker.twilio_client import TwilioClient
@@ -44,7 +45,7 @@ def _build_outbound_clients(
     chamado pela API no startup; mesmo assim revalidamos aqui para o caso
     do worker subir antes da API.
 
-    Em modo mock, todos os 3 canais são instanciados (cliente simula envio).
+    Em modo mock, todos os canais são instanciados (cliente simula envio).
     """
     status = settings.channel_status()
     clients: dict[MessagingChannel, OutboundClient] = {}
@@ -99,11 +100,28 @@ def _build_outbound_clients(
             has_static_token=bool(settings.uazapi_instance_token),
         )
 
+    if status["evolution"]["complete"] and (
+        status["evolution"]["touched"] or outbound_mode == "mock"
+    ):
+        evolution = EvolutionClient(
+            base_url=settings.evolution_base_url,
+            api_key=settings.evolution_api_key,
+            instance=settings.evolution_instance,
+            delivery_mode=outbound_mode,
+        )
+        clients[MessagingChannel.EVOLUTION] = evolution
+        logger.info(
+            "evolution_client_ready",
+            outbound_mode=outbound_mode,
+            base_url=settings.evolution_base_url or None,
+            instance=settings.evolution_instance or None,
+        )
+
     if not clients:
         logger.error("no_outbound_channel_enabled", channel_status=status)
         raise SystemExit(
             "Nenhum canal de mensageria está habilitado. Preencha credenciais "
-            "de pelo menos um (Twilio, Meta ou uazapi) ou rode em "
+            "de pelo menos um (Twilio, Meta, uazapi ou Evolution) ou rode em "
             "OUTBOUND_MODE=mock para desenvolvimento local."
         )
 
