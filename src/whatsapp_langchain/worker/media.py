@@ -16,6 +16,7 @@ import structlog
 from langchain_core.messages import HumanMessage
 
 from whatsapp_langchain.shared.config import settings
+from whatsapp_langchain.shared.models import MessagingChannel
 
 logger = structlog.get_logger()
 
@@ -49,12 +50,28 @@ class MediaPreprocessResult:
 
 async def download_media(
     url: str,
+    canal: MessagingChannel | str = MessagingChannel.TWILIO,
+    message_key: dict | None = None,
 ) -> bytes:
-    """Faz download de mídia do Twilio.
+    """Baixa mídia usando o mecanismo do canal de origem.
 
-    Autentica com API Key (api_key_sid:api_key_secret) — mesmas credenciais
-    usadas pelo TwilioClient para envio outbound.
+    Twilio/Meta/uazapi entregam URL baixável com autenticação. A Evolution
+    não: a URL do payload aponta para mídia criptografada, e o conteúdo
+    decifrado só sai por getBase64FromMediaMessage.
     """
+    if canal == MessagingChannel.EVOLUTION:
+        if not message_key:
+            raise ValueError("Evolution exige message_key para baixar mídia")
+
+        from whatsapp_langchain.worker.evolution_client import EvolutionClient
+
+        cliente = EvolutionClient(
+            base_url=settings.evolution_base_url,
+            api_key=settings.evolution_api_key,
+            instance=settings.evolution_instance,
+        )
+        return await cliente.baixar_midia(message_key)
+
     auth = (
         (settings.twilio_api_key_sid, settings.twilio_api_key_secret)
         if settings.twilio_api_key_sid
