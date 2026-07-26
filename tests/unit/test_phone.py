@@ -66,6 +66,41 @@ def test_ddi_55_irreconhecivel_e_recusado():
     assert canonicalizar("551187654321999") is None
 
 
+@pytest.mark.parametrize(
+    "bruto",
+    [
+        "274988654321@lid",  # LID que não parece telefone brasileiro
+        "551188654321@lid",  # LID que casa com BR_SEM_9 — o caso que corrompe
+        "274988654321:2@lid",  # LID com sufixo de aparelho
+        "551188654321@LID",  # caixa alta
+    ],
+    ids=["lid", "lid_parece_br", "lid_com_device", "lid_caixa_alta"],
+)
+def test_lid_nao_vira_telefone(bruto):
+    """`@lid` é identificador opaco, não número — aceitá-lo funde duas pessoas.
+
+    Um LID de 12 dígitos começando em 55 casa com `BR_SEM_9` e vira
+    exatamente a chave primária de um lead real.
+    """
+    assert canonicalizar(bruto) is None
+
+
+def test_sufixo_de_aparelho_nao_engole_numero_com_prefixo():
+    """`:\\d+$` sem âncora à esquerda comia o número inteiro do `From` do Twilio."""
+    assert canonicalizar("whatsapp:5511987654321") == "551187654321"
+    assert canonicalizar("whatsapp:+5511987654321") == "551187654321"
+
+
+def test_tronco_que_nao_fecha_com_forma_brasileira_e_recusado():
+    """O 0 declara discagem nacional, mas 11 dígitos sem o 9 não existem no BR.
+
+    Antes o `lstrip("0")` devolvia `11187654321` — número que o outbound
+    nunca alcança, virando chave primária em leads_crm.
+    """
+    assert canonicalizar("011187654321") is None
+    assert canonicalizar("55011187654321") is None
+
+
 def test_estrangeiro_continua_passando_por_digitos():
     """A recusa é só para o que se declara brasileiro e não fecha com nenhuma forma."""
     assert canonicalizar("14155550123") == "14155550123"
@@ -118,6 +153,20 @@ def test_resolver_ignora_remote_jid_alt():
 )
 def test_resolver_converge_as_formas_malformadas(remote_jid):
     assert resolver_telefone({"remoteJid": remote_jid}) == "551187654321"
+
+
+@pytest.mark.parametrize(
+    "remote_jid",
+    [
+        "274988654321@lid",
+        "551188654321@lid",
+        "274988654321:2@lid",
+    ],
+    ids=["lid", "lid_parece_br", "lid_com_device"],
+)
+def test_resolver_recusa_lid(remote_jid):
+    """O LID está em rollout no WhatsApp e não é telefone — vai para descarte."""
+    assert resolver_telefone({"remoteJid": remote_jid}) is None
 
 
 def test_resolver_recusa_jid_irreconhecivel():
