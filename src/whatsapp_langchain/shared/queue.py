@@ -33,18 +33,34 @@ from whatsapp_langchain.shared.models import (
 logger = structlog.get_logger()
 
 
+# Alvo explícito do ON CONFLICT: sem ele, o DO NOTHING engoliria em silêncio
+# qualquer unique constraint que a tabela venha a ganhar. Repete o predicado
+# do índice parcial da migração 009 para que o Postgres consiga inferi-lo.
+ALVO_DE_CONFLITO = (
+    "ON CONFLICT (channel, agent_id, message_id) "
+    "WHERE message_id IS NOT NULL DO NOTHING"
+)
+
+
 async def _buscar_por_message_id(
     conn: AsyncConnection[Any],
     channel_value: str,
+    agent_id: str,
     message_id: str | None,
 ) -> int | None:
-    """Id da linha já enfileirada para esse (canal, message_id), se existir."""
+    """Id da linha já enfileirada para esse (canal, agente, message_id).
+
+    `agent_id` faz parte da chave porque o mesmo payload entregue em
+    `?agent=a` e `?agent=b` são duas mensagens legítimas — sem ele, a
+    segunda seria tratada como reentrega da primeira.
+    """
     if not message_id:
         return None
 
     cursor = await conn.execute(
-        "SELECT id FROM message_queue WHERE channel = %s AND message_id = %s LIMIT 1",
-        (channel_value, message_id),
+        "SELECT id FROM message_queue "
+        "WHERE channel = %s AND agent_id = %s AND message_id = %s LIMIT 1",
+        (channel_value, agent_id, message_id),
     )
     row = await cursor.fetchone()
     return row[0] if row is not None else None
@@ -74,11 +90,13 @@ async def enqueue_or_buffer(
     - Concorrência protegida por pg_advisory_xact_lock(hash(phone+agent)).
 
     Idempotência: quando `message_id` vem preenchido, uma reentrega do mesmo
-    id no mesmo canal não vira linha nova nem é concatenada por debounce —
-    devolve o id da linha original com `is_duplicate=True`. Provedores
-    reentregam o webhook em timeout ou resposta >= 400; sem isso o lead
-    receberia a resposta duas vezes. O índice único parcial da migração 009
-    é a garantia final contra a corrida entre dois workers da API.
+    id no mesmo canal e agente não vira linha nova nem é concatenada por
+    debounce — devolve o id da linha original com `is_duplicate=True`.
+    Provedores reentregam o webhook em timeout ou resposta >= 400; sem isso o
+    lead receberia a resposta duas vezes. O mesmo payload em `?agent=a` e
+    `?agent=b` continua gerando duas linhas, que é o comportamento correto do
+    template. O índice único parcial da migração 009 é a garantia final
+    contra a corrida entre dois workers da API.
 
     Limitação conhecida: NumMedia > 1 no mesmo webhook fica fora do escopo.
 
@@ -129,7 +147,9 @@ async def enqueue_or_buffer(
         # aqui, antes do branch de debounce — o caminho de debounce faz
         # UPDATE, não INSERT, e escaparia do índice único da migração 009,
         # concatenando o mesmo texto duas vezes na mesma linha.
-        duplicada = await _buscar_por_message_id(conn, channel_value, message_id)
+        duplicada = await _buscar_por_message_id(
+            conn, channel_value, agent_id, message_id
+        )
         if duplicada is not None:
             await conn.commit()
             logger.info(
@@ -174,13 +194,13 @@ async def enqueue_or_buffer(
 
             # Inserir mídia com process_after=NOW() (sem buffer)
             cursor = await conn.execute(
-                """
+                f"""
                 INSERT INTO message_queue
                     (message_id, phone_number, to_number, agent_id,
                      thread_id, incoming_message, media_url, media_type,
                      outbound_token, channel, provider_message_key, process_after)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
-                ON CONFLICT DO NOTHING
+                {ALVO_DE_CONFLITO}
                 RETURNING id
                 """,
                 (
@@ -206,7 +226,7 @@ async def enqueue_or_buffer(
                 # o índice único suprimiu o INSERT. A linha vencedora é a
                 # resposta correta.
                 duplicada = await _buscar_por_message_id(
-                    conn, channel_value, message_id
+                    conn, channel_value, agent_id, message_id
                 )
                 await conn.commit()
                 if duplicada is None:
@@ -305,13 +325,13 @@ async def enqueue_or_buffer(
 
         # Nova mensagem de texto na fila
         cursor = await conn.execute(
-            """
+            f"""
             INSERT INTO message_queue
                 (message_id, phone_number, to_number, agent_id, thread_id,
                  incoming_message, media_url, media_type, outbound_token,
                  channel, provider_message_key, process_after)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT DO NOTHING
+            {ALVO_DE_CONFLITO}
             RETURNING id
             """,
             (
@@ -334,7 +354,9 @@ async def enqueue_or_buffer(
         row = await cursor.fetchone()
 
         if row is None:
-            duplicada = await _buscar_por_message_id(conn, channel_value, message_id)
+            duplicada = await _buscar_por_message_id(
+                conn, channel_value, agent_id, message_id
+            )
             await conn.commit()
             if duplicada is None:
                 raise RuntimeError(
