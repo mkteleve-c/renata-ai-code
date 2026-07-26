@@ -261,11 +261,19 @@ async def aplicar_gate(
                     "where phone in (%s, %s)",
                     (com_9, sem_9),
                 )
+            # Três estados distintos, não dois: "sem lead" não é "não estava
+            # pausado" — não havia o que pausar.
+            if not linhas:
+                pausa = "sem_lead"
+            elif ja_pausado:
+                pausa = "ja_pausado"
+            else:
+                pausa = "aplicada"
             logger.info(
                 "gate_descartado",
                 motivo="from_me",
                 telefone=canonico,
-                ja_pausado=ja_pausado,
+                pausa=pausa,
             )
             return ResultadoGate(False, "from_me", canonico)
 
