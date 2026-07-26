@@ -227,12 +227,35 @@ async def _transcribe_audio(media_bytes: bytes, media_type: str) -> str:
     )
 
 
+def _tem_via_de_download(
+    media_url: str | None,
+    canal: MessagingChannel | str,
+    message_key: dict | None,
+) -> bool:
+    """Indica se existe caminho para obter os bytes da mídia.
+
+    Para os demais canais a URL é a única via. Na Evolution a URL do
+    payload é cifrada e pode nem vir — quem baixa é a message_key via
+    getBase64FromMediaMessage.
+    """
+    if canal == MessagingChannel.EVOLUTION:
+        return bool(media_url) or bool(message_key)
+    return bool(media_url)
+
+
 async def preprocess_incoming_message(
     body: str,
     media_url: str | None = None,
     media_type: str | None = None,
+    canal: MessagingChannel | str = MessagingChannel.TWILIO,
+    message_key: dict | None = None,
 ) -> MediaPreprocessResult:
-    """Normaliza entrada para texto antes da chamada ao agente."""
+    """Normaliza entrada para texto antes da chamada ao agente.
+
+    `canal` e `message_key` vêm da mensagem da fila e decidem como a mídia
+    é baixada. Os defaults mantêm o comportamento histórico (Twilio) para
+    chamadores que não os informam.
+    """
     if not media_url and not media_type:
         return MediaPreprocessResult(
             should_invoke_agent=True,
@@ -241,7 +264,7 @@ async def preprocess_incoming_message(
         )
 
     # Payload de mídia incompleto: não invoca agente.
-    if not media_url or not media_type:
+    if not _tem_via_de_download(media_url, canal, message_key) or not media_type:
         return MediaPreprocessResult(
             should_invoke_agent=False,
             normalized_text=None,
@@ -276,7 +299,11 @@ async def preprocess_incoming_message(
         )
 
     try:
-        media_bytes = await download_media(media_url)
+        media_bytes = await download_media(
+            media_url or "",
+            canal=canal,
+            message_key=message_key,
+        )
 
         if kind == "image":
             description = await _describe_image(media_bytes, media_type)
@@ -328,12 +355,16 @@ async def build_human_message(
     body: str,
     media_url: str | None = None,
     media_type: str | None = None,
+    canal: MessagingChannel | str = MessagingChannel.TWILIO,
+    message_key: dict | None = None,
 ) -> HumanMessage:
     """Compatibilidade: retorna HumanMessage de texto (sem multimodal)."""
     pre = await preprocess_incoming_message(
         body=body,
         media_url=media_url,
         media_type=media_type,
+        canal=canal,
+        message_key=message_key,
     )
     text = pre.normalized_text or body or pre.auto_response or ""
     return HumanMessage(content=text)
