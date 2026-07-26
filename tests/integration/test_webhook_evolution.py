@@ -160,6 +160,75 @@ async def test_grupo_e_ignorado(limpar):
     assert r.json()["motivo"] == "telefone_invalido"
 
 
+async def test_lid_e_descartado(limpar):
+    """`@lid` de 12 dígitos começando em 55 casaria com a chave de um lead real."""
+    lid = "551188654321"
+    pool = await get_pool()
+    async with pool.connection() as conn:
+        await conn.execute(
+            "delete from leads_crm where phone in (%s, %s)", (lid, "5511988654321")
+        )
+        await conn.execute(
+            "delete from message_queue where phone_number = %s", (f"+{lid}",)
+        )
+    request_history.pop(f"+{lid}", None)
+
+    async with await cliente() as c:
+        r = await c.post(
+            f"/webhook/evolution?agent={AGENTE}",
+            json=payload(remote_jid="551188654321@lid", message_id="MSG-LID"),
+        )
+
+    assert r.json()["motivo"] == "telefone_invalido"
+
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            "select 1 from leads_crm where phone in (%s, %s)",
+            (lid, "5511988654321"),
+        )
+        leads = await cur.fetchone()
+        cur = await conn.execute(
+            "select 1 from message_queue where phone_number = %s", (f"+{lid}",)
+        )
+        na_fila = await cur.fetchone()
+        await conn.execute(
+            "delete from leads_descartados where phone_original = %s", (f"{lid}@lid",)
+        )
+
+    assert leads is None, "LID não pode virar lead"
+    assert na_fila is None, "LID não pode virar linha na fila"
+
+
+async def test_descarte_retem_agente_e_instancia(limpar):
+    """Sem `agent` e `instance` o descarte não é reprocessável.
+
+    O `agent` vem da query string e o `instance` do topo do payload — nenhum
+    dos dois está dentro de `data`, que era tudo que ia para a tabela.
+    """
+    jid = "999888777666555@lid"
+    async with await cliente() as c:
+        await c.post(
+            f"/webhook/evolution?agent={AGENTE}",
+            json=payload(remote_jid=jid, message_id="MSG-DESCARTE-CTX"),
+        )
+
+    pool = await get_pool()
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            "select payload from leads_descartados where phone_original = %s", (jid,)
+        )
+        linha = await cur.fetchone()
+        await conn.execute(
+            "delete from leads_descartados where phone_original = %s", (jid,)
+        )
+
+    assert linha is not None
+    retido = linha[0]
+    assert retido["agent"] == AGENTE
+    assert retido["instance"] == "instancia-apioficial"
+    assert retido["data"]["key"]["id"] == "MSG-DESCARTE-CTX"
+
+
 async def test_evento_nao_mensagem_e_ignorado(limpar):
     async with await cliente() as c:
         r = await c.post(

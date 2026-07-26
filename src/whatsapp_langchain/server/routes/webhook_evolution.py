@@ -298,9 +298,11 @@ async def _processar_mensagem(
         key,
         push_name=push_name if isinstance(push_name, str) else None,
         # Sem telefone resolvível o gate não tem onde gravar o lead, e o que
-        # ele retém em `leads_descartados` é este payload — a mensagem
-        # inteira, não só a key.
-        payload=data,
+        # ele retém em `leads_descartados` é este payload. `agent` vem da
+        # query string e `instance` do topo do corpo — nenhum dos dois está
+        # dentro de `data`, e sem eles não dá para saber por qual instância a
+        # mensagem entrou nem reconstruir o POST que a reprocessaria.
+        payload={"agent": agent, "instance": instance, "data": data},
     )
 
     if not resultado.aceito:
