@@ -1,0 +1,8 @@
+{
+  "dependencies": ["."],
+  "graphs": {
+    "rhawk_assistant": "./src/whatsapp_langchain/agents/catalog/rhawk_assistant/graph.py:graph",
+    "illumi_assistant": "./src/whatsapp_langchain/agents/catalog/illumi_assistant/graph.py:graph"
+  },
+  "env": ".env"
+}

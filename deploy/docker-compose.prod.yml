@@ -1,0 +1,204 @@
+# Stack de produção — Traefik + API + Worker + Frontend + DB.
+# Todos os serviços expostos publicamente passam por Traefik com TLS via Let's Encrypt.
+#
+# Pré-requisitos:
+#   1. DOMAIN apontando (registro A) para o IP público desta VPS.
+#   2. Portas 80 e 443 liberadas no firewall.
+#   3. Arquivo .env.prod preenchido (cp .env.prod.example .env.prod).
+#   4. Arquivo traefik/acme.json existente com permissão 600 (criado por scripts/init-vps.sh).
+#
+# Uso:
+#   cd deploy
+#   docker compose -f docker-compose.prod.yml --env-file .env.prod up -d --build
+#   docker compose -f docker-compose.prod.yml --env-file .env.prod logs -f
+
+name: whatsapp-langchain
+
+services:
+  # -------- Reverse proxy + TLS automático ----------------------------------
+  traefik:
+    image: traefik:v3.6.15
+    restart: unless-stopped
+    command:
+      # Entradas HTTP/HTTPS
+      - --entrypoints.web.address=:80
+      - --entrypoints.web.http.redirections.entrypoint.to=websecure
+      - --entrypoints.web.http.redirections.entrypoint.scheme=https
+      - --entrypoints.web.http.redirections.entrypoint.permanent=true
+      - --entrypoints.websecure.address=:443
+      # Entrypoint interno dedicado ao /ping (sem TLS, sem redirect) — usado
+      # pelo healthcheck do Docker. Porta 8080 = default do CLI
+      # `traefik healthcheck --ping`. Não é mapeado para o host.
+      - --entrypoints.traefik.address=:8080
+      - --ping=true
+      - --ping.entrypoint=traefik
+      # Provider Docker — descobre serviços via labels
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --providers.docker.network=whatsapp-net
+      # Let's Encrypt (HTTP-01 challenge na porta 80)
+      - --certificatesresolvers.letsencrypt.acme.email=${LETSENCRYPT_EMAIL:?LETSENCRYPT_EMAIL ausente em .env.prod}
+      - --certificatesresolvers.letsencrypt.acme.storage=/letsencrypt/acme.json
+      - --certificatesresolvers.letsencrypt.acme.httpchallenge=true
+      - --certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web
+      # Logs
+      - --log.level=${TRAEFIK_LOG_LEVEL:-INFO}
+      - --accesslog=true
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./traefik/acme.json:/letsencrypt/acme.json
+    networks:
+      - whatsapp-net
+    healthcheck:
+      test: ["CMD", "traefik", "healthcheck", "--ping"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # -------- PostgreSQL com pgvector ----------------------------------------
+  db:
+    build:
+      context: ..
+      dockerfile: Dockerfile.db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-whatsapp_langchain}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD ausente em .env.prod}
+    # Banco NÃO é exposto publicamente. Acesso via:
+    #   - https://${DOMAIN}/banco (pgweb, protegido por BasicAuth) — caminho oficial
+    #   - SSH tunnel pontual: ssh -L 5432:localhost:5432 user@vps + docker exec -it ... psql
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - whatsapp-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-whatsapp_langchain}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # -------- pgweb (visualizador web do Postgres em /banco) -----------------
+  # https://${DOMAIN}/banco — protegido por BasicAuth (PGWEB_AUTH_USER/PASS).
+  # Conecta direto na rede Docker (db:5432) — não exige porta exposta no host.
+  pgweb:
+    image: sosedoff/pgweb:0.16.2
+    restart: unless-stopped
+    environment:
+      PGWEB_DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-whatsapp_langchain}?sslmode=disable
+      PGWEB_AUTH_USER: ${PGWEB_AUTH_USER:?PGWEB_AUTH_USER ausente em .env.prod}
+      PGWEB_AUTH_PASS: ${PGWEB_AUTH_PASS:?PGWEB_AUTH_PASS ausente em .env.prod}
+    command:
+      - --bind=0.0.0.0
+      - --listen=8081
+      - --prefix=banco
+      - --lock-session
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - whatsapp-net
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=whatsapp-net"
+      - "traefik.http.routers.pgweb.rule=Host(`${DOMAIN}`) && PathPrefix(`/banco`)"
+      - "traefik.http.routers.pgweb.entrypoints=websecure"
+      - "traefik.http.routers.pgweb.tls=true"
+      - "traefik.http.routers.pgweb.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.pgweb.priority=90"
+      - "traefik.http.services.pgweb.loadbalancer.server.port=8081"
+
+  # -------- API FastAPI (webhooks + admin) ---------------------------------
+  api:
+    build:
+      context: ..
+      dockerfile: Dockerfile.api
+    restart: unless-stopped
+    env_file: .env.prod
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-whatsapp_langchain}
+      ENVIRONMENT: production
+      LOG_JSON: "true"
+      TWILIO_WEBHOOK_URL: https://${DOMAIN:?DOMAIN ausente em .env.prod}
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - whatsapp-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=whatsapp-net"
+      # Roteamento: webhook + endpoints administrativos do FastAPI.
+      # NÃO captura /api/auth/* (que pertence ao Better Auth no frontend).
+      - "traefik.http.routers.api.rule=Host(`${DOMAIN}`) && (PathPrefix(`/webhook`) || Path(`/health`) || PathPrefix(`/api/agents`) || PathPrefix(`/api/chats`) || PathPrefix(`/api/metrics`))"
+      - "traefik.http.routers.api.entrypoints=websecure"
+      - "traefik.http.routers.api.tls=true"
+      - "traefik.http.routers.api.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.api.priority=100"
+      - "traefik.http.services.api.loadbalancer.server.port=8000"
+
+  # -------- Worker (consumer da fila) --------------------------------------
+  worker:
+    build:
+      context: ..
+      dockerfile: Dockerfile.worker
+    restart: unless-stopped
+    env_file: .env.prod
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-whatsapp_langchain}
+      ENVIRONMENT: production
+      LOG_JSON: "true"
+    depends_on:
+      db:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    networks:
+      - whatsapp-net
+
+  # -------- Frontend Next.js (admin panel + Better Auth) -------------------
+  frontend:
+    build:
+      context: ..
+      dockerfile: Dockerfile.frontend
+    restart: unless-stopped
+    env_file: .env.prod
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-whatsapp_langchain}
+      INTERNAL_API_URL: http://api:8000
+      BETTER_AUTH_URL: https://${DOMAIN}
+      ENVIRONMENT: production
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      - whatsapp-net
+    labels:
+      - "traefik.enable=true"
+      - "traefik.docker.network=whatsapp-net"
+      # Catchall: tudo que não for capturado pela API cai aqui (UI + /api/auth/* do Better Auth).
+      - "traefik.http.routers.frontend.rule=Host(`${DOMAIN}`)"
+      - "traefik.http.routers.frontend.entrypoints=websecure"
+      - "traefik.http.routers.frontend.tls=true"
+      - "traefik.http.routers.frontend.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.frontend.priority=10"
+      - "traefik.http.services.frontend.loadbalancer.server.port=3000"
+
+networks:
+  whatsapp-net:
+    name: whatsapp-net
+    driver: bridge
+
+volumes:
+  postgres_data:
+    name: whatsapp-postgres-data

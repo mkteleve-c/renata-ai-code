@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <defs>
+    <linearGradient id="illumi" x1="48" y1="180" x2="208" y2="60" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#0017ff"/>
+      <stop offset=".5" stop-color="#0095f2"/>
+      <stop offset="1" stop-color="#a7e8fe"/>
+    </linearGradient>
+  </defs>
+  <g transform="translate(50.7 89.2) scale(1)">
+    <path fill="url(#illumi)" d="M88.4,66.3c16.2,16.2,43.1,15.1,57.9-3.3,11.2-14,11.2-34.3,0-48.3-14.7-18.4-41.7-19.5-57.9-3.3-3.4,3.4-6,7.2-7.8,11.3-3.1,6.8-9.7,11.2-17.2,11.2h-2.1c-6.3,0-12.2-3.1-15.7-8.4-1.7-2.6-4-5-6.8-6.9-8.5-5.9-20-5.8-28.3.2-14,10-14,30.6,0,40.6,8.4,6,19.9,6.1,28.3.2,2.8-1.9,5.1-4.3,6.8-6.9,3.4-5.3,9.4-8.4,15.7-8.4h2.3c7.4,0,14,4.4,17.1,11.1,1.8,4,4.4,7.7,7.7,10.9Z"/>
+  </g>
+</svg>
