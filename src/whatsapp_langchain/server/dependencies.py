@@ -148,6 +148,10 @@ async def verify_evolution_webhook_secret(request: Request) -> None:
     Aceita o valor em `X-Evolution-Webhook-Secret` ou em `apikey` (o nome
     que a própria Evolution usa nos headers dela).
 
+    Comparação em bytes: `hmac.compare_digest` sobre `str` levanta TypeError
+    se algum lado tem caractere fora de ASCII, e um header com acento viraria
+    500 — justamente a resposta que faz a Evolution reentregar em loop.
+
     Raises:
         HTTPException 401: Se o segredo está configurado e o header não bate.
     """
@@ -155,9 +159,12 @@ async def verify_evolution_webhook_secret(request: Request) -> None:
     if not esperado:
         return
 
+    esperado_bytes = esperado.encode("utf-8")
     for header in EVOLUTION_SECRET_HEADERS:
         recebido = request.headers.get(header)
-        if recebido and hmac.compare_digest(recebido.strip(), esperado):
+        if recebido and hmac.compare_digest(
+            recebido.strip().encode("utf-8"), esperado_bytes
+        ):
             logger.debug("evolution_webhook_secret_valido", header=header)
             return
 
