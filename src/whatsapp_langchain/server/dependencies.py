@@ -130,6 +130,41 @@ async def verify_service_token(request: Request) -> None:
     logger.debug("service_token_valid", path=str(request.url.path))
 
 
+EVOLUTION_SECRET_HEADERS = ("X-Evolution-Webhook-Secret", "apikey")
+
+
+async def verify_evolution_webhook_secret(request: Request) -> None:
+    """Verifica o segredo do webhook da Evolution, quando configurado.
+
+    A Evolution não assina o body — não há HMAC para conferir como em
+    Twilio/Meta. O que existe é o header estático que o operador configura
+    no webhook da instância. Sem isso, qualquer POST com `fromMe: true`
+    desliga o agente para o telefone que quiser.
+
+    Opcional por design: `EVOLUTION_WEBHOOK_SECRET` vazio (default de dev)
+    deixa a rota aberta. Preenchido, o header passa a ser obrigatório —
+    produção liga a proteção sem mudar código.
+
+    Aceita o valor em `X-Evolution-Webhook-Secret` ou em `apikey` (o nome
+    que a própria Evolution usa nos headers dela).
+
+    Raises:
+        HTTPException 401: Se o segredo está configurado e o header não bate.
+    """
+    esperado = settings.evolution_webhook_secret.strip()
+    if not esperado:
+        return
+
+    for header in EVOLUTION_SECRET_HEADERS:
+        recebido = request.headers.get(header)
+        if recebido and hmac.compare_digest(recebido.strip(), esperado):
+            logger.debug("evolution_webhook_secret_valido", header=header)
+            return
+
+    logger.warning("evolution_webhook_secret_invalido", path=str(request.url.path))
+    raise HTTPException(status_code=401, detail="Invalid Evolution webhook secret")
+
+
 async def check_rate_limit(phone_number: str) -> None:
     """Verifica rate limit por número de telefone.
 

@@ -99,6 +99,10 @@ class Settings(BaseSettings):
     evolution_base_url: str = ""
     evolution_api_key: str = ""
     evolution_instance: str = ""
+    # Segredo opcional do webhook inbound. A Evolution não assina o body;
+    # se preenchido aqui e configurado como header no webhook da instância,
+    # a rota passa a exigi-lo. Vazio = rota aberta (default de dev).
+    evolution_webhook_secret: str = ""
 
     # --- Rate Limit ---
     rate_limit_per_hour: int = 30
