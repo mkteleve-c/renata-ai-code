@@ -241,7 +241,13 @@ async def _processar_mensagem(
     pool = await get_pool()
     push_name = data.get("pushName")
     resultado = await aplicar_gate(
-        pool, key, push_name=push_name if isinstance(push_name, str) else None
+        pool,
+        key,
+        push_name=push_name if isinstance(push_name, str) else None,
+        # Sem telefone resolvível o gate não tem onde gravar o lead, e o que
+        # ele retém em `leads_descartados` é este payload — a mensagem
+        # inteira, não só a key.
+        payload=data,
     )
 
     if not resultado.aceito:

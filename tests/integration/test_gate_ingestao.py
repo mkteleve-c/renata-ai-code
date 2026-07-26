@@ -3,6 +3,7 @@
 import asyncio
 
 import pytest
+from psycopg.types.json import Jsonb
 
 from whatsapp_langchain.shared.db import get_pool
 from whatsapp_langchain.shared.leads import aplicar_gate
@@ -19,13 +20,23 @@ async def limpar():
         await conn.execute(
             "delete from leads_crm where phone in (%s, %s)", (TELEFONE, COM_9)
         )
-        await conn.execute("delete from blocklist where phone = %s", (TELEFONE,))
+        await conn.execute(
+            "delete from blocklist where phone in (%s, %s)", (TELEFONE, COM_9)
+        )
+        await conn.execute(
+            "delete from leads_descartados where phone_original like %s", ("%g.us",)
+        )
     yield
     async with pool.connection() as conn:
         await conn.execute(
             "delete from leads_crm where phone in (%s, %s)", (TELEFONE, COM_9)
         )
-        await conn.execute("delete from blocklist where phone = %s", (TELEFONE,))
+        await conn.execute(
+            "delete from blocklist where phone in (%s, %s)", (TELEFONE, COM_9)
+        )
+        await conn.execute(
+            "delete from leads_descartados where phone_original like %s", ("%g.us",)
+        )
 
 
 async def test_lead_novo_e_criado_e_aceito(limpar):
@@ -55,6 +66,30 @@ async def test_blocklist_descarta(limpar):
         (total,) = await cur.fetchone()
 
     assert total == 0, "blocklist descarta antes de qualquer escrita em leads_crm"
+
+
+async def test_blocklist_na_forma_com_9_descarta(limpar):
+    """Opt-out importado do n8n vem com o 9º dígito e precisa barrar do mesmo jeito.
+
+    O CHECK da blocklist aceita as duas formas e o lookup de leads_crm já
+    consultava as duas — só a blocklist olhava para a canônica.
+    """
+    pool = await get_pool()
+    async with pool.connection() as conn:
+        await conn.execute("insert into blocklist (phone) values (%s)", (COM_9,))
+
+    r = await aplicar_gate(pool, JID, push_name=None)
+
+    assert r.aceito is False
+    assert r.motivo == "blocklist"
+
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            "select count(*) from leads_crm where phone in (%s, %s)", (TELEFONE, COM_9)
+        )
+        (total,) = await cur.fetchone()
+
+    assert total == 0, "blocklist com 9 não pode deixar criar lead"
 
 
 async def test_from_me_desliga_agente_e_descarta(limpar):
@@ -198,6 +233,119 @@ async def test_consolida_duplicata_com_e_sem_9(limpar):
         (restantes,) = await cur.fetchone()
 
     assert restantes == 0, "a linha legada é apagada após a fusão"
+
+
+async def test_fusao_preserva_metadata_da_linha_legada(limpar):
+    """`metadata` tem default '{}' — coalesce por `is not None` nunca cai para a
+    linha antiga, e o DELETE seguinte torna a perda irreversível."""
+    pool = await get_pool()
+    async with pool.connection() as conn:
+        await conn.execute(
+            "insert into leads_crm (phone, metadata, last_interaction_at) "
+            "values (%s, %s, '2019-01-01')",
+            (COM_9, Jsonb({"origem": "linkedin", "utm": "camp-2024"})),
+        )
+        await conn.execute(
+            "insert into leads_crm (phone, metadata, last_interaction_at) "
+            "values (%s, %s, '2024-01-01')",
+            (TELEFONE, Jsonb({})),
+        )
+
+    r = await aplicar_gate(pool, JID, push_name=None)
+
+    assert r.aceito is True
+    assert r.lead["metadata"]["origem"] == "linkedin"
+    assert r.lead["metadata"]["utm"] == "camp-2024"
+
+
+async def test_fusao_registra_linhas_fundidas(limpar):
+    """A auditoria da fusão: os telefones originais são a única cópia do que
+    existia antes do DELETE da linha legada."""
+    pool = await get_pool()
+    async with pool.connection() as conn:
+        await conn.execute(
+            "insert into leads_crm (phone, last_interaction_at) "
+            "values (%s, '2019-01-01')",
+            (COM_9,),
+        )
+        await conn.execute(
+            "insert into leads_crm (phone, last_interaction_at) "
+            "values (%s, '2024-01-01')",
+            (TELEFONE,),
+        )
+
+    r = await aplicar_gate(pool, JID, push_name=None)
+
+    assert r.aceito is True
+    assert sorted(r.lead["metadata"]["linhas_fundidas"]) == sorted([TELEFONE, COM_9])
+
+
+async def test_fusao_da_precedencia_a_linha_vencedora_por_chave(limpar):
+    pool = await get_pool()
+    async with pool.connection() as conn:
+        await conn.execute(
+            "insert into leads_crm (phone, metadata, last_interaction_at) "
+            "values (%s, %s, '2019-01-01')",
+            (COM_9, Jsonb({"origem": "linkedin", "utm": "antiga"})),
+        )
+        await conn.execute(
+            "insert into leads_crm (phone, metadata, last_interaction_at) "
+            "values (%s, %s, '2024-01-01')",
+            (TELEFONE, Jsonb({"utm": "nova"})),
+        )
+
+    r = await aplicar_gate(pool, JID, push_name=None)
+
+    assert r.lead["metadata"]["utm"] == "nova", "a linha recente vence por chave"
+    assert r.lead["metadata"]["origem"] == "linkedin", "chave só da antiga sobrevive"
+
+
+async def test_fusao_preserva_o_maior_followup_count(limpar):
+    """Mesmo defeito do metadata: default 0 não é None e nunca cai para a antiga.
+
+    Não é observável no caminho aceito (o upsert zera), mas fica gravado na
+    fusão persistida e é o que o gate devolve no caminho de descarte.
+    """
+    pool = await get_pool()
+    async with pool.connection() as conn:
+        await conn.execute(
+            "insert into leads_crm (phone, agent_active, followup_count, "
+            "last_interaction_at) values (%s, false, 7, '2019-01-01')",
+            (COM_9,),
+        )
+        await conn.execute(
+            "insert into leads_crm (phone, agent_active, followup_count, "
+            "last_interaction_at) values (%s, true, 0, '2024-01-01')",
+            (TELEFONE,),
+        )
+
+    r = await aplicar_gate(pool, JID, push_name=None)
+
+    assert r.aceito is False
+    assert r.motivo == "agente_desligado"
+    assert r.lead["followup_count"] == 7
+
+
+async def test_telefone_invalido_e_retido_em_leads_descartados(limpar):
+    """Mensagem real de WhatsApp descartada não pode sumir só com uma linha de log."""
+    pool = await get_pool()
+    key = {"remoteJid": "1234-5678@g.us", "fromMe": False, "id": "MSG-DESCARTE"}
+
+    r = await aplicar_gate(pool, key, push_name=None, payload={"key": key})
+
+    assert r.aceito is False
+    assert r.motivo == "telefone_invalido"
+
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            "select motivo, payload from leads_descartados where phone_original = %s",
+            ("1234-5678@g.us",),
+        )
+        linha = await cur.fetchone()
+
+    assert linha is not None, "o descarte precisa ficar em leads_descartados"
+    assert linha[0] == "telefone_invalido"
+    assert linha[1]["key"]["id"] == "MSG-DESCARTE", "o payload precisa ser retido"
 
 
 async def test_consolida_duplicata_com_fase_nula(limpar):

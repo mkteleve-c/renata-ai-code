@@ -44,7 +44,12 @@ _FASE_RANK = {
     "agendou_sessao": 5,
 }
 
-_CAMPOS_MESCLAVEIS = (
+# Coalesce só vale para coluna em que NULL significa "sem dado". `metadata`
+# (default '{}') e `followup_count` (default 0) ficam de fora: o valor default
+# não é None, então a linha nova — justamente a que o gate acabou de criar —
+# venceria sempre e apagaria o da linha legada, que o DELETE da consolidação
+# leva junto. Ver `_fundir_metadata` e o max() de followup_count.
+_CAMPOS_COALESCIVEIS = (
     "pipedriveid",
     "name",
     "username",
@@ -53,8 +58,6 @@ _CAMPOS_MESCLAVEIS = (
     "qualificacao_notas",
     "google_event_id",
     "source",
-    "metadata",
-    "followup_count",
 )
 
 
@@ -116,13 +119,42 @@ def _vencedor_pausa(canonica: dict[str, Any], legada: dict[str, Any]) -> dict[st
     return _mais_recente(canonica, legada)
 
 
+def _telefones_ja_fundidos(metadata: Any) -> set[str]:
+    if isinstance(metadata, dict) and isinstance(metadata.get("linhas_fundidas"), list):
+        return {str(item) for item in metadata["linhas_fundidas"]}
+    return set()
+
+
+def _fundir_metadata(
+    recente: Any,
+    antiga: Any,
+    telefones: set[str],
+) -> dict[str, Any]:
+    """Mescla os dois JSONB, com a linha vencedora tendo precedência por chave.
+
+    `linhas_fundidas` guarda os telefones originais — depois do DELETE da
+    linha legada é a única prova de que ela existiu, e de qual identidade
+    virou qual. Fusões encadeadas acumulam: o que já estava registrado nas
+    duas linhas entra na lista da resultante.
+    """
+    base = dict(antiga) if isinstance(antiga, dict) else {}
+    topo = dict(recente) if isinstance(recente, dict) else {}
+
+    anteriores = _telefones_ja_fundidos(base) | _telefones_ja_fundidos(topo)
+
+    fundido: dict[str, Any] = {**base, **topo}
+    fundido["linhas_fundidas"] = sorted(anteriores | telefones)
+    return fundido
+
+
 def _fundir(canonica: dict[str, Any], legada: dict[str, Any]) -> dict[str, Any]:
     """Funde duas linhas do mesmo lead num dict só, sem tocar o banco.
 
     Campos de conteúdo: vale o valor de quem tem last_interaction_at mais
     recente, caindo para o valor da outra linha quando nulo. Fase: a mais
     avançada das duas — nunca a mais recente. Pausa do agente: ver
-    `_vencedor_pausa`. Puro por design — quem chama decide se e quando
+    `_vencedor_pausa`. `metadata` e `followup_count` não coalescem, ver
+    `_CAMPOS_COALESCIVEIS`. Puro por design — quem chama decide se e quando
     persistir o resultado.
     """
     recente = _mais_recente(canonica, legada)
@@ -130,8 +162,19 @@ def _fundir(canonica: dict[str, Any], legada: dict[str, Any]) -> dict[str, Any]:
 
     mesclado = {
         campo: recente[campo] if recente[campo] is not None else antiga[campo]
-        for campo in _CAMPOS_MESCLAVEIS
+        for campo in _CAMPOS_COALESCIVEIS
     }
+
+    mesclado["metadata"] = _fundir_metadata(
+        recente.get("metadata"),
+        antiga.get("metadata"),
+        {canonica["phone"], legada["phone"]},
+    )
+    # O maior vence (regra do spec): a escada de follow-up já percorrida não
+    # pode ser esquecida por uma linha nova que nasceu com 0.
+    mesclado["followup_count"] = max(
+        canonica["followup_count"] or 0, legada["followup_count"] or 0
+    )
 
     vencedor = _vencedor_pausa(canonica, legada)
     mesclado["agent_active"] = vencedor["agent_active"]
@@ -172,7 +215,7 @@ async def _persistir_consolidacao(
             mesclado["qualificacao_notas"],
             mesclado["google_event_id"],
             mesclado["source"],
-            Jsonb(mesclado["metadata"]) if mesclado["metadata"] is not None else None,
+            Jsonb(mesclado["metadata"]),
             mesclado["agent_active"],
             mesclado["followup_active"],
             mesclado["agent_reactivate_at"],
@@ -197,17 +240,49 @@ async def _persistir_consolidacao(
     return consolidada
 
 
+async def _reter_descarte(
+    pool: AsyncConnectionPool,
+    phone_original: str | None,
+    motivo: str,
+    payload: dict[str, Any] | None,
+) -> None:
+    """Grava em `leads_descartados` o que sai do gate sem telefone resolvível.
+
+    É mensagem real de WhatsApp: sem isto o único rastro é uma linha de log,
+    e o conteúdo do lead some. A gravação nunca pode derrubar a ingestão — a
+    Evolution reentrega tudo que responder >= 400 —, então falha aqui vira
+    aviso, não exceção.
+    """
+    try:
+        async with pool.connection() as conn:
+            await conn.execute(
+                "insert into leads_descartados (phone_original, motivo, payload) "
+                "values (%s, %s, %s)",
+                (phone_original, motivo, Jsonb(payload if payload is not None else {})),
+            )
+    except Exception as erro:
+        logger.warning("leads_descartados_nao_gravado", motivo=motivo, erro=str(erro))
+
+
 async def aplicar_gate(
     pool: AsyncConnectionPool,
     key: dict[str, Any],
     push_name: str | None,
+    payload: dict[str, Any] | None = None,
 ) -> ResultadoGate:
     canonico = resolver_telefone(key)
     if not canonico:
+        remote_jid = key.get("remoteJid")
         logger.info(
             "gate_descartado",
             motivo="telefone_invalido",
-            remote_jid=key.get("remoteJid"),
+            remote_jid=remote_jid,
+        )
+        await _reter_descarte(
+            pool,
+            str(remote_jid) if remote_jid else None,
+            "telefone_invalido",
+            payload if payload is not None else {"key": key},
         )
         return ResultadoGate(False, "telefone_invalido")
 
@@ -218,7 +293,13 @@ async def aplicar_gate(
         # Liberado automaticamente no commit/rollback desta transação.
         await cur.execute("select pg_advisory_xact_lock(%s)", (_lock_key(canonico),))
 
-        await cur.execute("select 1 from blocklist where phone = %s", (canonico,))
+        # As duas variações, igual ao lookup do lead: o CHECK da blocklist
+        # aceita as duas formas e o opt-out importado do n8n veio com o 9º
+        # dígito. Consultar só a canônica deixava esse opt-out sem efeito
+        # nenhum — criava o lead e enfileirava a mensagem.
+        await cur.execute(
+            "select 1 from blocklist where phone in (%s, %s)", (com_9, sem_9)
+        )
         if await cur.fetchone():
             logger.info("gate_descartado", motivo="blocklist", telefone=canonico)
             return ResultadoGate(False, "blocklist", canonico)
