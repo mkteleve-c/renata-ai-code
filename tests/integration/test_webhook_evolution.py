@@ -12,6 +12,7 @@ from whatsapp_langchain.shared.db import get_pool
 
 TELEFONE = "551166665555"
 AGENTE = "illumi_assistant"
+OUTRO_AGENTE = "rhawk_assistant"
 JID = "5511966665555@s.whatsapp.net"
 
 
@@ -107,6 +108,22 @@ async def unica_linha(colunas: str = "*") -> Any:
     linhas = await linhas_na_fila(colunas)
     assert len(linhas) == 1, f"esperava 1 linha na fila, veio {len(linhas)}"
     return linhas[0]
+
+
+async def lead_do_teste(colunas: str = "*") -> Any | None:
+    """Linha de leads_crm do telefone de teste, ou None se não existe.
+
+    `xmin` é o id da transação que escreveu a versão atual da linha: se um
+    UPDATE roda, ele muda mesmo que nenhuma coluna mude de valor. É como se
+    observa "o UPDATE não foi refeito" sem depender de coluna de auditoria,
+    que leads_crm não tem.
+    """
+    pool = await get_pool()
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            f"select {colunas} from leads_crm where phone = %s", (TELEFONE,)
+        )
+        return await cur.fetchone()
 
 
 async def test_mensagem_valida_entra_na_fila(limpar):
@@ -222,6 +239,39 @@ async def test_reacao_nao_invoca_o_agente(limpar):
     assert await linhas_na_fila("id") == []
 
 
+async def test_reacao_de_lead_nao_cria_lead(limpar):
+    """O guard tem que cortar antes do gate, que escreve em leads_crm."""
+    corpo = payload_tipo(
+        "reactionMessage",
+        {"reactionMessage": {"text": "👍", "key": {"id": "MSG1"}}},
+    )
+
+    async with await cliente() as c:
+        r = await c.post(f"/webhook/evolution?agent={AGENTE}", json=corpo)
+
+    assert r.json()["motivo"] == "conteudo_nao_suportado"
+    assert await lead_do_teste("phone") is None, "um emoji não pode criar lead"
+
+
+async def test_reacao_de_lead_nao_altera_lead_existente(limpar):
+    async with await cliente() as c:
+        await c.post(f"/webhook/evolution?agent={AGENTE}", json=payload())
+
+    antes = await lead_do_teste("xmin::text, followup_count, last_interaction_at")
+    assert antes is not None
+
+    corpo = payload_tipo(
+        "reactionMessage",
+        {"reactionMessage": {"text": "👍", "key": {"id": "MSG-REACAO"}}},
+    )
+    async with await cliente() as c:
+        r = await c.post(f"/webhook/evolution?agent={AGENTE}", json=corpo)
+
+    assert r.json()["motivo"] == "conteudo_nao_suportado"
+    depois = await lead_do_teste("xmin::text, followup_count, last_interaction_at")
+    assert depois == antes, "reação não pode renovar last_interaction_at"
+
+
 async def test_mensagem_apagada_nao_invoca_o_agente(limpar):
     corpo = payload_tipo(
         "protocolMessage",
@@ -254,7 +304,12 @@ async def test_sticker_entra_como_midia_com_url(limpar):
     assert linha[2] == ""
 
 
-async def test_midia_sem_url_e_sem_legenda_e_ignorada(limpar):
+async def test_audio_sem_url_entra_na_fila_como_midia(limpar):
+    """Na Evolution a URL é inútil — quem baixa é a provider_message_key.
+
+    Descartar mídia sem URL perderia áudio de lead em silêncio, com 200 e
+    sem reentrega.
+    """
     corpo = payload_tipo(
         "audioMessage",
         {"audioMessage": {"seconds": 3}},
@@ -265,8 +320,39 @@ async def test_midia_sem_url_e_sem_legenda_e_ignorada(limpar):
         r = await c.post(f"/webhook/evolution?agent={AGENTE}", json=corpo)
 
     assert r.status_code == 200
-    assert r.json()["motivo"] == "conteudo_nao_suportado"
-    assert await linhas_na_fila("id") == []
+    assert r.json()["status"] == "ok"
+
+    linha = await unica_linha("media_url, media_type, provider_message_key")
+    assert linha[0] is None
+    assert linha[1] == "audio/ogg"
+    assert linha[2] == {"remoteJid": JID, "fromMe": False, "id": "MSG-AUDIO"}
+
+
+async def test_midia_com_legenda_e_sem_url_entra_como_midia(limpar):
+    """Com legenda a mensagem tem texto — não pode cair no branch de texto.
+
+    Se caísse, media_url e media_type iriam nulos para o banco e o worker
+    nunca a trataria como mídia, tornando o provider_message_key inútil.
+    """
+    corpo = payload_tipo(
+        "imageMessage",
+        {"imageMessage": {"caption": "olha isso"}},
+        message_id="MSG-IMG-SEM-URL",
+    )
+
+    async with await cliente() as c:
+        r = await c.post(f"/webhook/evolution?agent={AGENTE}", json=corpo)
+
+    assert r.status_code == 200
+    assert r.json()["status"] == "ok"
+
+    linha = await unica_linha(
+        "media_url, media_type, incoming_message, provider_message_key"
+    )
+    assert linha[0] is None
+    assert linha[1] == "image/jpeg"
+    assert linha[2] == "olha isso"
+    assert linha[3] == {"remoteJid": JID, "fromMe": False, "id": "MSG-IMG-SEM-URL"}
 
 
 async def test_mensagem_sem_campo_message_e_ignorada(limpar):
@@ -362,6 +448,76 @@ async def test_reentrega_de_midia_nao_duplica_a_fila(limpar):
     assert primeira.json()["status"] == "ok"
     assert segunda.json()["motivo"] == "duplicata"
     assert len(await linhas_na_fila("id")) == 1
+
+
+async def test_mesmo_message_id_em_dois_agentes_gera_duas_linhas(limpar):
+    """Multi-agente é mecanismo do template, não reentrega.
+
+    O mesmo payload em ?agent=a e ?agent=b são duas mensagens legítimas.
+    Com a chave de dedupe sem agent_id, a segunda virava "duplicata" e
+    devolvia o queue_id do primeiro agente.
+    """
+    async with await cliente() as c:
+        primeira = await c.post(f"/webhook/evolution?agent={AGENTE}", json=payload())
+        segunda = await c.post(
+            f"/webhook/evolution?agent={OUTRO_AGENTE}", json=payload()
+        )
+
+    assert primeira.json()["status"] == "ok"
+    assert segunda.json()["status"] == "ok", segunda.text
+    assert segunda.json()["queue_id"] != primeira.json()["queue_id"]
+
+    linhas = await linhas_na_fila("agent_id, message_id")
+    assert len(linhas) == 2
+    assert {linha[0] for linha in linhas} == {AGENTE, OUTRO_AGENTE}
+    assert {linha[1] for linha in linhas} == {"MSG1"}
+
+
+async def test_from_me_repetido_nao_reescreve_o_lead(limpar):
+    """Rajada de fromMe é o único caminho destrutivo sem rate limit.
+
+    O primeiro fromMe desliga o agente; do segundo em diante o UPDATE seria
+    no-op e não deve ser executado.
+    """
+    async with await cliente() as c:
+        await c.post(f"/webhook/evolution?agent={AGENTE}", json=payload())
+
+        primeiro = await c.post(
+            f"/webhook/evolution?agent={AGENTE}",
+            json=payload(from_me=True, message_id="HUMANO-1"),
+        )
+        apos_primeiro = await lead_do_teste("xmin::text, agent_active")
+
+        segundo = await c.post(
+            f"/webhook/evolution?agent={AGENTE}",
+            json=payload(from_me=True, message_id="HUMANO-2"),
+        )
+        apos_segundo = await lead_do_teste("xmin::text, agent_active")
+
+    assert primeiro.json()["motivo"] == "from_me"
+    assert segundo.json()["motivo"] == "from_me"
+    assert apos_primeiro is not None and apos_primeiro[1] is False
+    assert apos_segundo == apos_primeiro, "o segundo fromMe refez o UPDATE"
+
+
+async def test_header_com_caractere_nao_ascii_da_401(limpar, monkeypatch):
+    """compare_digest sobre str não-ASCII levanta TypeError → 500 → loop.
+
+    O valor vai como bytes latin-1 porque é assim que trafega no fio: o
+    httpx recusa str não-ASCII em header, e o Starlette decodifica de volta
+    para `str` com latin-1 antes de a rota ver.
+    """
+    monkeypatch.setattr(settings, "evolution_webhook_secret", "segredo-forte")
+
+    async with await cliente() as c:
+        r = await c.post(
+            f"/webhook/evolution?agent={AGENTE}",
+            json=payload(),
+            headers={"apikey": "café".encode("latin-1")},
+        )
+
+    assert r.status_code == 401, r.text
+    assert await linhas_na_fila("id") == []
 
 
 async def test_secret_configurado_rejeita_header_errado(limpar, monkeypatch):
