@@ -41,3 +41,6 @@ pgdata/
 
 # Scratch do subagent-driven-development
 .superpowers/
+
+# Override local de porta do compose
+docker-compose.override.yml
