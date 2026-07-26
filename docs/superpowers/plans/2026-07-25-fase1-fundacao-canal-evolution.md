@@ -19,7 +19,13 @@
 - **Idioma do código e dos commits: português brasileiro.** Conventional Commits (`feat:`, `fix:`, `test:`, `docs:`, `chore:`).
 - **Sem comentários óbvios nem docstrings longas** — o código do harness é didático por design, mas não redundante.
 - **Todo commit termina com:** `Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>`
-- **Rodar `make check` antes de cada commit** (lint + format-check + typecheck).
+- **Lint e tipos antes de cada commit, escopados aos arquivos alterados:**
+  `uv run ruff check <arquivos>`, `uv run ruff format --check <arquivos>`,
+  `uv run pyright <arquivos>`.
+  **Não use `make check` como gate**: `stress/locustfile.py` já tem 9 erros de
+  lint no commit base desta branch, herdados do template. Exigir `make check`
+  limpo faria cada tarefa perseguir um problema que não é dela. Corrigir o
+  locustfile é trabalho separado, fora do escopo desta fase.
 - Valores fixos desta instância: servidor Evolution `https://evolution.ju39tu.easypanel.host`, instância `instancia-apioficial`, integração `WHATSAPP-BUSINESS`.
 
 ---
