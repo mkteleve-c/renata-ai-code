@@ -133,11 +133,19 @@ class TwilioWebhookPayload(BaseModel):
 class EnqueueResult(BaseModel):
     """Resultado de uma operação de enqueue.
 
-    Indica se a mensagem foi inserida na fila ou buffered (debounce).
+    Indica se a mensagem foi inserida na fila, buffered (debounce) ou
+    descartada por já existir (reentrega do provedor).
     """
 
     message_id: int
     is_buffered: bool = Field(
         default=False,
         description="True se a mensagem foi concatenada a uma existente (debounce)",
+    )
+    is_duplicate: bool = Field(
+        default=False,
+        description=(
+            "True se o message_id do provedor já estava na fila — nada foi "
+            "inserido nem concatenado, message_id aponta para a linha original"
+        ),
     )

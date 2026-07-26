@@ -20,6 +20,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import structlog
+from psycopg import AsyncConnection
 from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
 
@@ -30,6 +31,23 @@ from whatsapp_langchain.shared.models import (
 )
 
 logger = structlog.get_logger()
+
+
+async def _buscar_por_message_id(
+    conn: AsyncConnection[Any],
+    channel_value: str,
+    message_id: str | None,
+) -> int | None:
+    """Id da linha já enfileirada para esse (canal, message_id), se existir."""
+    if not message_id:
+        return None
+
+    cursor = await conn.execute(
+        "SELECT id FROM message_queue WHERE channel = %s AND message_id = %s LIMIT 1",
+        (channel_value, message_id),
+    )
+    row = await cursor.fetchone()
+    return row[0] if row is not None else None
 
 
 async def enqueue_or_buffer(
@@ -55,6 +73,13 @@ async def enqueue_or_buffer(
       para que o worker processe o texto ANTES da mídia (ordenação por created_at).
     - Concorrência protegida por pg_advisory_xact_lock(hash(phone+agent)).
 
+    Idempotência: quando `message_id` vem preenchido, uma reentrega do mesmo
+    id no mesmo canal não vira linha nova nem é concatenada por debounce —
+    devolve o id da linha original com `is_duplicate=True`. Provedores
+    reentregam o webhook em timeout ou resposta >= 400; sem isso o lead
+    receberia a resposta duas vezes. O índice único parcial da migração 009
+    é a garantia final contra a corrida entre dois workers da API.
+
     Limitação conhecida: NumMedia > 1 no mesmo webhook fica fora do escopo.
 
     Args:
@@ -68,14 +93,17 @@ async def enqueue_or_buffer(
         message_id: ID externo da mensagem, ex: Twilio MessageSid (opcional).
         buffer_seconds: Segundos de debounce. Default: 2.0.
         provider_message_key: Key completa da mensagem no provedor (ex: data.key
-            da Evolution), gravada apenas quando há mídia. Vazia para os demais
-            canais.
+            da Evolution), necessária quando o download de mídia exige mais que
+            o id. Vazia para os demais canais.
 
     Returns:
-        EnqueueResult com message_id e se foi buffered.
+        EnqueueResult com message_id, se foi buffered e se era duplicata.
     """
     thread_id = f"{phone_number}:{agent_id}"
     has_media = media_url is not None
+    # "" é ausência de id disfarçada (a uazapi manda string vazia quando o
+    # payload não traz messageid) e não pode participar da deduplicação.
+    message_id = message_id or None
     channel_value = (
         channel.value if isinstance(channel, MessagingChannel) else str(channel)
     )
@@ -96,6 +124,25 @@ async def enqueue_or_buffer(
         # Lock transacional: serializa debounce para o mesmo phone+agent.
         # Liberado automaticamente no commit/rollback da transação.
         await conn.execute("SELECT pg_advisory_xact_lock(%s)", (lock_key,))
+
+        # Reentrega do provedor: o id já virou linha. Precisa ser checado
+        # aqui, antes do branch de debounce — o caminho de debounce faz
+        # UPDATE, não INSERT, e escaparia do índice único da migração 009,
+        # concatenando o mesmo texto duas vezes na mesma linha.
+        duplicada = await _buscar_por_message_id(conn, channel_value, message_id)
+        if duplicada is not None:
+            await conn.commit()
+            logger.info(
+                "message_duplicate_ignored",
+                message_id=duplicada,
+                provider_message_id=message_id,
+                phone=phone_number,
+                agent_id=agent_id,
+                channel=channel_value,
+            )
+            return EnqueueResult(
+                message_id=duplicada, is_buffered=False, is_duplicate=True
+            )
 
         if has_media:
             # Mídia: flush texto pendente e inserir imediatamente.
@@ -133,6 +180,7 @@ async def enqueue_or_buffer(
                      thread_id, incoming_message, media_url, media_type,
                      outbound_token, channel, provider_message_key, process_after)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                ON CONFLICT DO NOTHING
                 RETURNING id
                 """,
                 (
@@ -152,7 +200,32 @@ async def enqueue_or_buffer(
                 ),
             )
             row = await cursor.fetchone()
-            assert row is not None
+
+            if row is None:
+                # Corrida perdida com outra requisição do mesmo message_id:
+                # o índice único suprimiu o INSERT. A linha vencedora é a
+                # resposta correta.
+                duplicada = await _buscar_por_message_id(
+                    conn, channel_value, message_id
+                )
+                await conn.commit()
+                if duplicada is None:
+                    raise RuntimeError(
+                        "INSERT de mídia suprimido sem linha correspondente "
+                        f"para message_id={message_id!r}"
+                    )
+                logger.info(
+                    "message_duplicate_ignored",
+                    message_id=duplicada,
+                    provider_message_id=message_id,
+                    phone=phone_number,
+                    agent_id=agent_id,
+                    channel=channel_value,
+                )
+                return EnqueueResult(
+                    message_id=duplicada, is_buffered=False, is_duplicate=True
+                )
+
             new_id = row[0]
             await conn.commit()
 
@@ -203,10 +276,21 @@ async def enqueue_or_buffer(
                 SET incoming_message = %s,
                     process_after = %s,
                     outbound_token = COALESCE(%s, outbound_token),
+                    provider_message_key = COALESCE(
+                        %s, provider_message_key
+                    ),
                     updated_at = NOW()
                 WHERE id = %s
                 """,
-                (new_body, process_after, outbound_token, existing_id),
+                (
+                    new_body,
+                    process_after,
+                    outbound_token,
+                    Jsonb(provider_message_key)
+                    if provider_message_key is not None
+                    else None,
+                    existing_id,
+                ),
             )
             await conn.commit()
 
@@ -225,8 +309,9 @@ async def enqueue_or_buffer(
             INSERT INTO message_queue
                 (message_id, phone_number, to_number, agent_id, thread_id,
                  incoming_message, media_url, media_type, outbound_token,
-                 channel, process_after)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 channel, provider_message_key, process_after)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT DO NOTHING
             RETURNING id
             """,
             (
@@ -240,11 +325,34 @@ async def enqueue_or_buffer(
                 None,
                 outbound_token,
                 channel_value,
+                Jsonb(provider_message_key)
+                if provider_message_key is not None
+                else None,
                 process_after,
             ),
         )
         row = await cursor.fetchone()
-        assert row is not None
+
+        if row is None:
+            duplicada = await _buscar_por_message_id(conn, channel_value, message_id)
+            await conn.commit()
+            if duplicada is None:
+                raise RuntimeError(
+                    "INSERT de texto suprimido sem linha correspondente "
+                    f"para message_id={message_id!r}"
+                )
+            logger.info(
+                "message_duplicate_ignored",
+                message_id=duplicada,
+                provider_message_id=message_id,
+                phone=phone_number,
+                agent_id=agent_id,
+                channel=channel_value,
+            )
+            return EnqueueResult(
+                message_id=duplicada, is_buffered=False, is_duplicate=True
+            )
+
         new_id = row[0]
         await conn.commit()
 
