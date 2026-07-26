@@ -23,8 +23,6 @@ from typing import Any
 import httpx
 import structlog
 
-from whatsapp_langchain.worker.uazapi_client import split_message_body
-
 logger = structlog.get_logger()
 
 TIMEOUT = httpx.Timeout(30.0)
@@ -259,3 +257,39 @@ def _extract_message_id(dados: dict[str, Any]) -> str | None:
         return None
     msg_id = key.get("id")
     return msg_id if isinstance(msg_id, str) and msg_id else None
+
+
+def split_message_body(body: str, limit: int = EVOLUTION_TEXT_BODY_LIMIT) -> list[str]:
+    """Divide mensagens longas para respeitar o limite da Cloud API (4096 chars)."""
+    if limit <= 0:
+        raise ValueError("limit deve ser maior que zero")
+
+    if len(body) <= limit:
+        return [body]
+
+    chunks: list[str] = []
+    remaining = body
+
+    while remaining:
+        if len(remaining) <= limit:
+            chunks.append(remaining)
+            break
+
+        split_at = -1
+        for sep in ("\n\n", "\n", " "):
+            idx = remaining.rfind(sep, 0, limit + 1)
+            if idx > 0:
+                split_at = idx
+                break
+
+        if split_at <= 0:
+            split_at = limit
+
+        chunk = remaining[:split_at].rstrip()
+        if not chunk:
+            chunk = remaining[:limit]
+
+        chunks.append(chunk)
+        remaining = remaining[len(chunk) :].lstrip()
+
+    return chunks
