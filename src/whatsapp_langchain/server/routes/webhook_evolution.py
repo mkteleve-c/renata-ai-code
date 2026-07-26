@@ -271,9 +271,10 @@ async def _processar_mensagem(
         message_id=message_id,
         buffer_seconds=settings.message_buffer_seconds,
         # A key é a única via de download na Evolution (`download_media`
-        # ignora a URL nesse canal), então grava sempre que há mídia — mesmo
-        # sem URL o media_type já identifica a mensagem como mídia.
-        provider_message_key=key if media_type else None,
+        # ignora a URL nesse canal), então grava sempre que há mídia. Key
+        # vazia vira None: sem `id`/`remoteJid` ela não baixa nada, e é o
+        # que diz a `enqueue_or_buffer` que não há via de download.
+        provider_message_key=key if media_type and key else None,
     )
 
     if enfileirado.is_duplicate:
