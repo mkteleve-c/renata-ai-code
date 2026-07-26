@@ -288,6 +288,46 @@ class Settings(BaseSettings):
             },
         }
 
+    def _evolution_webhook_secret_errors(self) -> list[str]:
+        """Exige segredo no webhook inbound da Evolution em produção.
+
+        A Evolution não assina o body — o único gate do inbound é o header
+        estático. Com `EVOLUTION_WEBHOOK_SECRET` vazia a rota aceita
+        qualquer POST: texto arbitrário e `remoteJid` escolhido pelo
+        atacante viram lead, fila, agente e **mensagem de WhatsApp saindo
+        pelo número oficial Meta do cliente** para o telefone que ele
+        quiser. Custo de LLM, `leads_crm` envenenado e risco de ban do
+        número. A URL é adivinhável: os ids de agente são públicos no
+        repositório template.
+
+        Vale independente do modo outbound: quem abre a porta é a rota
+        inbound, que não olha `OUTBOUND_MODE`.
+        """
+        if not self.is_production:
+            return []
+
+        touched, _ = self._evolution_credentials_status()
+        if not touched:
+            return []
+
+        secret = self.evolution_webhook_secret.strip()
+        if not secret:
+            return [
+                "Canal 'evolution' configurado em produção exige "
+                "EVOLUTION_WEBHOOK_SECRET — sem ele /webhook/evolution aceita "
+                "qualquer POST e um terceiro dispara mensagem pelo número "
+                "oficial do cliente. Gere com: openssl rand -base64 32"
+            ]
+
+        if len(secret) < MIN_PRODUCTION_SECRET_LENGTH:
+            return [
+                "Production requer valor forte para EVOLUTION_WEBHOOK_SECRET "
+                f"(mínimo {MIN_PRODUCTION_SECRET_LENGTH} caracteres). "
+                "Gere com: openssl rand -base64 32"
+            ]
+
+        return []
+
     def validate_runtime_settings(self) -> None:
         """Valida configuração mínima e hardening por ambiente.
 
@@ -308,19 +348,22 @@ class Settings(BaseSettings):
                 "Atualize as env vars antes do deploy."
             )
 
-        # Em modo mock, credenciais são opcionais — o cliente simula envio.
-        if self.resolved_outbound_mode == "mock":
-            return
-
         errors: list[str] = []
-        for channel, status in self.channel_status().items():
-            if status["touched"] and status["missing"]:
-                missing_list = ", ".join(status["missing"])  # type: ignore[arg-type]
-                errors.append(
-                    f"Canal '{channel}' está parcialmente configurado em "
-                    f"modo real — preencha: {missing_list} (ou zere todas as "
-                    f"credenciais do canal para desabilitá-lo)."
-                )
+
+        # Em modo mock, credenciais outbound são opcionais — o cliente simula
+        # envio. O segredo do webhook inbound não entra nessa isenção.
+        if self.resolved_outbound_mode != "mock":
+            for channel, status in self.channel_status().items():
+                if status["touched"] and status["missing"]:
+                    missing_list = ", ".join(status["missing"])  # type: ignore[arg-type]
+                    errors.append(
+                        f"Canal '{channel}' está parcialmente configurado em "
+                        f"modo real — preencha: {missing_list} (ou zere todas as "
+                        f"credenciais do canal para desabilitá-lo)."
+                    )
+
+        errors.extend(self._evolution_webhook_secret_errors())
+
         if errors:
             raise ValueError(" | ".join(errors))
 

@@ -141,9 +141,10 @@ async def verify_evolution_webhook_secret(request: Request) -> None:
     no webhook da instância. Sem isso, qualquer POST com `fromMe: true`
     desliga o agente para o telefone que quiser.
 
-    Opcional por design: `EVOLUTION_WEBHOOK_SECRET` vazio (default de dev)
-    deixa a rota aberta. Preenchido, o header passa a ser obrigatório —
-    produção liga a proteção sem mudar código.
+    Opcional só em dev: `EVOLUTION_WEBHOOK_SECRET` vazio deixa a rota
+    aberta. Em produção com o canal Evolution configurado, a ausência (ou
+    um valor fraco) derruba o boot em `settings.validate_runtime_settings()`
+    — a rota nunca chega a subir aberta em produção.
 
     Aceita o valor em `X-Evolution-Webhook-Secret` ou em `apikey` (o nome
     que a própria Evolution usa nos headers dela).

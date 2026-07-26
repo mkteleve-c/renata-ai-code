@@ -28,6 +28,9 @@ def test_settings_da_evolution_tem_default_vazio():
     assert s.evolution_instance == ""
 
 
+SEGREDO_FORTE = "s" * MIN_PRODUCTION_SECRET_LENGTH
+
+
 def _producao(**kwargs) -> Settings:
     return Settings(
         environment="production",
@@ -65,6 +68,7 @@ class TestChannelStatusEvolution:
             evolution_base_url="https://evolution.exemplo.host",
             evolution_api_key="chave",
             evolution_instance="instancia-teste",
+            evolution_webhook_secret=SEGREDO_FORTE,
         )
         status = s.channel_status()
         assert status["evolution"]["touched"] is True
@@ -82,3 +86,64 @@ class TestChannelStatusEvolution:
         status = s.channel_status()
         assert status["evolution"]["complete"] is True
         s.validate_runtime_settings()
+
+
+class TestWebhookSecretEmProducao:
+    """Sem secret, `/webhook/evolution` aceita qualquer POST.
+
+    O vetor caro não é o `fromMe`: é um POST anônimo com texto arbitrário e
+    `remoteJid` escolhido pelo atacante — o gate cria o lead, a fila roda, o
+    agente responde, e sai mensagem pelo número oficial Meta do cliente para
+    um telefone qualquer. A URL é adivinhável: os ids de agente são públicos
+    no repositório template.
+    """
+
+    def test_producao_com_canal_configurado_e_sem_secret_derruba_o_boot(self):
+        s = _producao(
+            evolution_base_url="https://evolution.exemplo.host",
+            evolution_api_key="chave",
+            evolution_instance="instancia-teste",
+        )
+        with pytest.raises(ValueError, match="EVOLUTION_WEBHOOK_SECRET"):
+            s.validate_runtime_settings()
+
+    def test_producao_com_secret_fraco_derruba_o_boot(self):
+        s = _producao(
+            evolution_base_url="https://evolution.exemplo.host",
+            evolution_api_key="chave",
+            evolution_instance="instancia-teste",
+            evolution_webhook_secret="123",
+        )
+        with pytest.raises(ValueError, match="EVOLUTION_WEBHOOK_SECRET"):
+            s.validate_runtime_settings()
+
+    def test_producao_em_outbound_mock_tambem_exige_secret(self):
+        """A rota inbound fica aberta independente do modo outbound."""
+        s = Settings(
+            environment="production",
+            internal_service_token="x" * MIN_PRODUCTION_SECRET_LENGTH,
+            outbound_mode="mock",
+            evolution_base_url="https://evolution.exemplo.host",
+            evolution_api_key="chave",
+            evolution_instance="instancia-teste",
+        )
+        with pytest.raises(ValueError, match="EVOLUTION_WEBHOOK_SECRET"):
+            s.validate_runtime_settings()
+
+    def test_producao_sem_canal_evolution_nao_exige_secret(self):
+        _producao(
+            twilio_account_sid="AC123",
+            twilio_api_key_sid="SK123",
+            twilio_api_key_secret="segredo",
+            twilio_from_number="whatsapp:+5511999999999",
+        ).validate_runtime_settings()
+
+    def test_desenvolvimento_sem_secret_continua_livre(self):
+        Settings(
+            environment="development",
+            internal_service_token="token-local",
+            outbound_mode="real",
+            evolution_base_url="https://evolution.exemplo.host",
+            evolution_api_key="chave",
+            evolution_instance="instancia-teste",
+        ).validate_runtime_settings()
