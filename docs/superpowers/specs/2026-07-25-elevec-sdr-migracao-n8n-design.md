@@ -60,6 +60,25 @@ Os dois zeros documentam buracos do fluxo atual: o e-mail é coletado na convers
 mas nunca gravado, e o handover é permanente na prática (a coluna de reativação
 existe e é lida pelo cron, mas nada nunca a preenche).
 
+### Qualidade da chave `phone` (medido)
+
+| Formato de `leads_crm.phone` | Linhas |
+|---|---|
+| `+55DD9XXXXXXXX` (E.164 com `+`, vindo do formulário) | 2.109 |
+| `55DD9XXXXXXXX` (dígitos, **com** o 9) | 415 |
+| `55DDXXXXXXXX` (dígitos, canônico **sem** o 9) | 769 |
+| Malformados (4 a 13 caracteres, inclusive um `null`) | 26 |
+
+**3.319 linhas correspondem a 3.164 pessoas — há 155 duplicatas.** A causa é
+demonstrável: `Add New Lead` procura o lead com
+`WHERE phone IN (phone_v1, phone_v2)`, e ambos são strings **só de dígitos** —
+portanto nunca casam com as 2.109 linhas que começam com `+`. Quando um lead de
+formulário manda a primeira mensagem, o n8n **cria uma segunda linha** em vez de
+atualizar a existente. Casos com 3 linhas para a mesma pessoa foram observados,
+com fases divergentes (`formulario_preenchido` + `iniciou_conversa`).
+
+Isso não é hipótese: é o estado atual do banco, e condiciona toda a migração.
+
 ## Decisões de arquitetura
 
 | # | Decisão | Motivo |
@@ -68,7 +87,7 @@ existe e é lida pelo cron, mas nada nunca a preenche).
 | 2 | Postgres próprio no Railway (`Dockerfile.db`, pgvector), **privado** | sem n8n externo, não há motivo para expor |
 | 3 | Novo canal `evolution` no harness | mantém instância e número atuais intactos |
 | 4 | Gate de ingestão na API, antes de enfileirar | `fromMe` é eco; não pode virar mensagem processada |
-| 5 | Follow-up como task asyncio no Worker + `pg_try_advisory_lock` | evita serviço novo; lock garante execução única sob réplicas |
+| 5 | Follow-up como task asyncio no Worker + `FOR UPDATE SKIP LOCKED` | evita serviço novo; advisory lock não sobrevive a pool de conexões |
 | 6 | `MEMORY_ENABLED=false` na v1 | o n8n não tem memória semântica; ligar mudaria comportamento |
 | 7 | Telefone canônico **sem** o 9º dígito em todo lugar | replica `phone_v2`; divergência quebra histórico |
 | 8 | Portões de e-mail/faturamento validados em código | hoje são só instrução de prompt, e o próprio prompt os chama de "INVIOLÁVEIS" |
@@ -95,7 +114,7 @@ Evolution API (instancia-apioficial, WHATSAPP-BUSINESS)
 │   • media.py: áudio→transcrição, imagem→descrição     │
 │   • agente elevec_sdr (LangGraph)                     │
 │   • saída {messages:[...]} → N envios com delay       │
-│ followup.py  ← asyncio + advisory lock, a cada 5 min  │
+│ followup.py  ← asyncio + SKIP LOCKED, a cada 5 min    │
 └───────────────────────────────────────────────────────┘
    ▼
 evolution_client.py → POST /message/sendText/{instance}
@@ -112,7 +131,7 @@ Cada módulo tem uma responsabilidade e é testável isoladamente.
 | `server/routes/webhook_evolution.py` | valida payload, aplica gate, enfileira | `phone`, `leads`, `queue` |
 | `server/routes/webhook_chatwoot.py` | liga/desliga agente por etiqueta | `phone`, `leads` |
 | `worker/evolution_client.py` | envio de texto/mídia, presença | HTTP |
-| `worker/followup.py` | cron de 5 min com advisory lock | `leads`, cliente outbound |
+| `worker/followup.py` | cron de 5 min, reivindica com `SKIP LOCKED` | `leads`, cliente outbound |
 | `agents/catalog/elevec_sdr/` | prompt, grafo, saída estruturada | LangGraph |
 | `.../tools/calendar.py` | 5 operações de Google Calendar | Google API |
 | `.../tools/crm.py` | `update_crm`: phase + Pipedrive | `leads`, Pipedrive |
@@ -135,6 +154,7 @@ NOVOS
   tests/unit/test_phone.py
   tests/unit/test_gate_ingestao.py
   tests/unit/test_saida_baloes.py
+  tests/unit/test_merge_duplicatas.py
   tests/integration/test_webhook_evolution.py
   tests/integration/test_followup.py
 
@@ -142,6 +162,7 @@ TOCADOS
   shared/models.py      → MessagingChannel.EVOLUTION
   shared/config.py      → settings de Evolution, ChatWoot, Google, Pipedrive
   worker/processor.py   → envio de múltiplos balões
+  worker/media.py       → download_media por canal (Evolution usa base64)
   worker/main.py        → sobe a task de follow-up
   server/main.py        → registra as 2 rotas novas
   langgraph.json        → registra elevec_sdr
@@ -167,7 +188,8 @@ CREATE TYPE lead_source AS ENUM (
   'linkedin_form','respondiapp_form','whatsapp_direct','manual_import');
 
 CREATE TABLE leads_crm (
-  phone                TEXT PRIMARY KEY,
+  phone                TEXT PRIMARY KEY
+                       CHECK (phone ~ '^[0-9]{8,15}$'),   -- só dígitos, E.164 sem '+'
   pipedriveid          TEXT,
   name                 TEXT,
   username             TEXT,
@@ -200,6 +222,15 @@ CREATE TABLE legacy_chat_history (
   PRIMARY KEY (phone, idx)
 );
 
+-- Leads cujo telefone não converge para o formato canônico. Não se perde nada
+-- em silêncio: fica aqui para inspeção manual.
+CREATE TABLE leads_descartados (
+  phone_original TEXT,
+  motivo         TEXT,
+  payload        JSONB,
+  created_at     TIMESTAMPTZ DEFAULT now()
+);
+
 CREATE INDEX idx_leads_followup
   ON leads_crm (followup_active, agent_active, last_interaction_at)
   WHERE followup_active AND agent_active;
@@ -217,14 +248,57 @@ nativamente (`MESSAGE_BUFFER_SECONDS` e checkpointer do LangGraph).
 
 ### Export único do Supabase (`scripts/migrar_supabase.py`)
 
-Leitura única, sem dependência permanente:
+Leitura única, sem dependência permanente. **Não é cópia direta** — a chave
+precisa ser normalizada e as duplicatas fundidas antes de entrar num banco onde
+`phone` é PK canônica.
 
-1. `leads_crm` → 3.319 linhas, cópia direta (colunas novas ficam nulas)
-2. `n8n_chat_histories` → últimas **12 mensagens** por `session_id` →
-   `legacy_chat_history` (736 sessões)
-3. Os 28 números hardcoded no nó `Filtro e Permissao v002` → `blocklist`
+**1. Normalizar** — para cada linha: remover tudo que não é dígito e o `+`; se
+tiver 10–11 dígitos, prefixar `55`; se casar `^55(\d{2})9(\d{8})$`, remover o 9º
+dígito. Brasileiro converge para `55DDXXXXXXXX`.
 
-Validação obrigatória pós-migração: contagem por `phase` idêntica à origem.
+Números que **não** são brasileiros passam adiante só com os dígitos, sem
+canonicalização — a regra do 9º dígito é brasileira e aplicá-la a um número
+estrangeiro o corromperia. Medição: 3.301 dos 3.319 são BR válidos e **nenhum**
+é estrangeiro legítimo; os ~18 restantes são erros de digitação do formulário
+(DDIs impossíveis como `98`, `99`, `67` com 9 dígitos).
+
+O que não vira nem BR canônico nem sequência plausível de 8–15 dígitos vai para
+`leads_descartados` com o motivo — **nada some em silêncio**. Um deles está em
+`qualificado` (lead ativo) e deve ser resolvido manualmente antes do cutover, não
+descartado.
+
+**2. Fundir duplicatas** — agrupar pelo telefone canônico. Regra de merge,
+determinística e nesta ordem:
+
+| Campo | Regra |
+|---|---|
+| `phase` | a mais avançada vence, pela ordem do enum (`agendou_sessao` > `qualificado` > `iniciou_conversa` > `formulario_preenchido`); `desqualificado` e `perdido` vencem tudo |
+| `last_interaction_at`, `created_at` | mais recente / mais antigo, respectivamente |
+| `pipedriveid`, `email`, `name`, `username`, `source` | primeiro valor não-nulo, priorizando a linha de fase mais avançada |
+| `followup_count` | o maior |
+| `agent_active`, `followup_active` | `false` vence — se qualquer linha está pausada, o lead fica pausado |
+| `metadata` | merge dos JSONB, com `linhas_fundidas` guardando os telefones originais |
+
+`agent_active = false` vencendo é deliberado: errar para o lado de não mandar
+mensagem é recuperável; errar para o lado de mandar para quem pediu silêncio,
+não.
+
+**3. Histórico** — últimas **12 mensagens** por `session_id` →
+`legacy_chat_history`, com o telefone já canonicalizado. Verificado: as 736
+sessões casam exatamente com um lead e 735 já estão em formato canônico; a
+exceção é tratada pela mesma normalização.
+
+**4. Blocklist** — os 28 números hardcoded em `Filtro e Permissao v002` →
+tabela `blocklist`, também canonicalizados.
+
+**Validações obrigatórias pós-migração**, todas bloqueantes:
+
+- soma de leads na origem = leads migrados + descartados
+- nenhuma linha em `leads_crm` fora do padrão `^55\d{10}$`
+- contagem por `phase` no destino ≥ contagem na origem para as fases avançadas
+  (a fusão só pode promover, nunca rebaixar)
+- 100% dos `session_id` de `legacy_chat_history` existem em `leads_crm`
+- relatório do que foi fundido, revisado por humano antes do cutover
 
 ### Continuidade das conversas
 
@@ -244,10 +318,24 @@ como consumido (`metadata->>'historico_injetado'`).
 |---|---|---|
 | Modelo | `x-ai/grok-4.3` | idem n8n |
 | Temperatura | `0.3` | idem n8n |
-| `CONTEXT_STRATEGY` | `trim`, ~12 mensagens | equivale a `contextWindowLength: 12` |
+| `CONTEXT_STRATEGY` | `trim` | equivale a `contextWindowLength: 12` |
+| `TRIM_KEEP_TURNS` | **`6`** | 6 turnos ≈ 12 mensagens; o harness conta turnos, não mensagens |
 | `MEMORY_ENABLED` | `false` | paridade |
 | Saída | `{messages: [string]}`, `minItems: 1` | idem n8n |
 | `thread_id` | `{phone_canonico}:elevec_sdr` | convenção do harness |
+
+### Como a saída estruturada é obtida
+
+**Não usar `response_format` nativo do LangGraph no mesmo agente que tem tools.**
+Estruturar a resposta e chamar ferramentas no mesmo turno é fonte conhecida de
+conflito: o modelo tende a devolver o JSON em vez de chamar a tool, ou a quebrar
+o schema quando há tool call pendente.
+
+O n8n não faz isso — o `outputParserStructured` **parseia o texto final** depois
+que o ciclo de tools terminou. Replicamos o mesmo mecanismo: o agente roda o
+loop normal de tools e, ao final, o conteúdo da última `AIMessage` é parseado
+como JSON contra o schema. É o comportamento que está em produção hoje, e evita
+o conflito por construção.
 
 ### Prompt
 
@@ -307,6 +395,23 @@ access token e tem `owner` em `silvio.hirata@eleve-c.co`.
 Risco registrado: rotacionar o OAuth Client no Google Cloud Console invalida o
 refresh token e derruba o agendamento.
 
+## Mídia (áudio e imagem)
+
+A transcrição e a descrição já existem no harness (`worker/media.py`, via
+`OPENROUTER_MIDIA_MODEL`) e são reaproveitadas sem mudança. **O download não.**
+
+`download_media` (`worker/media.py:50`) é específico do Twilio: autentica com
+`twilio_api_key_sid`/`twilio_api_key_secret` e faz um `GET` direto na URL. Isso
+não funciona para a Evolution — a URL que chega em `message.audioMessage.url` é
+mídia **criptografada do Baileys**, inútil num `GET` simples. É por isso que o
+n8n tem os nós `Get Audio` → `Base64` antes de transcrever.
+
+Mudança necessária: `download_media` passa a receber o canal e ganha um caminho
+para Evolution, usando `POST /chat/getBase64FromMediaMessage/{instance}` com o
+header `apikey`, que devolve o conteúdo já decifrado em base64.
+
+Sem isso, áudio e imagem — que o agente processa hoje — falhariam em produção.
+
 ## Gate de ingestão
 
 Ordem exata, replicando o SQL `Add New Lead`:
@@ -314,21 +419,75 @@ Ordem exata, replicando o SQL `Add New Lead`:
 1. **Resolver telefone** — pontua `remoteJidAlt` e `remoteJid`: base 2 se tiver
    12–14 dígitos, +2 se contiver `@s.whatsapp.net`, +1 se começar com `55`.
    Maior score vence. Sem candidato válido → descarta.
-2. **Blocklist** — sufixo casando com a tabela → descarta.
+2. **Blocklist** — **igualdade** sobre o telefone canônico, não sufixo. O n8n usa
+   `endsWith` porque compara formatos heterogêneos; com os dois lados
+   canonicalizados na mesma função, sufixo só adiciona risco de bloquear
+   terceiro por coincidência de final. Casou → descarta.
 3. **Variações do 9º dígito** — `^55(\d{2})(\d{8,9})$` gera `phone_v1` (com 9) e
    `phone_v2` (sem 9).
 4. **`fromMe = true`** — humano respondeu pelo celular: `agent_active = false`,
    `followup_active = false`, `agent_reactivate_at = NULL`, descarta.
-5. **Upsert** — busca por qualquer variação, **grava sempre `phone_v2`**,
+5. **Ler o lead e checar `agent_active`** — se `false`, descarta **sem escrever
+   nada**.
+6. **Upsert** — busca por qualquer variação, **grava sempre `phone_v2`**,
    atualiza `last_interaction_at`, zera `followup_count`, promove
    `formulario_preenchido → iniciou_conversa`.
-6. **`agent_active = false`** — descarta.
 7. **Enfileira** com `channel = 'evolution'`.
+
+> **A ordem entre 5 e 6 importa e é fácil de errar.** No SQL do n8n, o CTE
+> `gate` guarda o `UPDATE` (`WHERE gate.should_continue = 1`): um lead com
+> `agent_active = false` **não** tem `last_interaction_at` renovado nem
+> `followup_count` zerado. Se o upsert viesse antes da checagem, todo lead em
+> handover teria o contador de follow-up reiniciado a cada mensagem recebida —
+> e ao ser reativado, receberia a escada de follow-up do zero. A checagem vem
+> antes da escrita.
 
 ## Follow-up
 
-Task asyncio no Worker, a cada 5 min, protegida por `pg_try_advisory_lock` — se
-outra réplica já detém o lock, a rodada é pulada.
+Task asyncio no Worker, a cada 5 minutos.
+
+**Exclusão mútua sem advisory lock.** O advisory lock do Postgres é *por
+sessão*: com pool de conexões, a conexão volta ao pool ainda segurando o lock, e
+se for reciclada o lock evapora sem aviso. Corretude exigiria uma conexão
+dedicada fora do pool — complexidade desnecessária.
+
+**Reivindicar e só então enviar.** Uma única instrução atômica seleciona e marca
+os leads, e o envio acontece **depois**, fora da transação:
+
+```sql
+UPDATE leads_crm
+SET followup_count = followup_count + 1,
+    last_interaction_at = now()
+WHERE phone IN (
+  SELECT phone FROM leads_crm
+  WHERE followup_active
+    AND agent_active
+    AND phase NOT IN ('agendou_sessao','desqualificado','perdido','qualificado')
+    AND (
+      (followup_count = 0 AND last_interaction_at < now() - interval '15 minutes')
+      OR (followup_count = 1 AND last_interaction_at < now() - interval '1 hour')
+      OR (followup_count = 2 AND last_interaction_at < now() - interval '23 hours')
+    )
+  ORDER BY last_interaction_at
+  LIMIT 10
+  FOR UPDATE SKIP LOCKED
+)
+RETURNING phone, name, followup_count;
+```
+
+O `followup_count` devolvido pelo `RETURNING` já é o **novo** valor (1, 2 ou 3),
+que é exatamente o nível da mensagem a enviar — o mesmo `next_level` que o n8n
+calcula com `followup_count + 1`.
+
+Duas réplicas nunca pegam o mesmo lead, e **nenhuma transação fica aberta
+durante uma chamada HTTP** — que é o defeito de segurar `FOR UPDATE` enquanto se
+espera a Evolution responder.
+
+> **Divergência consciente do n8n.** Lá o `Atualizar Status` roda *depois* do
+> envio: se o envio falha, o contador não sobe e a próxima rodada tenta de novo.
+> Aqui o contador sobe antes, então uma falha de envio faz o lead **pular um
+> nível** de follow-up. É a troca certa: perder um follow-up é irrelevante;
+> mandar a mesma mensagem duas vezes para um lead, não.
 
 Reativação (mantida por paridade, mesmo hoje inerte):
 
@@ -374,15 +533,20 @@ Específico do SDR:
 
 **Unitários** (sem banco):
 - `test_phone.py` — com/sem 9, DDDs, números não-BR, score `remoteJid` vs
-  `remoteJidAlt`, blocklist por sufixo
+  `remoteJidAlt`, blocklist por igualdade canônica (inclusive o caso em que o
+  mesmo número chega com `+`, com 9 e sem 9)
 - `test_gate_ingestao.py` — `fromMe`, `agent_active=false`, blocklist,
   promoção de phase
 - `test_saida_baloes.py` — parse do `{messages:[...]}`, fallback de balão único
+- `test_merge_duplicatas.py` — normalização dos 4 formatos reais (`+`, com 9,
+  sem 9, malformado), precedência de `phase`, `agent_active=false` vencendo,
+  e o caso observado de 3 linhas para a mesma pessoa
 
 **Integração:**
 - `test_webhook_evolution.py` — payload real, enfileiramento correto
-- `test_followup.py` — os 3 níveis com relógio controlado, e o advisory lock
-  impedindo execução dupla
+- `test_followup.py` — os 3 níveis com relógio controlado; duas tarefas
+  concorrentes reivindicando ao mesmo tempo não podem pegar o mesmo lead; e
+  falha de envio deixa o contador já incrementado (divergência documentada)
 
 ## Deploy no Railway
 
@@ -391,9 +555,14 @@ Quatro serviços (`docs/RAILWAY.md` cobre a mecânica):
 | Serviço | Dockerfile | Notas |
 |---|---|---|
 | `db` | `Dockerfile.db` | pgvector, volume em `/var/lib/postgresql/data`, **privado** |
-| `api` | `Dockerfile.api` | público; recebe webhooks Evolution e ChatWoot |
+| `api` | `Dockerfile.api` | público; recebe webhooks Evolution e ChatWoot; **1 réplica** na v1 |
 | `worker` | `Dockerfile.worker` | privado; **1 réplica** na v1 |
 | `frontend` | `Dockerfile.frontend` | painel admin |
+
+> `docs/RAILWAY.md` sugere 2 réplicas para a API, mas o rate limit do harness é
+> **em memória**: com 2 réplicas o limite efetivo por telefone dobra
+> silenciosamente (30/h vira até 60/h). Na v1 fixamos 1 réplica. Escalar exige
+> antes mover o rate limit para o Postgres — fora do escopo desta entrega.
 
 Variáveis novas além das de `docs/RAILWAY.md`:
 
@@ -410,9 +579,19 @@ FOLLOWUP_ENABLED, FOLLOWUP_INTERVAL_SECONDS=300
 
 1. **Fundação** — `007`, `phone.py`, `leads.py`, canal Evolution, `MessagingChannel.EVOLUTION`
 2. **Agente** — `elevec_sdr`, prompt portado, saída em balões, tools nativas
-3. **Periféricos** — follow-up com advisory lock, webhook ChatWoot
-4. **Migração de dados** — `migrar_supabase.py` + validação de contagens
-5. **Cutover** — desligar workflows n8n, repontar webhook da Evolution, monitorar
+3. **Periféricos** — follow-up com reivindicação atômica, webhook ChatWoot
+4. **Migração de dados** — `migrar_supabase.py`, fusão de duplicatas, relatório
+   de merge revisado por humano, validações bloqueantes
+5. **Cutover** — na ordem:
+   1. desligar os 6 workflows n8n
+   2. rodar a migração e conferir as validações
+   3. repontar o webhook da instância `instancia-apioficial` para
+      `https://<api>/webhook/evolution?agent=elevec_sdr`
+   4. **repontar o webhook do ChatWoot** para `https://<api>/webhook/chatwoot`
+      — sem este passo a etiqueta `pausar_agente` para de funcionar em silêncio,
+      e o único sinal seria o agente respondendo por cima de um humano
+   5. conferir `max(last_interaction_at)` antes e depois
+   6. monitorar a primeira hora com a fila à vista
 
 ## Pré-condição bloqueante da Fase 1
 
@@ -429,11 +608,25 @@ Não presumir. Validar antes de escrever `phone.py`.
 | Risco | Impacto | Mitigação |
 |---|---|---|
 | `remoteJidAlt` ausente na integração oficial | alto | pré-condição acima |
+| Fusão de duplicatas escolhe a linha errada | alto | regra determinística; relatório revisado por humano antes do cutover; linhas originais preservadas em `metadata.linhas_fundidas` |
 | Rotação do OAuth Client do Google | alto | documentado; ninguém rotaciona sem aviso |
 | Cutover perde mensagens | médio | fora do horário comercial; conferir `max(last_interaction_at)` antes/depois |
 | Divergência de canonicalização | médio | `phone.py` único, com testes |
-| Grok-4.3 responder fora do schema | baixo | retry + fallback de balão único |
-| Follow-up duplicado sob réplicas | baixo | advisory lock |
+| Esquecer de repontar o ChatWoot | médio | passo explícito no cutover; falha é silenciosa |
+| Grok-4.3 responder fora do schema | baixo | parse do texto final (não `response_format`) + retry + fallback de balão único |
+| Follow-up duplicado sob réplicas | baixo | `FOR UPDATE SKIP LOCKED` |
+
+### Riscos avaliados e descartados
+
+Levantados na revisão adversarial e **refutados com consulta ao banco** — ficam
+registrados para não serem reinvestigados:
+
+- **Enxurrada de follow-up no cutover.** Zero leads elegíveis pela regra atual
+  no momento da medição; 1.044 dos leads ativos já estão em `followup_count = 3`
+  (esgotados). Não há represa acumulada.
+- **`session_id` do histórico não casar com o lead canônico.** As 736 sessões
+  casam exatamente com uma linha de `leads_crm`, e 735 já estão no formato
+  canônico de 12 dígitos.
 
 ## Fora de escopo
 
