@@ -88,26 +88,76 @@ async def test_send_typing_e_noop(client, monkeypatch):
     assert await client.send_typing("+551187654321") is False
 
 
-async def test_resposta_nao_json_vira_excecao(client, monkeypatch):
+async def test_resposta_nao_json_com_2xx_nao_vira_excecao(client, monkeypatch):
+    """2xx é entrega feita — levantar aqui faria o processor reenviar tudo."""
+    chamadas = 0
+
     async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal chamadas
+        chamadas += 1
         return httpx.Response(
             200, content=b"nao e json", headers={"content-type": "text/plain"}
         )
 
     monkeypatch.setattr(client, "_transport", httpx.MockTransport(handler))
 
-    with pytest.raises(EvolutionSendError):
-        await client.send_message("+551187654321", "Olá")
+    assert await client.send_message("+551187654321", "Olá") is None
+    assert chamadas == 1
 
 
-async def test_resposta_sem_chave_key_vira_excecao(client, monkeypatch):
+async def test_resposta_sem_id_reconhecivel_devolve_none(client, monkeypatch):
+    """Corpo irreconhecível com 2xx: a mensagem foi entregue mesmo assim.
+
+    Levantar aqui derrubava o processor no `except Exception` genérico →
+    mark_failed → retry → o lead recebia a mesma mensagem três vezes.
+    """
+
     async def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"status": "PENDING"})
 
     monkeypatch.setattr(client, "_transport", httpx.MockTransport(handler))
 
-    with pytest.raises(EvolutionSendError):
-        await client.send_message("+551187654321", "Olá")
+    assert await client.send_message("+551187654321", "Olá") is None
+
+
+@pytest.mark.parametrize(
+    "corpo",
+    [
+        {"key": {"id": "wamid.HBg"}},
+        {"messages": [{"id": "wamid.HBg"}]},
+        {"data": {"key": {"id": "wamid.HBg"}}},
+        {"data": {"messages": [{"id": "wamid.HBg"}]}},
+        {"data": [{"key": {"id": "wamid.HBg"}}]},
+    ],
+)
+async def test_extrai_id_dos_shapes_plausiveis(client, monkeypatch, corpo):
+    """A integração WHATSAPP-BUSINESS é proxy da Cloud API oficial.
+
+    A resposta nativa da Cloud API é `{"messages":[{"id":"wamid..."}]}`; o
+    wrapper pode repassá-la crua, aninhá-la em `data`, ou devolver o shape
+    Baileys. Todos precisam render o mesmo id.
+    """
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(201, json=corpo)
+
+    monkeypatch.setattr(client, "_transport", httpx.MockTransport(handler))
+    assert await client.send_message("+551187654321", "Olá") == "wamid.HBg"
+
+
+async def test_modo_mock_nao_baixa_midia():
+    """Download é chamada real à Evolution — não pode escapar do modo mock."""
+    mock = EvolutionClient(
+        base_url=BASE, api_key=CHAVE, instance=INSTANCIA, delivery_mode="mock"
+    )
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        raise AssertionError(f"mock não pode fazer requisição: {request.url}")
+
+    mock._transport = httpx.MockTransport(handler)
+
+    with pytest.raises(RuntimeError, match="mock"):
+        await mock.baixar_midia({"id": "MSG123"})
 
 
 async def test_baixar_midia_sem_base64_vira_excecao(client, monkeypatch):

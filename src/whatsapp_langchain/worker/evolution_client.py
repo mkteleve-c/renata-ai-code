@@ -92,12 +92,15 @@ class EvolutionClient:
         token: str | None = None,
         delay_ms: int = 0,
     ) -> str | None:
-        """Envia mensagem de texto via /message/sendText. Retorna key.id.
+        """Envia mensagem de texto via /message/sendText. Retorna o id, se houver.
 
         Mensagens acima de `EVOLUTION_TEXT_BODY_LIMIT` são quebradas em
         partes e enviadas em sequência, preservando a ordem. O retorno é o
         `id` da última parte enviada — mesmo precedente do `last_id` em
         `uazapi_client.send_message`.
+
+        Resposta 2xx sem id reconhecível devolve `None`, não exceção: a
+        mensagem já saiu, e falhar aqui faria o processor reenviar tudo.
 
         `token` é ignorado — a Evolution autentica pela apikey da instância,
         não por um token entregue por mensagem como a uazapi. O parâmetro
@@ -152,35 +155,23 @@ class EvolutionClient:
                     )
                     raise EvolutionSendError(response.status_code, detail)
 
-                dados = _safe_json(response)
-                if not isinstance(dados, dict):
-                    detail = (
-                        f"corpo inesperado (não é objeto JSON): {response.text[:500]!r}"
-                    )
-                    logger.error(
-                        "evolution_send_invalid_response",
+                # 2xx é entrega feita. Levantar aqui derrubava o processor no
+                # `except Exception` genérico → mark_failed → retry → o lead
+                # recebia a mesma mensagem de novo, já tendo recebido a
+                # primeira. O `id` não é consumido por ninguém (o processor
+                # descarta o retorno), então corpo irreconhecível é warning,
+                # não erro.
+                last_id = _extract_message_id(_safe_json(response))
+                if last_id is None:
+                    logger.warning(
+                        "evolution_send_sem_id",
                         to=normalized_to,
                         status_code=response.status_code,
-                        detail=detail,
+                        body=response.text[:500],
                         chunk_index=idx,
                         chunk_count=chunk_count,
                     )
-                    raise EvolutionSendError(response.status_code, detail)
 
-                chunk_id = _extract_message_id(dados)
-                if chunk_id is None:
-                    detail = f"resposta sem key.id: {response.text[:500]!r}"
-                    logger.error(
-                        "evolution_send_missing_id",
-                        to=normalized_to,
-                        status_code=response.status_code,
-                        detail=detail,
-                        chunk_index=idx,
-                        chunk_count=chunk_count,
-                    )
-                    raise EvolutionSendError(response.status_code, detail)
-
-                last_id = chunk_id
                 logger.info(
                     "evolution_message_sent",
                     to=normalized_to,
@@ -211,7 +202,19 @@ class EvolutionClient:
 
         A URL de mídia que chega no payload do webhook é criptografada
         (herança do Baileys) — um GET direto nela não devolve o arquivo.
+
+        Em `delivery_mode="mock"` não há o que simular: o download é uma
+        chamada real à Evolution, e devolver bytes falsos levaria a uma
+        chamada multimodal ao LLM. Levanta em vez de sair pela rede.
         """
+        if self.delivery_mode == "mock":
+            logger.info("evolution_mock_download", message_key=message_key)
+            raise RuntimeError(
+                "download de mídia da Evolution não acontece em "
+                "delivery_mode=mock — rode com OUTBOUND_MODE=real para "
+                "exercitar getBase64FromMediaMessage"
+            )
+
         async with httpx.AsyncClient(
             transport=self._transport, timeout=TIMEOUT
         ) as client:
@@ -269,12 +272,41 @@ def _safe_json(response: httpx.Response) -> dict[str, Any] | list[Any] | None:
         return None
 
 
-def _extract_message_id(dados: dict[str, Any]) -> str | None:
-    key = dados.get("key")
-    if not isinstance(key, dict):
+def _extract_message_id(dados: Any, profundidade: int = 3) -> str | None:
+    """Id da mensagem em qualquer um dos shapes plausíveis da resposta.
+
+    O `POST /message/sendText` nunca foi exercitado contra o servidor real, e
+    na integração WHATSAPP-BUSINESS a Evolution faz proxy da Cloud API, cuja
+    resposta nativa é `{"messages":[{"id":"wamid..."}]}`. O wrapper pode
+    repassar esse shape, devolver o shape Baileys (`{"key":{"id":...}}`), ou
+    aninhar qualquer um dos dois em `data`. Extrair o id de todos é melhor
+    que devolver None — e nenhum deles é motivo para falhar o envio.
+    """
+    if profundidade <= 0 or not isinstance(dados, dict):
         return None
-    msg_id = key.get("id")
-    return msg_id if isinstance(msg_id, str) and msg_id else None
+
+    key = dados.get("key")
+    if isinstance(key, dict):
+        msg_id = key.get("id")
+        if isinstance(msg_id, str) and msg_id:
+            return msg_id
+
+    mensagens = dados.get("messages")
+    if isinstance(mensagens, list):
+        for item in mensagens:
+            if isinstance(item, dict):
+                msg_id = item.get("id")
+                if isinstance(msg_id, str) and msg_id:
+                    return msg_id
+
+    interno = dados.get("data")
+    candidatos = interno if isinstance(interno, list) else [interno]
+    for candidato in candidatos:
+        achado = _extract_message_id(candidato, profundidade - 1)
+        if achado:
+            return achado
+
+    return None
 
 
 def split_message_body(body: str, limit: int = EVOLUTION_TEXT_BODY_LIMIT) -> list[str]:
