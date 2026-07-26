@@ -234,6 +234,24 @@ class Settings(BaseSettings):
             missing.append("UAZAPI_BASE_URL")
         return touched, missing
 
+    def _evolution_credentials_status(self) -> tuple[bool, list[str]]:
+        """Retorna (touched, missing) para o canal Evolution em modo real."""
+        # A instância é fixa por deploy e a apikey autentica envio e download
+        # de mídia — os três campos são obrigatórios quando o canal foi tocado.
+        touched = (
+            bool(self.evolution_base_url)
+            or bool(self.evolution_api_key)
+            or bool(self.evolution_instance)
+        )
+        missing: list[str] = []
+        if not self.evolution_base_url:
+            missing.append("EVOLUTION_BASE_URL")
+        if not self.evolution_api_key:
+            missing.append("EVOLUTION_API_KEY")
+        if not self.evolution_instance:
+            missing.append("EVOLUTION_INSTANCE")
+        return touched, missing
+
     def channel_status(self) -> dict[str, dict[str, object]]:
         """Diagnóstico por canal: touched, complete, missing.
 
@@ -244,6 +262,7 @@ class Settings(BaseSettings):
         twilio_touched, twilio_missing = self._twilio_credentials_status()
         meta_touched, meta_missing = self._meta_credentials_status()
         uazapi_touched, uazapi_missing = self._uazapi_credentials_status()
+        evolution_touched, evolution_missing = self._evolution_credentials_status()
 
         is_mock = self.resolved_outbound_mode == "mock"
         return {
@@ -261,6 +280,11 @@ class Settings(BaseSettings):
                 "touched": uazapi_touched,
                 "missing": [] if is_mock else uazapi_missing,
                 "complete": is_mock or not uazapi_missing,
+            },
+            "evolution": {
+                "touched": evolution_touched,
+                "missing": [] if is_mock else evolution_missing,
+                "complete": is_mock or not evolution_missing,
             },
         }
 
