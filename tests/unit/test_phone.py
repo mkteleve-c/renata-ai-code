@@ -37,6 +37,41 @@ def test_entrada_invalida_devolve_none(bruto):
     assert canonicalizar(bruto) is None
 
 
+@pytest.mark.parametrize(
+    "bruto",
+    [
+        "551187654321:3@s.whatsapp.net",  # aparelho pareado
+        "551187654321:12",  # device de dois dígitos, sem servidor
+        "55011987654321@s.whatsapp.net",  # 0 de tronco depois do DDI
+        "011987654321@s.whatsapp.net",  # 0 de tronco sem DDI
+        "5511987654321:5@s.whatsapp.net",  # device + 9º dígito
+    ],
+    ids=["device", "device2", "tronco_com_ddi", "tronco_sem_ddi", "device_com_9"],
+)
+def test_formas_malformadas_convergem_para_a_mesma_identidade(bruto):
+    """Device pareado e 0 de tronco não podem virar leads fantasmas.
+
+    Cada uma dessas formas produzia uma identidade canônica própria — quatro
+    linhas em leads_crm para a mesma pessoa, e outbound para um número que
+    não existe no caso do `:device`.
+    """
+    assert canonicalizar(bruto) == "551187654321"
+
+
+def test_ddi_55_irreconhecivel_e_recusado():
+    """15 dígitos com DDI 55 não é telefone brasileiro nenhum.
+
+    Antes virava chave canônica e criava lead que o outbound nunca alcança.
+    """
+    assert canonicalizar("551187654321999") is None
+
+
+def test_estrangeiro_continua_passando_por_digitos():
+    """A recusa é só para o que se declara brasileiro e não fecha com nenhuma forma."""
+    assert canonicalizar("14155550123") == "14155550123"
+    assert canonicalizar("447911123456") == "447911123456"
+
+
 def test_variacoes_brasileiras():
     assert variacoes("551187654321") == ("5511987654321", "551187654321")
 
@@ -70,6 +105,23 @@ def test_resolver_ignora_remote_jid_alt():
     """
     key = {"remoteJid": "5511987654321@s.whatsapp.net", "remoteJidAlt": "5599999999999"}
     assert resolver_telefone(key) == "551187654321"
+
+
+@pytest.mark.parametrize(
+    "remote_jid",
+    [
+        "551187654321:3@s.whatsapp.net",
+        "55011987654321@s.whatsapp.net",
+        "011987654321@s.whatsapp.net",
+    ],
+    ids=["device", "tronco_com_ddi", "tronco_sem_ddi"],
+)
+def test_resolver_converge_as_formas_malformadas(remote_jid):
+    assert resolver_telefone({"remoteJid": remote_jid}) == "551187654321"
+
+
+def test_resolver_recusa_jid_irreconhecivel():
+    assert resolver_telefone({"remoteJid": "55118765432199@s.whatsapp.net"}) is None
 
 
 def test_conversao_e164_ida_e_volta():
