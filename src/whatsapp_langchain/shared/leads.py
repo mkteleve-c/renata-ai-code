@@ -244,14 +244,29 @@ async def aplicar_gate(
             lead_view = {**mesclado, "phone": canonico}
 
         if key.get("fromMe") is True:
-            if linhas:
+            # Curto-circuito quando o UPDATE seria no-op: fromMe é o único
+            # caminho do gate com escrita destrutiva e o único sem rate limit
+            # (ele não pode ter — é o handover do atendente). Sem isto, uma
+            # rajada de fromMe reescreve as mesmas linhas indefinidamente.
+            ja_pausado = bool(linhas) and all(
+                linha["agent_active"] is False
+                and linha["followup_active"] is False
+                and linha["agent_reactivate_at"] is None
+                for linha in linhas
+            )
+            if linhas and not ja_pausado:
                 await cur.execute(
                     "update leads_crm set agent_active = false, "
                     "followup_active = false, agent_reactivate_at = null "
                     "where phone in (%s, %s)",
                     (com_9, sem_9),
                 )
-            logger.info("gate_descartado", motivo="from_me", telefone=canonico)
+            logger.info(
+                "gate_descartado",
+                motivo="from_me",
+                telefone=canonico,
+                ja_pausado=ja_pausado,
+            )
             return ResultadoGate(False, "from_me", canonico)
 
         if lead_view and lead_view["agent_active"] is False:
