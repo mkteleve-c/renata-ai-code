@@ -31,6 +31,26 @@ async def test_evolution_usa_base64_e_ignora_url(monkeypatch):
     assert chamado["key"] == {"id": "MSG1"}
 
 
+async def test_evolution_em_modo_mock_nao_bate_na_api_real(monkeypatch):
+    """Credencial preenchida + OUTBOUND_MODE=mock não pode virar chamada real."""
+    monkeypatch.setattr(media.settings, "evolution_base_url", "https://e.host")
+    monkeypatch.setattr(media.settings, "evolution_api_key", "chave")
+    monkeypatch.setattr(media.settings, "evolution_instance", "inst")
+    monkeypatch.setattr(media.settings, "outbound_mode", "mock")
+
+    async def proibido(*args, **kwargs):
+        raise AssertionError("modo mock não pode abrir conexão")
+
+    monkeypatch.setattr("httpx.AsyncClient.post", proibido)
+
+    with pytest.raises(RuntimeError, match="mock"):
+        await media.download_media(
+            "https://mmg.whatsapp.net/algo.enc",
+            canal=MessagingChannel.EVOLUTION,
+            message_key={"id": "MSG1"},
+        )
+
+
 async def test_evolution_sem_message_key_falha():
     with pytest.raises(ValueError, match="message_key"):
         await media.download_media(

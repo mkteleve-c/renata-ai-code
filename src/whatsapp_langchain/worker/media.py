@@ -65,10 +65,14 @@ async def download_media(
 
         from whatsapp_langchain.worker.evolution_client import EvolutionClient
 
+        # `delivery_mode` explícito: sem ele o cliente nascia "real" e o
+        # download batia na API da Evolution mesmo com OUTBOUND_MODE=mock,
+        # furando a semântica de mock em dev com credenciais preenchidas.
         cliente = EvolutionClient(
             base_url=settings.evolution_base_url,
             api_key=settings.evolution_api_key,
             instance=settings.evolution_instance,
+            delivery_mode=settings.resolved_outbound_mode,
         )
         return await cliente.baixar_midia(message_key)
 
