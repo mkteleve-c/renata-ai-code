@@ -3,7 +3,10 @@
 A ORDEM das regras importa e replica o SQL `Add New Lead` do n8n:
 a checagem de agent_active vem ANTES do upsert. Um lead em handover não
 pode ter followup_count zerado nem last_interaction_at renovado — se
-tivesse, ao ser reativado receberia a escada de follow-up do zero.
+tivesse, ao ser reativado receberia a escada de follow-up do zero. Pela
+mesma razão, uma duplicata (telefone gravado com e sem o 9º dígito) só é
+consolidada em disco DEPOIS dessa checagem — a fusão nunca pode escrever
+nada para um lead pausado.
 
 Cada mensagem chega como um webhook HTTP separado e o FastAPI atende em
 paralelo — três mensagens seguidas do mesmo lead são o caso normal, não
@@ -28,13 +31,17 @@ from whatsapp_langchain.shared.phone import resolver_telefone, variacoes
 
 logger = structlog.get_logger()
 
+# agendou_sessao vence tudo: reunião marcada é fato verificável (existe
+# evento no Google Calendar), enquanto desqualificado/perdido são julgamento.
+# Fases desconhecidas ou nulas (a coluna é nullable) ficam abaixo de
+# qualquer fase real — nunca derrubam uma fase concreta na fusão.
 _FASE_RANK = {
-    "formulario_preenchido": 0,
-    "iniciou_conversa": 1,
-    "qualificado": 2,
-    "agendou_sessao": 3,
+    "formulario_preenchido": 1,
+    "iniciou_conversa": 2,
+    "qualificado": 3,
     "desqualificado": 4,
     "perdido": 4,
+    "agendou_sessao": 5,
 }
 
 _CAMPOS_MESCLAVEIS = (
@@ -70,8 +77,14 @@ def _lock_key(canonico: str) -> int:
     )
 
 
-def _mais_avancada(fase_a: str, fase_b: str) -> str:
-    return fase_a if _FASE_RANK[fase_a] >= _FASE_RANK[fase_b] else fase_b
+def _rank_fase(fase: str | None) -> int:
+    if fase is None:
+        return -1
+    return _FASE_RANK.get(fase, -1)
+
+
+def _mais_avancada(fase_a: str | None, fase_b: str | None) -> str | None:
+    return fase_a if _rank_fase(fase_a) >= _rank_fase(fase_b) else fase_b
 
 
 def _mais_recente(a: dict[str, Any], b: dict[str, Any]) -> dict[str, Any]:
@@ -83,20 +96,31 @@ def _mais_recente(a: dict[str, Any], b: dict[str, Any]) -> dict[str, Any]:
     return a if ta >= tb else b
 
 
-async def _consolidar_duplicata(
-    cur: AsyncCursor[DictRow],
-    canonico: str,
-    canonica: dict[str, Any],
-    legada: dict[str, Any],
-) -> dict[str, Any]:
-    """Funde a linha legada (telefone com o 9º dígito) na canônica e apaga a legada.
+def _vencedor_pausa(canonica: dict[str, Any], legada: dict[str, Any]) -> dict[str, Any]:
+    """Decide de qual linha vêm agent_active, followup_active e agent_reactivate_at.
 
-    Base legada gravando o telefone com o 9º dígito e o gate novo gravando
-    sem ele convivem: as duas formas viram linhas distintas da mesma pessoa,
-    e um UPDATE que muda phone de uma para a outra colidiria com a PK. Regra
-    de fusão: campo a campo vale o valor de quem tem last_interaction_at mais
-    recente, caindo para o valor da outra linha quando nulo; a fase mantida é
-    sempre a mais avançada das duas, nunca a mais recente.
+    False vence: errar para o lado de não mandar mensagem é recuperável,
+    mandar para quem pediu silêncio não é. agent_reactivate_at acompanha
+    essa mesma linha e nunca é coalescido com a outra — ali NULL é estado
+    significativo ("nenhuma reativação agendada"), não ausência de dado.
+    """
+    if canonica["agent_active"] is False and legada["agent_active"] is False:
+        return _mais_recente(canonica, legada)
+    if canonica["agent_active"] is False:
+        return canonica
+    if legada["agent_active"] is False:
+        return legada
+    return _mais_recente(canonica, legada)
+
+
+def _fundir(canonica: dict[str, Any], legada: dict[str, Any]) -> dict[str, Any]:
+    """Funde duas linhas do mesmo lead num dict só, sem tocar o banco.
+
+    Campos de conteúdo: vale o valor de quem tem last_interaction_at mais
+    recente, caindo para o valor da outra linha quando nulo. Fase: a mais
+    avançada das duas — nunca a mais recente. Pausa do agente: ver
+    `_vencedor_pausa`. Puro por design — quem chama decide se e quando
+    persistir o resultado.
     """
     recente = _mais_recente(canonica, legada)
     antiga = legada if recente is canonica else canonica
@@ -105,8 +129,28 @@ async def _consolidar_duplicata(
         campo: recente[campo] if recente[campo] is not None else antiga[campo]
         for campo in _CAMPOS_MESCLAVEIS
     }
-    mesclado["phase"] = _mais_avancada(canonica["phase"], legada["phase"])
 
+    vencedor = _vencedor_pausa(canonica, legada)
+    mesclado["agent_active"] = vencedor["agent_active"]
+    mesclado["followup_active"] = vencedor["followup_active"]
+    mesclado["agent_reactivate_at"] = vencedor["agent_reactivate_at"]
+
+    mesclado["phase"] = _mais_avancada(canonica["phase"], legada["phase"])
+    return mesclado
+
+
+async def _persistir_consolidacao(
+    cur: AsyncCursor[DictRow],
+    canonico: str,
+    mesclado: dict[str, Any],
+    legada_phone: str,
+) -> dict[str, Any]:
+    """Grava a fusão de `_fundir` na linha canônica e apaga a legada.
+
+    Um UPDATE que movesse `phone` de uma linha para a outra colidiria com a
+    PK — por isso a identidade que sobrevive é sempre a canônica, e a legada
+    é apagada à parte.
+    """
     await cur.execute(
         "update leads_crm set"
         "  pipedriveid = %s, name = %s, username = %s, email = %s,"
@@ -133,37 +177,19 @@ async def _consolidar_duplicata(
         ),
     )
     consolidada = await cur.fetchone()
-    assert consolidada is not None
+    if consolidada is None:
+        raise RuntimeError(f"consolidação não encontrou a linha canônica de {canonico}")
 
-    await cur.execute("delete from leads_crm where phone = %s", (legada["phone"],))
+    await cur.execute("delete from leads_crm where phone = %s", (legada_phone,))
 
     logger.info(
         "leads_duplicata_consolidada",
         canonico=canonico,
-        legada=legada["phone"],
+        legada=legada_phone,
         fase_final=mesclado["phase"],
     )
 
     return consolidada
-
-
-async def _resolver_lead(
-    cur: AsyncCursor[DictRow], canonico: str, com_9: str, sem_9: str
-) -> dict[str, Any] | None:
-    await cur.execute(
-        "select * from leads_crm where phone in (%s, %s) order by phone",
-        (com_9, sem_9),
-    )
-    linhas = await cur.fetchall()
-
-    if not linhas:
-        return None
-    if len(linhas) == 1:
-        return linhas[0]
-
-    canonica = next(linha for linha in linhas if linha["phone"] == sem_9)
-    legada = next(linha for linha in linhas if linha["phone"] == com_9)
-    return await _consolidar_duplicata(cur, canonico, canonica, legada)
 
 
 async def aplicar_gate(
@@ -192,22 +218,47 @@ async def aplicar_gate(
             logger.info("gate_descartado", motivo="blocklist", telefone=canonico)
             return ResultadoGate(False, "blocklist", canonico)
 
-        lead = await _resolver_lead(cur, canonico, com_9, sem_9)
+        await cur.execute(
+            "select * from leads_crm where phone in (%s, %s) order by phone",
+            (com_9, sem_9),
+        )
+        linhas = await cur.fetchall()
+
+        # Fusão só computada em memória aqui — nada é escrito até sabermos
+        # que a mensagem não vai ser descartada por fromMe ou agent_active.
+        legada: dict[str, Any] | None = None
+        mesclado: dict[str, Any] | None = None
+        if not linhas:
+            lead_view = None
+        elif len(linhas) == 1:
+            lead_view = linhas[0]
+        else:
+            canonica = next(linha for linha in linhas if linha["phone"] == sem_9)
+            legada = next(linha for linha in linhas if linha["phone"] == com_9)
+            mesclado = _fundir(canonica, legada)
+            lead_view = {**mesclado, "phone": canonico}
 
         if key.get("fromMe") is True:
-            if lead:
+            if linhas:
                 await cur.execute(
                     "update leads_crm set agent_active = false, "
                     "followup_active = false, agent_reactivate_at = null "
-                    "where phone = %s",
-                    (lead["phone"],),
+                    "where phone in (%s, %s)",
+                    (com_9, sem_9),
                 )
             logger.info("gate_descartado", motivo="from_me", telefone=canonico)
             return ResultadoGate(False, "from_me", canonico)
 
-        if lead and lead["agent_active"] is False:
+        if lead_view and lead_view["agent_active"] is False:
             logger.info("gate_descartado", motivo="agente_desligado", telefone=canonico)
-            return ResultadoGate(False, "agente_desligado", canonico, lead)
+            return ResultadoGate(False, "agente_desligado", canonico, lead_view)
+
+        if legada is not None and mesclado is not None:
+            lead = await _persistir_consolidacao(
+                cur, canonico, mesclado, legada["phone"]
+            )
+        else:
+            lead = lead_view
 
         if lead:
             await cur.execute(
