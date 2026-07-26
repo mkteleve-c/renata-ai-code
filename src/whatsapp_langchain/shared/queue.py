@@ -17,8 +17,10 @@ Uso:
 
 import hashlib
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import structlog
+from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
 
 from whatsapp_langchain.shared.models import (
@@ -42,6 +44,7 @@ async def enqueue_or_buffer(
     message_id: str | None = None,
     buffer_seconds: float = 2.0,
     outbound_token: str | None = None,
+    provider_message_key: dict[str, Any] | None = None,
 ) -> EnqueueResult:
     """Insere mensagem na fila ou agrupa com mensagem pendente (debounce).
 
@@ -64,6 +67,9 @@ async def enqueue_or_buffer(
         to_number: Número destinatário (opcional).
         message_id: ID externo da mensagem, ex: Twilio MessageSid (opcional).
         buffer_seconds: Segundos de debounce. Default: 2.0.
+        provider_message_key: Key completa da mensagem no provedor (ex: data.key
+            da Evolution), gravada apenas quando há mídia. Vazia para os demais
+            canais.
 
     Returns:
         EnqueueResult com message_id e se foi buffered.
@@ -125,8 +131,8 @@ async def enqueue_or_buffer(
                 INSERT INTO message_queue
                     (message_id, phone_number, to_number, agent_id,
                      thread_id, incoming_message, media_url, media_type,
-                     outbound_token, channel, process_after)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                     outbound_token, channel, provider_message_key, process_after)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
                 RETURNING id
                 """,
                 (
@@ -140,6 +146,9 @@ async def enqueue_or_buffer(
                     media_type,
                     outbound_token,
                     channel_value,
+                    Jsonb(provider_message_key)
+                    if provider_message_key is not None
+                    else None,
                 ),
             )
             row = await cursor.fetchone()

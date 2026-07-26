@@ -11,6 +11,7 @@ Uso:
 
 from datetime import UTC, datetime
 from enum import Enum
+from typing import Any
 
 from pydantic import BaseModel, Field
 
@@ -78,6 +79,14 @@ class MessageQueue(BaseModel):
         description=(
             "Token outbound dinâmico (uazapi). Vem do payload do webhook "
             "e é usado pelo worker para autenticar o envio de resposta."
+        ),
+    )
+    provider_message_key: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Key completa da mensagem no provedor (ex: data.key da Evolution). "
+            "Necessária quando o download de mídia exige mais que o id, "
+            "como getBase64FromMediaMessage."
         ),
     )
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
