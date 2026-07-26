@@ -283,6 +283,63 @@ async def test_duplicata_com_legada_pausada_nao_consolida_nem_ressuscita_handove
     assert followup_count_legada == 5, "a linha legada não pode ser tocada"
 
 
+async def test_duplicata_reactivate_at_nao_e_coalescido_de_volta(limpar):
+    """Discrimina coalesce de _vencedor_pausa: as duas linhas têm agent_active=true,
+    então a mensagem é aceita e a fusão é persistida — mas a linha vencedora
+    (a mais recente) tem agent_reactivate_at NULL, e a antiga tem um 2030 obsoleto.
+    Coalesce (recente-se-não-nulo-senão-antiga) produziria 2030; o resultado tem
+    que ser NULL porque NULL ali significa "sem reativação agendada", não "sem
+    dado". Nenhum teste anterior discriminava isso: no cenário de
+    test_duplicata_com_legada_pausada_..., a linha vencedora já tinha o 2030."""
+    pool = await get_pool()
+    async with pool.connection() as conn:
+        await conn.execute(
+            "insert into leads_crm (phone, agent_active, agent_reactivate_at, "
+            "last_interaction_at) values (%s, true, '2030-01-01', '2019-01-01')",
+            (COM_9,),
+        )
+        await conn.execute(
+            "insert into leads_crm (phone, agent_active, agent_reactivate_at, "
+            "last_interaction_at) values (%s, true, null, '2024-01-01')",
+            (TELEFONE,),
+        )
+
+    r = await aplicar_gate(pool, JID, push_name=None)
+
+    assert r.aceito is True
+    assert r.lead["agent_reactivate_at"] is None, "coalesce ressuscitaria o 2030"
+
+
+async def test_from_me_com_duplicata_desliga_as_duas_linhas(limpar):
+    """fromMe usa `where phone in (com_9, sem_9)`, não o phone de uma consolidação —
+    sem consolidar nada, as duas formas do telefone precisam ficar com agent_active
+    false."""
+    pool = await get_pool()
+    async with pool.connection() as conn:
+        await conn.execute(
+            "insert into leads_crm (phone, agent_active) values (%s, true)", (COM_9,)
+        )
+        await conn.execute(
+            "insert into leads_crm (phone, agent_active) values (%s, true)",
+            (TELEFONE,),
+        )
+
+    r = await aplicar_gate(pool, {**JID, "fromMe": True}, push_name=None)
+
+    assert r.aceito is False
+    assert r.motivo == "from_me"
+
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            "select phone, agent_active from leads_crm where phone in (%s, %s)",
+            (TELEFONE, COM_9),
+        )
+        linhas = await cur.fetchall()
+
+    assert len(linhas) == 2, "fromMe não pode consolidar nem apagar nenhuma das duas"
+    assert all(agent_active is False for _, agent_active in linhas)
+
+
 async def test_concorrencia_lead_novo_gera_uma_linha_so(limpar):
     """Duas mensagens simultâneas de um lead novo não podem colidir no INSERT.
 

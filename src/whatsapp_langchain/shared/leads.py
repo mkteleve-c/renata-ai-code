@@ -54,9 +54,6 @@ _CAMPOS_MESCLAVEIS = (
     "google_event_id",
     "source",
     "metadata",
-    "agent_active",
-    "followup_active",
-    "agent_reactivate_at",
     "followup_count",
 )
 
@@ -78,9 +75,15 @@ def _lock_key(canonico: str) -> int:
 
 
 def _rank_fase(fase: str | None) -> int:
+    """None fica abaixo de qualquer fase, real ou desconhecida.
+
+    Fase desconhecida (um valor novo do enum que este código ainda não
+    conhece) usa 0, não -1: precisa continuar vencendo `None` para que uma
+    fase nova nunca seja apagada por uma linha sem fase nenhuma.
+    """
     if fase is None:
         return -1
-    return _FASE_RANK.get(fase, -1)
+    return _FASE_RANK.get(fase, 0)
 
 
 def _mais_avancada(fase_a: str | None, fase_b: str | None) -> str | None:
@@ -132,6 +135,8 @@ def _fundir(canonica: dict[str, Any], legada: dict[str, Any]) -> dict[str, Any]:
 
     vencedor = _vencedor_pausa(canonica, legada)
     mesclado["agent_active"] = vencedor["agent_active"]
+    # Não minimizado à parte: segue o vencedor de agent_active, não é
+    # observável em nenhum caminho (descarte não escreve, aceite força true).
     mesclado["followup_active"] = vencedor["followup_active"]
     mesclado["agent_reactivate_at"] = vencedor["agent_reactivate_at"]
 
