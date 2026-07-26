@@ -35,32 +35,50 @@ logger = structlog.get_logger()
 
 # Alvo explícito do ON CONFLICT: sem ele, o DO NOTHING engoliria em silêncio
 # qualquer unique constraint que a tabela venha a ganhar. Repete o predicado
-# do índice parcial da migração 009 para que o Postgres consiga inferi-lo.
+# do índice parcial da migração 012 para que o Postgres consiga inferi-lo.
 ALVO_DE_CONFLITO = (
-    "ON CONFLICT (channel, agent_id, message_id) "
+    "ON CONFLICT (channel, agent_id, phone_number, message_id) "
     "WHERE message_id IS NOT NULL DO NOTHING"
 )
+
+# Texto para efeito de debounce é a linha sem NENHUMA via de download de
+# mídia — espelha o `has_media` de `enqueue_or_buffer`. `media_url IS NULL`
+# sozinho não serve: linha de mídia da Evolution tem exatamente isso, com a
+# `provider_message_key` preenchida, e quando volta para `queued` num retry
+# viraria alvo de debounce (legenda corrompida com texto alheio, e a
+# mensagem nova herdando as tentativas e o pré-processamento da mídia).
+PREDICADO_DE_TEXTO = "media_url IS NULL AND provider_message_key IS NULL"
 
 
 async def _buscar_por_message_id(
     conn: AsyncConnection[Any],
     channel_value: str,
     agent_id: str,
+    phone_number: str,
     message_id: str | None,
 ) -> int | None:
-    """Id da linha já enfileirada para esse (canal, agente, message_id).
+    """Id da linha que já ingeriu esse (canal, agente, telefone, message_id).
 
     `agent_id` faz parte da chave porque o mesmo payload entregue em
     `?agent=a` e `?agent=b` são duas mensagens legítimas — sem ele, a
-    segunda seria tratada como reentrega da primeira.
+    segunda seria tratada como reentrega da primeira. `phone_number` faz
+    parte pelo motivo inverso: o id do WhatsApp só é único por chat, e sem
+    ele a mensagem de OUTRO lead que repetisse o id sumia em silêncio.
+
+    `message_ids_absorvidos` entra na busca porque numa rajada só a primeira
+    mensagem vira linha — as seguintes são concatenadas por debounce, e sem
+    o registro do id absorvido a reentrega delas concatenaria o mesmo texto
+    de novo.
     """
     if not message_id:
         return None
 
     cursor = await conn.execute(
         "SELECT id FROM message_queue "
-        "WHERE channel = %s AND agent_id = %s AND message_id = %s LIMIT 1",
-        (channel_value, agent_id, message_id),
+        "WHERE channel = %s AND agent_id = %s AND phone_number = %s "
+        "  AND (message_id = %s OR message_ids_absorvidos @> ARRAY[%s]::text[]) "
+        "LIMIT 1",
+        (channel_value, agent_id, phone_number, message_id, message_id),
     )
     row = await cursor.fetchone()
     return row[0] if row is not None else None
@@ -87,18 +105,22 @@ async def enqueue_or_buffer(
     - Mensagem com mídia não faz debounce (entrada imediata). Conta como
       mídia quem tem `media_url` OU `media_type` + `provider_message_key` —
       a Evolution baixa pela key e não depende da URL.
+    - Linha de mídia nunca é ALVO de debounce nem de flush, mesmo depois de
+      voltar para `queued` num retry: ver PREDICADO_DE_TEXTO.
     - Antes de inserir mídia, flush de texto pendente do mesmo phone+agent
       para que o worker processe o texto ANTES da mídia (ordenação por created_at).
     - Concorrência protegida por pg_advisory_xact_lock(hash(phone+agent)).
 
     Idempotência: quando `message_id` vem preenchido, uma reentrega do mesmo
-    id no mesmo canal e agente não vira linha nova nem é concatenada por
-    debounce — devolve o id da linha original com `is_duplicate=True`.
+    id no mesmo canal, agente e telefone não vira linha nova nem é concatenada
+    por debounce — devolve o id da linha original com `is_duplicate=True`.
     Provedores reentregam o webhook em timeout ou resposta >= 400; sem isso o
-    lead receberia a resposta duas vezes. O mesmo payload em `?agent=a` e
-    `?agent=b` continua gerando duas linhas, que é o comportamento correto do
-    template. O índice único parcial da migração 009 é a garantia final
-    contra a corrida entre dois workers da API.
+    lead receberia a resposta duas vezes. Vale também para a mensagem que o
+    debounce absorveu: o id dela é gravado em `message_ids_absorvidos`, sem o
+    que só a primeira mensagem de uma rajada ficaria protegida. O mesmo
+    payload em `?agent=a` e `?agent=b` continua gerando duas linhas, que é o
+    comportamento correto do template. O índice único parcial da migração 012
+    é a garantia final contra a corrida entre dois workers da API.
 
     Limitação conhecida: NumMedia > 1 no mesmo webhook fica fora do escopo.
 
@@ -156,10 +178,10 @@ async def enqueue_or_buffer(
 
         # Reentrega do provedor: o id já virou linha. Precisa ser checado
         # aqui, antes do branch de debounce — o caminho de debounce faz
-        # UPDATE, não INSERT, e escaparia do índice único da migração 009,
+        # UPDATE, não INSERT, e escaparia do índice único da migração 012,
         # concatenando o mesmo texto duas vezes na mesma linha.
         duplicada = await _buscar_por_message_id(
-            conn, channel_value, agent_id, message_id
+            conn, channel_value, agent_id, phone_number, message_id
         )
         if duplicada is not None:
             await conn.commit()
@@ -181,7 +203,7 @@ async def enqueue_or_buffer(
             # garantindo que o worker os processe antes da mídia (via created_at).
             # Filtro por channel: textos de outros canais não são afetados.
             flushed = await conn.execute(
-                """
+                f"""
                 UPDATE message_queue
                 SET process_after = NOW(),
                     updated_at = NOW()
@@ -190,7 +212,7 @@ async def enqueue_or_buffer(
                   AND channel = %s
                   AND status = 'queued'
                   AND process_after > NOW()
-                  AND media_url IS NULL
+                  AND {PREDICADO_DE_TEXTO}
                 """,
                 (phone_number, agent_id, channel_value),
             )
@@ -237,7 +259,7 @@ async def enqueue_or_buffer(
                 # o índice único suprimiu o INSERT. A linha vencedora é a
                 # resposta correta.
                 duplicada = await _buscar_por_message_id(
-                    conn, channel_value, agent_id, message_id
+                    conn, channel_value, agent_id, phone_number, message_id
                 )
                 await conn.commit()
                 if duplicada is None:
@@ -275,10 +297,10 @@ async def enqueue_or_buffer(
         # outbound própria.
         process_after = datetime.now(UTC) + timedelta(seconds=buffer_seconds)
 
-        # Busca texto pendente para debounce (media_url IS NULL garante
-        # que não debounce texto dentro de uma mensagem de mídia)
+        # Busca texto pendente para debounce. Ver PREDICADO_DE_TEXTO: linha
+        # com qualquer via de download de mídia fica de fora.
         cursor = await conn.execute(
-            """
+            f"""
             SELECT id, incoming_message
             FROM message_queue
             WHERE phone_number = %s
@@ -286,7 +308,7 @@ async def enqueue_or_buffer(
               AND channel = %s
               AND status = 'queued'
               AND process_after > NOW()
-              AND media_url IS NULL
+              AND {PREDICADO_DE_TEXTO}
             ORDER BY created_at DESC
             LIMIT 1
             """,
@@ -301,6 +323,10 @@ async def enqueue_or_buffer(
 
             # Atualiza o outbound_token apenas se vier preenchido — token novo
             # do mesmo phone+agent geralmente reflete a instância ativa atual.
+            #
+            # `message_ids_absorvidos` é o que dá à mensagem concatenada a
+            # mesma proteção contra reentrega que a primeira da rajada ganha
+            # pelo índice único: o UPDATE não passa por ON CONFLICT nenhum.
             await conn.execute(
                 """
                 UPDATE message_queue
@@ -310,6 +336,10 @@ async def enqueue_or_buffer(
                     provider_message_key = COALESCE(
                         %s, provider_message_key
                     ),
+                    message_ids_absorvidos = CASE
+                        WHEN %s::text IS NULL THEN message_ids_absorvidos
+                        ELSE message_ids_absorvidos || %s::text
+                    END,
                     updated_at = NOW()
                 WHERE id = %s
                 """,
@@ -320,6 +350,8 @@ async def enqueue_or_buffer(
                     Jsonb(provider_message_key)
                     if provider_message_key is not None
                     else None,
+                    message_id,
+                    message_id,
                     existing_id,
                 ),
             )
@@ -366,7 +398,7 @@ async def enqueue_or_buffer(
 
         if row is None:
             duplicada = await _buscar_por_message_id(
-                conn, channel_value, agent_id, message_id
+                conn, channel_value, agent_id, phone_number, message_id
             )
             await conn.commit()
             if duplicada is None:
