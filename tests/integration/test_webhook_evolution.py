@@ -328,11 +328,21 @@ async def test_audio_sem_url_entra_na_fila_como_midia(limpar):
     assert linha[2] == {"remoteJid": JID, "fromMe": False, "id": "MSG-AUDIO"}
 
 
-async def test_midia_com_legenda_e_sem_url_entra_como_midia(limpar):
-    """Com legenda a mensagem tem texto — não pode cair no branch de texto.
+async def test_midia_com_legenda_preserva_legenda_e_via_de_download(limpar):
+    """A legenda é preservada JUNTO com os campos de mídia, não no lugar deles.
 
-    Se caísse, media_url e media_type iriam nulos para o banco e o worker
-    nunca a trataria como mídia, tornando o provider_message_key inútil.
+    Decisão consciente (fix round 3): a mensagem vai para o branch de mídia
+    mesmo tendo texto. O que o branch de texto faria seria gravar media_url e
+    media_type nulos, e uma linha assim é indistinguível de texto puro —
+    nem o worker de hoje nem o da Task 9 conseguiriam recuperar a imagem, e
+    o agente responderia a uma legenda sobre uma foto que ninguém viu.
+
+    No branch de mídia nada do que o lead escreveu se perde: a legenda fica
+    em `incoming_message`, ao lado de `media_type` e da key. A entrega dessa
+    legenda ao agente depende de `preprocess_incoming_message`
+    (`worker/media.py:244`), que hoje corta em `not media_url` — é a linha
+    que a Task 9 precisa mudar de qualquer forma para o download por key
+    funcionar.
     """
     corpo = payload_tipo(
         "imageMessage",
