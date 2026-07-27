@@ -11,34 +11,49 @@ duplicatas em memória (`agrupar_por_canonico`, `fundir_grupo`,
 `gerar_relatorio`), a importação validada de `leads_crm`/`leads_descartados`
 (`importar_leads`) e a extração/importação do histórico de conversa
 (`montar_historico_por_sessao`, `importar_historico`) para
-`legacy_chat_history`. A leitura via REST do Supabase que alimenta este
-módulo com `LinhaOrigem`/`LinhaHistoricoOrigem` reais, e a orquestração de
-ponta a ponta (`main()`), ficam para a execução do cutover (Fase 5) -- as
-funções puras (normalização, fusão, filtro de histórico) não dependem de
-rede nem de banco, e por isso são testáveis isoladamente; as que escrevem
-(`importar_leads`, `importar_historico`) são testadas contra o Postgres
-real, nunca monkeypatchadas.
+`legacy_chat_history`. As funções puras (normalização, fusão, filtro de
+histórico) não dependem de rede nem de banco, e por isso são testáveis
+isoladamente; as que escrevem (`importar_leads`, `importar_historico`) são
+testadas contra o Postgres real, nunca monkeypatchadas.
 
-A credencial do Supabase é segredo: entra por variável de ambiente,
-nunca é versionada, e nunca deve ser impressa -- nem em log, nem no
-relatório. O `relatorio_migracao.md` gerado também não é versionado --
+A leitura via REST do Supabase (`ler_leads_supabase`, `ler_historico_supabase`,
+paginada contra `Content-Range`) e a orquestração de ponta a ponta (`main`,
+`executar_migracao`) são a "casca" acrescentada na Fase 5, Task 1 -- CLI com
+`--dry-run` (padrão: lê, funde, valida, escreve `relatorio_migracao.md` e
+para) e `--executar` (grava de verdade), mutuamente exclusivos.
+
+A credencial do Supabase é segredo: entra por variável de ambiente
+(`SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`), nunca é versionada, e nunca
+deve ser impressa -- nem em log, nem no relatório, nem em mensagem de erro.
+Por isso ela viaja só em headers HTTP (`apikey`/`Authorization`), nunca em
+query string -- um `httpx.HTTPStatusError` ou `RequestError` não permite,
+por desenho, reconstruir o segredo a partir do que este módulo captura dele
+(só `type(exc).__name__` e o código de status, nunca `str(exc)` inteiro nem
+`exc.request`). O `relatorio_migracao.md` gerado também não é versionado --
 carrega telefone e nome de gente real.
 """
 
 from __future__ import annotations
 
+import argparse
+import asyncio
 import json
+import os
 import re
+import sys
 from collections import defaultdict
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
+import httpx
 from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
 
 from whatsapp_langchain.agents.catalog.elevec_sdr.saida import extrair_baloes
+from whatsapp_langchain.shared.db import get_pool
 from whatsapp_langchain.shared.phone import (
     _digitos_do_jid,
     _e_endereco_sem_telefone,
@@ -1615,3 +1630,446 @@ async def importar_historico(
                 )
                 total += 1
     return total
+
+
+# =============================================================================
+# Leitura REST do Supabase e CLI (Fase 5, Task 1)
+# =============================================================================
+#
+# Tudo abaixo é a "casca" -- Fase 4 entregou a biblioteca (normalização,
+# fusão, importação, validações, histórico), testada, mas sem `main()`, sem
+# leitura de rede, sem relatório em disco. Esta seção não reabre nenhuma
+# decisão de negócio de lá; ela só lê, orquestra e imprime.
+#
+# Tabelas de origem confirmadas contra o Supabase real (MCP, nesta task):
+# `leads_crm` (3.382 linhas -- a base é viva, o plano mediu 3.373 dias
+# antes) e `n8n_chat_histories` (8.920 linhas, batendo exato com o plano).
+# Os nomes de campo do REST já são os mesmos de `LinhaOrigem`/
+# `LinhaHistoricoOrigem` -- nenhuma renomeação nas funções de mapeamento
+# abaixo.
+
+_SUPABASE_URL_ENV = "SUPABASE_URL"
+_SUPABASE_KEY_ENV = "SUPABASE_SERVICE_ROLE_KEY"
+
+_TABELA_LEADS = "leads_crm"
+_TABELA_HISTORICO = "n8n_chat_histories"
+
+# PostgREST corta em 1.000 linhas por padrão -- ver a armadilha descrita no
+# brief desta task. `_buscar_paginado` pagina por este tamanho e valida a
+# soma final contra o `Content-Range` que o próprio Supabase devolveu.
+_TAMANHO_PAGINA = 1000
+
+_TIMEOUT_HTTP = httpx.Timeout(30.0)
+
+_RELATORIO_NOME = "relatorio_migracao.md"
+
+# Extrai o total de um `Content-Range` no formato do PostgREST
+# (`"0-999/3373"`). Grupo 1 também casa com `"*"` (PostgREST usa isso para
+# "não contado") -- tratado como total desconhecido em `_total_do_content_range`.
+_CONTENT_RANGE_TOTAL = re.compile(r"/(\d+|\*)$")
+
+
+class CredencialAusente(RuntimeError):
+    """`SUPABASE_URL`/`SUPABASE_SERVICE_ROLE_KEY` ausente(s) no ambiente.
+
+    A mensagem nomeia só a(s) variável(is) que falta(m) -- nunca um valor.
+    Não há valor para vazar quando a variável está ausente; o mesmo cuidado
+    vale para qualquer outro erro deste módulo que toque credencial (ver o
+    docstring do módulo: a chave só viaja em headers HTTP, e as funções de
+    leitura nunca capturam `str(exc)` inteiro nem `exc.request` de uma
+    falha do `httpx` -- só o tipo da exceção e o código de status).
+    """
+
+
+def _credenciais_supabase() -> tuple[str, str]:
+    """Lê `SUPABASE_URL`/`SUPABASE_SERVICE_ROLE_KEY` do ambiente.
+
+    Levanta `CredencialAusente` com uma mensagem legível que nomeia a(s)
+    variável(is) faltante(s) -- nunca o valor de nenhuma delas, presente ou
+    não. RLS está ligado nas duas tabelas de origem (confirmado via MCP do
+    Supabase) -- por isso a variável é a service-role key, não a anon key:
+    a anon key não enxergaria as linhas.
+    """
+    url = os.environ.get(_SUPABASE_URL_ENV, "").strip()
+    chave = os.environ.get(_SUPABASE_KEY_ENV, "").strip()
+    faltando = [
+        nome
+        for nome, valor in ((_SUPABASE_URL_ENV, url), (_SUPABASE_KEY_ENV, chave))
+        if not valor
+    ]
+    if faltando:
+        raise CredencialAusente(
+            "variável(is) de ambiente ausente(s): "
+            + ", ".join(faltando)
+            + " -- configure antes de rodar a migração"
+        )
+    return url, chave
+
+
+def _cliente_supabase(
+    transporte: httpx.AsyncBaseTransport | None = None,
+) -> httpx.AsyncClient:
+    """Fábrica do cliente HTTP -- isolada para que os testes injetem
+    `httpx.MockTransport` (o mesmo padrão de `tests/unit/test_pipedrive.py`,
+    `test_evolution_client.py` etc.) sem tocar a rede real. Em produção,
+    `transporte=None` e o `httpx.AsyncClient` usa a rede de verdade.
+    """
+    return httpx.AsyncClient(timeout=_TIMEOUT_HTTP, transport=transporte)
+
+
+def _total_do_content_range(valor: str) -> int | None:
+    """Extrai o total de um header `Content-Range` do PostgREST.
+
+    Devolve `None` quando o header está ausente, malformado, ou o total vem
+    como `*` (PostgREST usa isso para "não contado", o que não deveria
+    acontecer com `Prefer: count=exact`, mas uma origem que ignorar esse
+    header não pode ser lida como "zero divergência" por omissão). Quem
+    chama trata `None` como "não dá para validar" -- e isso é abort, nunca
+    "assume que está certo".
+    """
+    if not valor:
+        return None
+    m = _CONTENT_RANGE_TOTAL.search(valor)
+    if m is None or m.group(1) == "*":
+        return None
+    return int(m.group(1))
+
+
+async def _buscar_paginado(
+    client: httpx.AsyncClient,
+    base_url: str,
+    chave: str,
+    tabela: str,
+    *,
+    order_by: str,
+    tamanho_pagina: int = _TAMANHO_PAGINA,
+) -> list[dict[str, Any]]:
+    """Lê `tabela` inteira via REST do Supabase, paginando pelo par de
+    headers `Range-Unit`/`Range` do PostgREST.
+
+    A credencial vai SÓ em headers (`apikey`, `Authorization: Bearer`) --
+    nunca em query string. Mesmo motivo já documentado em
+    `shared/pipedrive.py`: um segredo em query string acaba dentro de
+    `str(url)`, que é o que vai para log ou traceback por descuido; em
+    header, não. `order_by` é obrigatório -- sem ordem explícita, paginação
+    contra uma tabela viva (que pode ganhar linha entre duas páginas) não
+    tem garantia de não pular nem repetir.
+
+    Cada resposta carrega seu próprio `Content-Range` (`Prefer: count=exact`
+    força o Postgres a contar de verdade, não estimar); a leitura para
+    quando a página volta menor que `tamanho_pagina` ou quando já leu o
+    total anunciado. Ao final, a contagem REAL de linhas lidas é validada
+    de novo contra o último total conhecido -- **aborta**
+    (`MigracaoAbortada`) se não bater. Essa checagem final é o que pega
+    "para cedo por engano" mesmo que o laço em si tenha um bug (ex.: um
+    `break` incondicional depois da primeira página): o total esperado só é
+    conhecido depois de uma resposta real do servidor, então uma leitura
+    truncada não tem como coincidir com ele por acaso, a menos que a
+    própria origem tenha só uma página -- caso em que não há nada para
+    truncar.
+    """
+    linhas: list[dict[str, Any]] = []
+    total_esperado: int | None = None
+    inicio = 0
+    url = f"{base_url.rstrip('/')}/rest/v1/{tabela}"
+    headers_base = {
+        "apikey": chave,
+        "Authorization": f"Bearer {chave}",
+        "Accept": "application/json",
+        "Range-Unit": "items",
+        "Prefer": "count=exact",
+    }
+
+    while True:
+        fim = inicio + tamanho_pagina - 1
+        headers = {**headers_base, "Range": f"{inicio}-{fim}"}
+        try:
+            response = await client.get(
+                url, params={"select": "*", "order": order_by}, headers=headers
+            )
+        except httpx.RequestError as exc:
+            # Nunca `str(exc)` nem `exc.request` -- os dois podem carregar a
+            # credencial que foi para os headers da requisição que falhou.
+            raise MigracaoAbortada(
+                f"falha de transporte lendo {tabela!r} do Supabase "
+                f"({type(exc).__name__}) -- abortando antes de qualquer "
+                "escrita"
+            ) from None
+
+        if response.status_code >= 400:
+            raise MigracaoAbortada(
+                f"Supabase respondeu {response.status_code} lendo {tabela!r} "
+                "-- abortando antes de qualquer escrita"
+            )
+
+        pagina = response.json()
+        if not isinstance(pagina, list):
+            raise MigracaoAbortada(
+                f"resposta de {tabela!r} não é uma lista JSON -- abortando "
+                "antes de qualquer escrita"
+            )
+        linhas.extend(pagina)
+
+        total_esperado = _total_do_content_range(
+            response.headers.get("content-range", "")
+        )
+        if total_esperado is None:
+            raise MigracaoAbortada(
+                f"Supabase não devolveu Content-Range utilizável lendo "
+                f"{tabela!r} -- abortando antes de qualquer escrita"
+            )
+
+        if len(pagina) < tamanho_pagina or len(linhas) >= total_esperado:
+            break
+        inicio += tamanho_pagina
+
+    if total_esperado is None or len(linhas) != total_esperado:
+        raise MigracaoAbortada(
+            f"paginação de {tabela!r} não fechou: Content-Range disse "
+            f"{total_esperado}, vieram {len(linhas)} -- abortando antes de "
+            "qualquer escrita"
+        )
+
+    return linhas
+
+
+def _parse_datetime(valor: Any) -> datetime | None:
+    """`created_at`/`last_interaction_at`/`agent_reactivate_at` chegam do
+    PostgREST como string ISO 8601 (`timestamptz`) ou `None`/ausente.
+    `fromisoformat` do Python 3.11+ já entende o sufixo `Z`, mas o
+    `replace` cobre os dois formatos sem depender de qual a origem envia.
+    """
+    if not isinstance(valor, str) or not valor:
+        return None
+    return datetime.fromisoformat(valor.replace("Z", "+00:00"))
+
+
+def _linha_origem_de_registro(bruto: dict[str, Any]) -> LinhaOrigem:
+    """`dict` cru de `leads_crm` (Supabase legado) -> `LinhaOrigem`.
+
+    Sem renomeação de campo -- os nomes do REST já são os de `LinhaOrigem`.
+    """
+    metadata = bruto.get("metadata")
+    return LinhaOrigem(
+        phone=bruto.get("phone"),
+        phase=bruto.get("phase"),
+        created_at=_parse_datetime(bruto.get("created_at")),
+        last_interaction_at=_parse_datetime(bruto.get("last_interaction_at")),
+        pipedriveid=bruto.get("pipedriveid"),
+        email=bruto.get("email"),
+        name=bruto.get("name"),
+        username=bruto.get("username"),
+        source=bruto.get("source"),
+        followup_count=bruto.get("followup_count"),
+        agent_active=bruto.get("agent_active"),
+        followup_active=bruto.get("followup_active"),
+        agent_reactivate_at=_parse_datetime(bruto.get("agent_reactivate_at")),
+        metadata=metadata if isinstance(metadata, dict) else None,
+    )
+
+
+def _linha_historico_de_registro(bruto: dict[str, Any]) -> LinhaHistoricoOrigem:
+    """`dict` cru de `n8n_chat_histories` -> `LinhaHistoricoOrigem`."""
+    mensagem = bruto.get("message")
+    return LinhaHistoricoOrigem(
+        id_origem=bruto["id"],
+        session_id=bruto.get("session_id"),
+        mensagem=mensagem if isinstance(mensagem, dict) else {},
+    )
+
+
+async def ler_leads_supabase(
+    client: httpx.AsyncClient, base_url: str, chave: str
+) -> list[LinhaOrigem]:
+    """Lê `leads_crm` inteira do Supabase legado, paginada e validada contra
+    `Content-Range` (ver `_buscar_paginado`)."""
+    brutos = await _buscar_paginado(
+        client, base_url, chave, _TABELA_LEADS, order_by="phone"
+    )
+    return [_linha_origem_de_registro(b) for b in brutos]
+
+
+async def ler_historico_supabase(
+    client: httpx.AsyncClient, base_url: str, chave: str
+) -> list[LinhaHistoricoOrigem]:
+    """Lê `n8n_chat_histories` inteira do Supabase legado, paginada e
+    validada. `order_by="id"` -- é a única ordem cronológica disponível
+    nessa tabela (ver o docstring de `LinhaHistoricoOrigem`)."""
+    brutos = await _buscar_paginado(
+        client, base_url, chave, _TABELA_HISTORICO, order_by="id"
+    )
+    return [_linha_historico_de_registro(b) for b in brutos]
+
+
+def _contagem_descartes_por_motivo(descartes: Sequence[Descarte]) -> dict[str, int]:
+    contagem: dict[str, int] = defaultdict(int)
+    for descarte in descartes:
+        contagem[descarte.motivo] += 1
+    return dict(contagem)
+
+
+def _imprimir_resumo(
+    *,
+    total_origem: int,
+    grupos: dict[str, list[LinhaOrigem]],
+    fundidas: dict[str, LinhaFundida],
+    descartes: Sequence[Descarte],
+    destaques: Sequence[str],
+    caminho_relatorio: Path,
+) -> None:
+    """Resumo em stdout: totais, descartes por motivo, grupos fundidos e
+    pendências de decisão humana. O `relatorio_migracao.md` é o documento
+    de revisão de verdade; isto é só o que cabe numa tela de terminal.
+    """
+    grupos_multiplos = sum(1 for linhas in grupos.values() if len(linhas) > 1)
+    print("== Migração Supabase -> harness ==")
+    print(f"Total na origem: {total_origem}")
+    print(
+        f"Leads finais após fusão: {len(fundidas)} "
+        f"({grupos_multiplos} grupo(s) com mais de uma linha física)"
+    )
+    print(f"Descartados: {len(descartes)}")
+    for motivo, quantidade in sorted(_contagem_descartes_por_motivo(descartes).items()):
+        print(f"  - {motivo}: {quantidade}")
+    print(f"Pendências de decisão humana: {len(destaques)}")
+    print(f"Relatório completo escrito em: {caminho_relatorio}")
+
+
+async def executar_migracao(
+    *,
+    executar: bool,
+    transporte: httpx.AsyncBaseTransport | None = None,
+    caminho_relatorio: Path | None = None,
+) -> int:
+    """Orquestra a migração de ponta a ponta -- o que `main()` chama.
+
+    `executar=False` (o que `main()` usa quando `--executar` não foi
+    passado -- **`--dry-run` é o padrão**): lê, funde, valida, escreve
+    `relatorio_migracao.md` e para. Nenhum `INSERT`/`UPDATE` acontece.
+
+    `executar=True`: depois do relatório, grava via `importar_leads` e
+    `importar_historico` -- as validações bloqueantes das duas continuam
+    valendo (`MigracaoAbortada`): `--executar` pula a escrita SE alguma
+    validação falhar, nunca pula a própria validação.
+
+    `transporte` e `caminho_relatorio` existem só para teste -- o primeiro
+    injeta `httpx.MockTransport` no lugar da rede real (ver
+    `_cliente_supabase`), o segundo evita que a suíte escreva o relatório
+    de verdade na raiz do repositório a cada teste. Em produção os dois
+    ficam `None` e `main()` usa a rede real e `<raiz do repo>/relatorio_migracao.md`.
+
+    Devolve o código de saída do processo: `0` em sucesso (inclusive
+    dry-run bem-sucedido), `1` em qualquer abort (`CredencialAusente`,
+    `MigracaoAbortada`, ou a soma que `gerar_relatorio` também valida). A
+    mensagem impressa em cada abort já é, por construção de quem levanta,
+    livre de credencial.
+    """
+    try:
+        url, chave = _credenciais_supabase()
+    except CredencialAusente as exc:
+        print(f"ERRO: {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        async with _cliente_supabase(transporte) as client:
+            leads = await ler_leads_supabase(client, url, chave)
+            historico_bruto = await ler_historico_supabase(client, url, chave)
+    except MigracaoAbortada as exc:
+        print(f"ERRO: {exc}", file=sys.stderr)
+        return 1
+
+    total_origem = len(leads)
+    grupos, descartes = agrupar_por_canonico(leads)
+    fundidas = fundir_todos(grupos)
+
+    try:
+        relatorio = gerar_relatorio(total_origem, grupos, fundidas, descartes)
+    except ValueError as exc:
+        print(f"ERRO: {exc}", file=sys.stderr)
+        return 1
+
+    if caminho_relatorio is None:
+        caminho_relatorio = Path(__file__).resolve().parents[1] / _RELATORIO_NOME
+    caminho_relatorio.write_text(relatorio, encoding="utf-8")
+
+    destaques = _montar_destaques(grupos, fundidas, descartes)
+    _imprimir_resumo(
+        total_origem=total_origem,
+        grupos=grupos,
+        fundidas=fundidas,
+        descartes=descartes,
+        destaques=destaques,
+        caminho_relatorio=caminho_relatorio,
+    )
+
+    if not executar:
+        print(
+            "\n--dry-run (padrão): nada foi gravado. Revise o relatório e "
+            "rode de novo com --executar quando estiver pronto."
+        )
+        return 0
+
+    historico_por_sessao = montar_historico_por_sessao(historico_bruto)
+    session_ids = [
+        linha.session_id for linha in historico_bruto if linha.session_id is not None
+    ]
+
+    pool = await get_pool()
+    try:
+        resultado = await importar_leads(
+            pool, total_origem, grupos, fundidas, descartes, session_ids
+        )
+        total_turnos = await importar_historico(pool, historico_por_sessao)
+    except MigracaoAbortada as exc:
+        print(f"ERRO: {exc}", file=sys.stderr)
+        return 1
+
+    print(
+        f"\n--executar: {resultado.leads_gravados} lead(s) gravado(s), "
+        f"{resultado.descartes_gravados} descarte(s) gravado(s), "
+        f"{resultado.reunioes_legadas_marcadas} reunião(ões) legada(s) "
+        f"marcada(s), {total_turnos} turno(s) de histórico gravado(s)."
+    )
+    return 0
+
+
+def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    """`--dry-run` e `--executar` são mutuamente exclusivos -- passar os
+    dois é erro de uso (`argparse` recusa com exit code 2, antes de
+    qualquer leitura). Sem nenhum dos dois, `args.executar` fica `False`,
+    e é isso que `main()` lê como "`--dry-run` é o padrão": não existe um
+    terceiro estado nem uma leitura implícita de "quis dizer --executar".
+    """
+    parser = argparse.ArgumentParser(
+        prog="migrar_supabase",
+        description=(
+            "Migra leads e histórico do Supabase legado para leads_crm/ "
+            "legacy_chat_history. Sem argumento, roda em modo --dry-run."
+        ),
+    )
+    modo = parser.add_mutually_exclusive_group()
+    modo.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Lê, funde, valida e escreve o relatório -- não grava nada (padrão).",
+    )
+    modo.add_argument(
+        "--executar",
+        action="store_true",
+        help="Grava em leads_crm, leads_descartados e legacy_chat_history.",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Ponto de entrada do CLI.
+
+    Uso: ``python scripts/migrar_supabase.py [--dry-run | --executar]``.
+    Exige `SUPABASE_URL` e `SUPABASE_SERVICE_ROLE_KEY` no ambiente.
+    """
+    args = _parse_args(argv)
+    return asyncio.run(executar_migracao(executar=args.executar))
+
+
+if __name__ == "__main__":
+    sys.exit(main())
