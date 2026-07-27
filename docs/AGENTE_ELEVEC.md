@@ -195,6 +195,110 @@ ninguém perceber. Todo fallback loga `warning`.
 
 ---
 
+## Régua de follow-up
+
+Task assíncrona no Worker (`worker/followup.py`, subida por `iniciar_followup`
+em `worker/main.py`) que reengaja lead silencioso em três degraus, sem
+depender de o modelo lembrar de nada — mesma doutrina de "`if` garante, prompt
+só pede" do resto do agente. **Desligada por padrão** (`FOLLOWUP_ENABLED=false`)
+até o cutover: religar cedo demais dispara mensagem de verdade contra leads
+reais sem o resto da migração (webhook do ChatWoot, mapa de template por
+origem da Fase 5) pronto para sustentar o que ela solta.
+
+### Os três degraus, e por que a âncora é `last_inbound_at`
+
+| Degrau | Dispara em | Mensagem |
+|---|---|---|
+| 1 | inbound + 15 min | `"{primeiro nome}?"` ou `"Oi?"` |
+| 2 | inbound + 1h15 | *"Opa, imagino que esteja corrido aí!..."* |
+| 3 | inbound + 23h | `"{nome}, tudo bem? Ainda faz sentido..."` |
+
+Os três contam a partir de `leads_crm.last_inbound_at` — o instante do
+**último inbound do lead**, gravado só pelo gate de ingestão — e não do envio
+anterior (`last_interaction_at`). A diferença importa porque `last_interaction_at`
+também é atualizado pelo próprio follow-up, o que tornaria a escada
+**cumulativa**: medido no banco legado, o degrau 3 caía numa mediana de 24h28
+desde a criação do lead — depois de a janela de 24h da Cloud API já ter
+fechado, e a Meta rejeita envio fora da janela em vez de atrasá-lo. Ancorada
+no inbound, a escada é **absoluta**: os até 5 minutos de atraso de cada
+rodada (`FOLLOWUP_INTERVAL_SECONDS`) não se acumulam de um degrau para o
+outro.
+
+### O contador sobe antes do envio — divergência consciente do n8n
+
+`reivindicar` incrementa `followup_count` no mesmo `UPDATE` que trava o lote
+(`FOR UPDATE SKIP LOCKED`), **antes** de qualquer HTTP acontecer. O n8n
+incrementava só depois de o envio ter sucesso. Aqui, uma falha de envio (a
+Evolution fora do ar, timeout) faz o lead **pular um degrau** em vez de
+tentar de novo na próxima rodada — a alternativa, reenviar, arrisca mandar a
+mesma mensagem duas vezes se a falha foi só na resposta e a mensagem já
+tinha saído. Mandar duas vezes é pior que perder um follow-up.
+
+### Quem sai da janela de 24h
+
+Um lead cujo degrau venceu mas cujo `last_inbound_at` já passou de
+`24h − FOLLOWUP_JANELA_MARGEM_MINUTOS` **não é reivindicado** — ele não entra
+no `UPDATE`, então `followup_count` não avança e o degrau não é queimado à
+toa. Ele **não é reclamado como enviado nem como perdido**: fica parado no
+mesmo degrau até voltar a falar. Quando volta, `aplicar_gate` zera
+`followup_count` e atualiza `last_inbound_at` no mesmo inbound que já reseta
+a escada por outros motivos — o lead reentra do zero, não do meio.
+
+Na operação, isso é visível pelo campo `bloqueados_por_janela` do resumo de
+`rodada()` (`{"enviados", "falhas", "abortados", "bloqueados_por_janela"}`,
+logado a cada rodada). Sem esse contador, "a régua morreu" (bug) e "não havia
+ninguém para reengajar" (dia calmo) são indistinguíveis olhando só
+`enviados == 0`.
+
+### A régua respeita a `blocklist` — e isso importa mais aqui do que em qualquer outro lugar
+
+A checagem de `blocklist` entra dentro do próprio predicado de elegibilidade
+do claim (antes do `LIMIT`, para não causar starvation — um lote todo
+bloqueado nunca deixaria o próximo lead elegível ser alcançado) e é
+revalidada de novo em `ainda_vale_enviar`, imediatamente antes do envio. A
+régua é o **único caminho do sistema que fala com o lead sem ele ter
+falado primeiro** — toda outra mensagem que sai é resposta a um inbound.
+Um opt-out que a régua ignorasse seria a única forma de esta base contatar
+alguém que pediu para não ser contatado.
+
+### `send_template` existe, e o follow-up não o usa
+
+`EvolutionClient.send_template` (Task 2 da Fase 3) foi implementado para
+abrir a janela de 24h via template aprovado pela Meta — é o que a Fase 5
+vai usar para reengajar quem *já* saiu da janela. O follow-up desta fase
+não chama: os dois templates que a EleveC tem hoje na Meta
+(`boas_vindas_renata_linkedin_02`, `boas_vindas_renata_respondiapp_03`) são
+de **boas-vindas**, para o primeiro contato vindo de formulário. Mandar
+"boas-vindas" para um lead no meio de uma conversa — que é exatamente quem a
+régua persegue — é pior que não mandar nada. Reabrir uma janela fechada de
+verdade exige um template de retomada dedicado, aprovado pela Meta, e essa
+é decisão de produto do cliente, não deste código. Dívida registrada para a
+Fase 5.
+
+### `leads_crm.phone` sempre canônico — a invariante que sustenta o claim
+
+Ver a seção **"Invariante de telefone"**, mais abaixo. A régua depende dela
+diretamente: o claim (`_SQL_ELEGIVEIS_TRAVADOS` em `worker/followup.py`) é
+uma consulta única porque o CHECK do banco garante que cada pessoa é
+**uma linha só** — antes da migração `014`, o mesmo lead podia ter até três
+linhas físicas e o claim precisava de uma segunda consulta travada só para
+alcançar o "irmão" fora do lote, sob risco de mandar a mesma mensagem duas
+vezes para a mesma pessoa.
+
+### Melhoria de produto fora de escopo: perseguir quem cancelou
+
+`reverter_fase_apos_cancelamento` (`tools/crm.py`) devolve o lead de
+`agendou_sessao` para `qualificado` e religa `followup_active` quando
+`agent_active`. Isso **restaura a coerência do estado** — a coluna volta ao
+valor que teria se a reunião nunca tivesse existido — mas **não** coloca o
+lead de volta na régua: `qualificado` está fora do filtro de fases do claim
+de propósito. Numa migração, a direção segura de errar é não mandar mensagem
+que o sistema atual não manda. Perseguir quem cancelou para tentar remarcar
+é melhoria real, mas é decisão de produto a discutir com o cliente **depois**
+do cutover — não uma promessa em aberto desta fase.
+
+---
+
 ## Variáveis de ambiente
 
 ### Google Calendar (obrigatórias para agendar)
@@ -242,6 +346,23 @@ BALAO_MAX_COUNT=10        # teto; acima disso o resto concatena no último
 O teto protege o `lease_seconds`: sem ele, uma resposta com dezenas de itens
 soma sleep suficiente para estourar o lease e, com mais de um worker,
 duplicar o envio.
+
+### Follow-up (régua de reengajamento)
+
+```
+FOLLOWUP_ENABLED=false                 # desligada até o cutover, de propósito
+FOLLOWUP_INTERVAL_SECONDS=300          # intervalo do loop no Worker
+FOLLOWUP_BATCH_SIZE=10                 # LIMIT reivindicado por rodada
+FOLLOWUP_NIVEL1_MINUTOS=15             # degrau 1, desde last_inbound_at
+FOLLOWUP_NIVEL2_MINUTOS=75             # degrau 2 (1h15)
+FOLLOWUP_NIVEL3_MINUTOS=1380           # degrau 3 (23h)
+FOLLOWUP_JANELA_MARGEM_MINUTOS=30      # folga antes das 24h da Cloud API
+```
+
+Ver a seção **"Régua de follow-up"**, acima, para a âncora em
+`last_inbound_at`, a divergência do contador e o que acontece com quem sai
+da janela de 24h. Sem cliente Evolution configurado, `iniciar_followup` não
+sobe a task (loga `followup_sem_canal`) mesmo com a flag ligada.
 
 ### Fail-fast no boot
 
