@@ -32,10 +32,11 @@ nem mídia (reação, enquete, mensagem apagada, protocolo) é descartado com
 200, antes do gate. Sem esse corte o agente seria invocado com conteúdo
 vazio e um emoji criaria lead novo em `leads_crm`.
 
-Mídia sem `url` NÃO é descarte: a URL do payload aponta para conteúdo
-cifrado e `download_media` nem a lê neste canal — quem baixa é a
-`provider_message_key`. Basta `media_type` para a mensagem entrar na fila
-como mídia.
+Mídia sem `url` NÃO é descarte no momento da ingestão: basta `media_type`
+para a mensagem entrar na fila como mídia. Na integração WHATSAPP-BUSINESS
+a URL sempre vem (e é ela que baixa), mas descartar aqui perderia áudio de
+lead em silêncio, com 200 e sem reentrega, se algum payload chegar sem ela
+— quem responde ao lead que a mídia não foi processada é o worker.
 
 Reentrega é esperada: a Evolution repete o POST em timeout ou resposta
 >= 400. A rota reconhece a reentrega ANTES do rate limit e do gate (ambos
@@ -49,11 +50,11 @@ malformado saem com 200 e log de erro. Reentrega não conserta typo na URL
 do webhook nem JSON quebrado; 4xx só produziria loop infinito. A exceção é
 o 401 do secret, em `verify_evolution_webhook_secret`.
 
-Mídia recebida pela Evolution só é baixável via getBase64FromMediaMessage,
-que exige a key completa (remoteJid + fromMe + id), não só o id. Por isso
-`data.key` inteiro é gravado em `provider_message_key` sempre que a
-mensagem tem mídia — a URL do payload aponta para conteúdo cifrado e é
-ignorada no download, então a key é a única via.
+Mídia recebida nesta integração é baixável por GET na própria `url` do
+payload (`lookaside.fbsbx.com`, não criptografada) — ver `worker/media.py`.
+`data.key` continua sendo gravado em `provider_message_key` como dado de
+diagnóstico e como via de download de uma instância Baileys; ver o
+comentário no `enqueue_or_buffer` desta rota.
 """
 
 from typing import Any
@@ -80,7 +81,7 @@ router = APIRouter(tags=["webhook"])
 EVENTOS_DE_MENSAGEM = {"messages.upsert", "messages"}
 
 # Campo dentro de `message` -> MIME de fallback, usado só quando o nó não
-# traz `mimetype`. É o conteúdo que manda, não o `messageType`: em mensagem
+# declara o MIME. É o conteúdo que manda, não o `messageType`: em mensagem
 # embrulhada (viewOnce, efêmera, documento com legenda) o tipo declarado é o
 # do envelope, não o da mídia de dentro — um `messageType=documentMessage`
 # com `imageMessage` dentro viraria `application/octet-stream`, que o
@@ -102,6 +103,13 @@ CAMPOS_DE_MIDIA: dict[str, str] = {
 # normalmente (a mensagem existe no chat, diferente de uma reação).
 CAMPO_DE_FIGURINHA = "stickerMessage"
 TEXTO_DE_FIGURINHA = "[figurinha]"
+
+# O nome do campo do MIME muda com a integração da instância: a
+# WHATSAPP-BUSINESS (Cloud API oficial) manda `mime_type`, o Baileys manda
+# `mimetype`. Este é um template herdado por clientes que rodam as duas, e
+# ler só uma forma joga a mensagem no default do campo — um `audio/mp4`
+# viraria `audio/ogg` e a transcrição sairia com o formato errado.
+CAMPOS_DE_MIME = ("mime_type", "mimetype")
 
 # Envelopes que aninham a mensagem real em `message.<envelope>.message`.
 ENVELOPES = (
@@ -147,12 +155,11 @@ def _extrair_conteudo(data: dict[str, Any]) -> tuple[str, str | None, str | None
     a rota trata isso como evento a ignorar. Reação, atualização de enquete
     e `protocolMessage` de mensagem apagada caem aqui.
 
-    O `media_type` vem do `mimetype` do próprio nó de mídia — todo nó
-    Baileys o carrega (`audioMessage.mimetype: "audio/ogg; codecs=opus"`) e
-    ele estava sendo ignorado ao lado do `url` e do `caption`, que são lidos
-    do mesmo dicionário. Os consumidores aguentam o parâmetro do MIME:
-    `_media_kind` testa `startswith("audio/")` e
-    `_audio_format_from_media_type` acha `"ogg"` dentro da string inteira.
+    O `media_type` vem do MIME declarado no próprio nó de mídia, em
+    `mime_type` (Cloud API) ou `mimetype` (Baileys) — ver `CAMPOS_DE_MIME`.
+    Os consumidores aguentam o parâmetro do MIME: `_media_kind` testa
+    `startswith("audio/")` e `_audio_format_from_media_type` acha `"ogg"`
+    dentro de `"audio/ogg; codecs=opus"`.
     """
     bruto = data.get("message")
     msg = _desembrulhar(bruto) if isinstance(bruto, dict) else {}
@@ -176,8 +183,12 @@ def _extrair_conteudo(data: dict[str, Any]) -> tuple[str, str | None, str | None
         if not texto and isinstance(legenda, str):
             texto = legenda
 
-        mimetype = conteudo.get("mimetype")
-        declarado = mimetype.strip() if isinstance(mimetype, str) else ""
+        declarado = ""
+        for campo_mime in CAMPOS_DE_MIME:
+            valor = conteudo.get(campo_mime)
+            if isinstance(valor, str) and valor.strip():
+                declarado = valor.strip()
+                break
 
         return (
             texto,
@@ -220,9 +231,9 @@ async def _processar_mensagem(
 
     # Nem texto nem mídia: reação, enquete, mensagem apagada, protocolo.
     # Enfileirar isso invocaria o agente com conteúdo vazio. O corte é por
-    # `media_type` e não por `media_url` porque na Evolution a URL aponta
-    # para conteúdo cifrado e o download é feito pela key — mídia sem URL é
-    # normal aqui, e descartá-la perderia áudio de lead em silêncio.
+    # `media_type` e não por `media_url`: um payload de mídia sem URL não
+    # baixa, mas quem avisa o lead disso é o worker (auto-resposta), não um
+    # descarte silencioso com 200 e sem reentrega.
     #
     # Antes do gate: uma reação de lead que passasse por ele renovaria
     # last_interaction_at e zeraria followup_count, criando ou "reengajando"
@@ -331,10 +342,19 @@ async def _processar_mensagem(
         media_type=media_type,
         message_id=message_id,
         buffer_seconds=settings.message_buffer_seconds,
-        # A key é a única via de download na Evolution (`download_media`
-        # ignora a URL nesse canal), então grava sempre que há mídia. Key
-        # vazia vira None: sem `id`/`remoteJid` ela não baixa nada, e é o
-        # que diz a `enqueue_or_buffer` que não há via de download.
+        # A key NÃO é mais via de download. Ela existe porque a Fase 1
+        # assumiu payload Baileys — URL cifrada, bytes só por
+        # `getBase64FromMediaMessage`, que exige a key inteira. O tráfego
+        # real desmentiu isso nesta integração: a URL vem aberta e o
+        # download é um GET (`worker/media.py`). Continua sendo gravada por
+        # dois motivos, nenhum deles o download: é o identificador que
+        # correlaciona a linha da fila com a mensagem no lado da Evolution/
+        # Meta quando algo precisa ser investigado, e é o que uma instância
+        # Baileys (este repositório é template) precisaria para voltar a
+        # baixar por `EvolutionClient.baixar_midia`. A coluna vem da
+        # migração 008 e fica — migração aplicada é imutável.
+        #
+        # Key vazia vira None: sem `id`/`remoteJid` ela não identifica nada.
         provider_message_key=key if media_type and key else None,
     )
 

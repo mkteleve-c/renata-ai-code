@@ -410,8 +410,44 @@ async def test_sticker_vira_marcador_de_texto_sem_chamada_multimodal(limpar):
     assert linha[3] is None
 
 
+async def test_payload_real_da_cloud_api_chega_inteiro_na_fila(limpar):
+    """Áudio real da integração WHATSAPP-BUSINESS, do webhook até a fila.
+
+    Shape medido em `docs/evidencias/payload-midia-cloud-api.json`:
+    `mime_type` (com underscore), URL aberta em `lookaside.fbsbx.com`, sem
+    `mediaKey`/`directPath`. Lendo só `mimetype`, o MIME caía no default do
+    campo e o `; codecs=opus` sumia.
+    """
+    corpo = payload_tipo(
+        "audioMessage",
+        {
+            "audioMessage": {
+                "mime_type": "audio/ogg; codecs=opus",
+                "sha256": "sha-redigido",
+                "id": "id-redigido",
+                "url": "https://lookaside.fbsbx.com/whatsapp_business/attachments/?x=1",
+                "voice": True,
+                "ptt": True,
+            }
+        },
+        message_id="MSG-CLOUD-PTT",
+    )
+
+    async with await cliente() as c:
+        r = await c.post(f"/webhook/evolution?agent={AGENTE}", json=corpo)
+
+    assert r.status_code == 200, r.text
+    linha = await unica_linha("media_url, media_type, provider_message_key")
+    assert linha[0] == (
+        "https://lookaside.fbsbx.com/whatsapp_business/attachments/?x=1"
+    )
+    assert linha[1] == "audio/ogg; codecs=opus"
+    # A key segue sendo gravada como diagnóstico, não como via de download.
+    assert linha[2] == {"remoteJid": JID, "fromMe": False, "id": "MSG-CLOUD-PTT"}
+
+
 async def test_mimetype_do_payload_prevalece_sobre_o_padrao(limpar):
-    """Todo nó de mídia Baileys carrega `mimetype` — inferir é desnecessário."""
+    """Nó de mídia Baileys carrega `mimetype` — a outra forma do MIME."""
     corpo = payload_tipo(
         "audioMessage",
         {"audioMessage": {"mimetype": "audio/ogg; codecs=opus", "seconds": 3}},
@@ -467,10 +503,12 @@ async def test_mimetype_ausente_cai_no_campo_e_nao_no_messagetype(limpar):
 
 
 async def test_audio_sem_url_entra_na_fila_como_midia(limpar):
-    """Na Evolution a URL é inútil — quem baixa é a provider_message_key.
+    """Mídia sem URL entra na fila; quem avisa o lead é o worker.
 
-    Descartar mídia sem URL perderia áudio de lead em silêncio, com 200 e
-    sem reentrega.
+    A ingestão não descarta: 200 sem reentrega perderia o áudio em silêncio.
+    Sem URL o download não acontece (a `provider_message_key` não baixa
+    nada), e o `preprocess_incoming_message` responde ao lead que a mídia
+    não foi processada.
     """
     corpo = payload_tipo(
         "audioMessage",
@@ -500,11 +538,9 @@ async def test_midia_com_legenda_preserva_legenda_e_via_de_download(limpar):
     o agente responderia a uma legenda sobre uma foto que ninguém viu.
 
     No branch de mídia nada do que o lead escreveu se perde: a legenda fica
-    em `incoming_message`, ao lado de `media_type` e da key. A entrega dessa
-    legenda ao agente depende de `preprocess_incoming_message`
-    (`worker/media.py:244`), que hoje corta em `not media_url` — é a linha
-    que a Task 9 precisa mudar de qualquer forma para o download por key
-    funcionar.
+    em `incoming_message`, ao lado de `media_type` e da key. Sem URL o
+    worker não baixa a imagem e responde ao lead com a auto-resposta de
+    mídia não suportada — o registro do que ele mandou fica na linha.
     """
     corpo = payload_tipo(
         "imageMessage",
