@@ -308,6 +308,25 @@ teardown. Nenhuma escrita chega a serviço externo.
 
 ---
 
+## Invariante de telefone (contrato para o importador da Fase 4)
+
+Desde a migração `db/migrations/014_uma_linha_por_pessoa.sql`,
+`leads_crm.phone` é **sempre** a forma canônica (só dígitos, brasileiro sem
+o 9º dígito) — garantido pelo banco, não por convenção de quem escreve. O
+`CHECK leads_crm_phone_canonico_check` proíbe as duas formas físicas que
+causavam duplicata de identidade (mesma pessoa, duas linhas): o 9º dígito
+do celular (`^55[0-9]{2}9[0-9]{8}$`) e o zero de tronco (`^550`).
+
+**Consequência para o importador do Supabase:** ele precisa canonicalizar
+(`shared/phone.py::canonicalizar`) **antes** de inserir, não depois. Uma
+violação do CHECK numa carga em massa falha alto (a linha inteira é
+recusada pelo Postgres) em vez de criar silenciosamente uma segunda linha
+para o mesmo lead — esse é o comportamento desejado. Não trate uma
+`CheckViolation` aqui como bug do importador para contornar; é o banco
+recusando um telefone que chegou sem canonicalizar.
+
+---
+
 ## Ver também
 
 - `docs/evidencias/prompt-renata-n8n.md` — o prompt de produção, verbatim

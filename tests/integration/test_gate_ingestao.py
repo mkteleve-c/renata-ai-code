@@ -14,6 +14,43 @@ JID = {"remoteJid": "5511988887777@s.whatsapp.net", "fromMe": False}
 
 
 @pytest.fixture
+async def permitir_forma_legada():
+    """Alguns testes abaixo fundem DUAS linhas físicas (`COM_9` + `TELEFONE`)
+    que compartilham a mesma identidade canônica — exatamente o cenário que
+    a migração `014_uma_linha_por_pessoa.sql` (Task 7) tornou
+    IRREPRESENTÁVEL em `leads_crm` via o CHECK `leads_crm_phone_canonico_check`.
+
+    O código de fusão que eles exercitam (`shared/leads.py::_fundir` /
+    `_persistir_consolidacao`, dentro de `aplicar_gate`) continua existindo
+    — é a referência que a migração 014 reimplementa em SQL para consolidar
+    a base legada uma única vez — mas deixou de ser alcançável em produção:
+    `aplicar_gate` nunca mais vai encontrar duas linhas físicas para o
+    mesmo telefone, porque nunca mais vai conseguir CRIAR a segunda.
+
+    Este fixture derruba o CHECK (via `COMMIT`, não rollback — `aplicar_gate`
+    abre a PRÓPRIA conexão do pool, então uma alteração de schema só
+    presa numa transação não commitada bloquearia ela, não seria enxergada)
+    só para o teste que o pede, e SEMPRE restaura no teardown: outros
+    testes do mesmo processo, incluindo os desta rodada de mutação,
+    dependem da invariante estar em vigor.
+    """
+    pool = await get_pool()
+    async with pool.connection() as conn:
+        await conn.execute(
+            "alter table leads_crm drop constraint leads_crm_phone_canonico_check"
+        )
+    try:
+        yield
+    finally:
+        async with pool.connection() as conn:
+            await conn.execute(
+                "alter table leads_crm add constraint "
+                "leads_crm_phone_canonico_check "
+                "check (phone !~ '^55[0-9]{2}9[0-9]{8}$' and phone !~ '^550')"
+            )
+
+
+@pytest.fixture
 async def limpar():
     pool = await get_pool()
     async with pool.connection() as conn:
@@ -164,7 +201,7 @@ async def test_telefone_invalido_descarta(limpar):
     assert r.motivo == "telefone_invalido"
 
 
-async def test_encontra_lead_gravado_com_9(limpar):
+async def test_encontra_lead_gravado_com_9(permitir_forma_legada, limpar):
     """Lead salvo na forma não-canônica é encontrado e a linha é canonicalizada."""
     pool = await get_pool()
     async with pool.connection() as conn:
@@ -203,7 +240,7 @@ async def test_promove_fase_formulario_para_iniciou_conversa(limpar):
     assert r.lead["phase"] == "iniciou_conversa"
 
 
-async def test_consolida_duplicata_com_e_sem_9(limpar):
+async def test_consolida_duplicata_com_e_sem_9(permitir_forma_legada, limpar):
     """Duas linhas para o mesmo lead (base legada com 9 + gate novo sem 9) se fundem."""
     pool = await get_pool()
     async with pool.connection() as conn:
@@ -235,7 +272,7 @@ async def test_consolida_duplicata_com_e_sem_9(limpar):
     assert restantes == 0, "a linha legada é apagada após a fusão"
 
 
-async def test_fusao_preserva_metadata_da_linha_legada(limpar):
+async def test_fusao_preserva_metadata_da_linha_legada(permitir_forma_legada, limpar):
     """`metadata` tem default '{}' — coalesce por `is not None` nunca cai para a
     linha antiga, e o DELETE seguinte torna a perda irreversível."""
     pool = await get_pool()
@@ -258,7 +295,7 @@ async def test_fusao_preserva_metadata_da_linha_legada(limpar):
     assert r.lead["metadata"]["utm"] == "camp-2024"
 
 
-async def test_fusao_registra_linhas_fundidas(limpar):
+async def test_fusao_registra_linhas_fundidas(permitir_forma_legada, limpar):
     """A auditoria da fusão: os telefones originais são a única cópia do que
     existia antes do DELETE da linha legada."""
     pool = await get_pool()
@@ -280,7 +317,9 @@ async def test_fusao_registra_linhas_fundidas(limpar):
     assert sorted(r.lead["metadata"]["linhas_fundidas"]) == sorted([TELEFONE, COM_9])
 
 
-async def test_fusao_da_precedencia_a_linha_vencedora_por_chave(limpar):
+async def test_fusao_da_precedencia_a_linha_vencedora_por_chave(
+    permitir_forma_legada, limpar
+):
     pool = await get_pool()
     async with pool.connection() as conn:
         await conn.execute(
@@ -300,7 +339,7 @@ async def test_fusao_da_precedencia_a_linha_vencedora_por_chave(limpar):
     assert r.lead["metadata"]["origem"] == "linkedin", "chave só da antiga sobrevive"
 
 
-async def test_fusao_preserva_o_maior_followup_count(limpar):
+async def test_fusao_preserva_o_maior_followup_count(permitir_forma_legada, limpar):
     """Mesmo defeito do metadata: default 0 não é None e nunca cai para a antiga.
 
     Não é observável no caminho aceito (o upsert zera), mas fica gravado na
@@ -348,7 +387,7 @@ async def test_telefone_invalido_e_retido_em_leads_descartados(limpar):
     assert linha[1]["key"]["id"] == "MSG-DESCARTE", "o payload precisa ser retido"
 
 
-async def test_consolida_duplicata_com_fase_nula(limpar):
+async def test_consolida_duplicata_com_fase_nula(permitir_forma_legada, limpar):
     """phase é nullable — a fusão não pode estourar KeyError numa linha sem fase."""
     pool = await get_pool()
     async with pool.connection() as conn:
@@ -366,7 +405,9 @@ async def test_consolida_duplicata_com_fase_nula(limpar):
     assert r.lead["phase"] == "qualificado"
 
 
-async def test_consolida_duplicata_agendou_sessao_vence_perdido(limpar):
+async def test_consolida_duplicata_agendou_sessao_vence_perdido(
+    permitir_forma_legada, limpar
+):
     """agendou_sessao é fato verificável (evento no calendário) e vence qualquer fase,
     inclusive perdido — mesmo quando perdido é a linha mais recente."""
     pool = await get_pool()
@@ -389,6 +430,7 @@ async def test_consolida_duplicata_agendou_sessao_vence_perdido(limpar):
 
 
 async def test_duplicata_com_legada_pausada_nao_consolida_nem_ressuscita_handover(
+    permitir_forma_legada,
     limpar,
 ):
     """Lead pausado numa duplicata não pode ter a fusão escrita (mesma doutrina de
@@ -431,7 +473,9 @@ async def test_duplicata_com_legada_pausada_nao_consolida_nem_ressuscita_handove
     assert followup_count_legada == 5, "a linha legada não pode ser tocada"
 
 
-async def test_duplicata_reactivate_at_nao_e_coalescido_de_volta(limpar):
+async def test_duplicata_reactivate_at_nao_e_coalescido_de_volta(
+    permitir_forma_legada, limpar
+):
     """Discrimina coalesce de _vencedor_pausa: as duas linhas têm agent_active=true,
     então a mensagem é aceita e a fusão é persistida — mas a linha vencedora
     (a mais recente) tem agent_reactivate_at NULL, e a antiga tem um 2030 obsoleto.
@@ -458,7 +502,9 @@ async def test_duplicata_reactivate_at_nao_e_coalescido_de_volta(limpar):
     assert r.lead["agent_reactivate_at"] is None, "coalesce ressuscitaria o 2030"
 
 
-async def test_from_me_com_duplicata_desliga_as_duas_linhas(limpar):
+async def test_from_me_com_duplicata_desliga_as_duas_linhas(
+    permitir_forma_legada, limpar
+):
     """fromMe usa `where phone in (com_9, sem_9)`, não o phone de uma consolidação —
     sem consolidar nada, as duas formas do telefone precisam ficar com agent_active
     false."""
@@ -516,7 +562,9 @@ async def test_concorrencia_lead_novo_gera_uma_linha_so(limpar):
     assert total == 1
 
 
-async def test_concorrencia_lead_legado_nao_perde_atualizacao(limpar):
+async def test_concorrencia_lead_legado_nao_perde_atualizacao(
+    permitir_forma_legada, limpar
+):
     """Duas mensagens simultâneas de um lead legado (com 9) não colidem nem somem."""
     pool = await get_pool()
     assert pool.max_size >= 2, "teste de concorrência exige pool com 2+ conexões"
@@ -563,8 +611,14 @@ async def _minutos_desde_inbound(phone: str) -> float:
 
 
 async def test_gate_grava_last_inbound_at(lead_factory):
-    """Cobre o ramo UPDATE do upsert: lead já existe (pré-criado pela fixture)."""
-    await lead_factory("5511987654321", minutos_desde_inbound=180)
+    """Cobre o ramo UPDATE do upsert: lead já existe (pré-criado pela fixture).
+
+    `lead_factory` insere na forma literal passada, sem canonicalizar — e
+    `leads_crm.phone` agora só aceita a forma canônica (CHECK da migração
+    014). O JID do webhook continua chegando com o 9º dígito (é assim que a
+    Meta manda) — só a linha pré-criada precisa nascer já canônica.
+    """
+    await lead_factory("551187654321", minutos_desde_inbound=180)
 
     resultado = await aplicar_gate(
         await get_pool(),
@@ -610,8 +664,11 @@ async def test_inbound_de_lead_pausado_ainda_move_a_janela(lead_factory):
 
     Sem isto, tudo que o lead escreve durante o handover humano não conta, e na
     retomada ele pode estar inalcançável pela régua com a janela real aberta.
+
+    A linha pré-criada nasce canônica (CHECK da migração 014); o JID do
+    webhook continua chegando com o 9º dígito.
     """
-    await lead_factory("5511987654322", agent_active=False, minutos_desde_inbound=180)
+    await lead_factory("551187654322", agent_active=False, minutos_desde_inbound=180)
 
     resultado = await aplicar_gate(
         await get_pool(),
@@ -620,16 +677,16 @@ async def test_inbound_de_lead_pausado_ainda_move_a_janela(lead_factory):
     )
     assert not resultado.aceito
     assert resultado.motivo == "agente_desligado"
-    assert await _minutos_desde_inbound("5511987654322") < 1
+    assert await _minutos_desde_inbound("551187654322") < 1
 
 
 async def test_mensagem_nossa_nao_move_a_janela(lead_factory):
     """fromMe somos nós — não abre janela nenhuma."""
-    await lead_factory("5511987654323", minutos_desde_inbound=180)
+    await lead_factory("551187654323", minutos_desde_inbound=180)
 
     await aplicar_gate(
         await get_pool(),
         key={"remoteJid": "5511987654323@s.whatsapp.net", "fromMe": True},
         push_name="Fulano",
     )
-    assert await _minutos_desde_inbound("5511987654323") > 170
+    assert await _minutos_desde_inbound("551187654323") > 170
