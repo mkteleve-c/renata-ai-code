@@ -143,6 +143,12 @@ Escolha um canal e cadastre o webhook correspondente:
 | Twilio | `https://${DOMAIN}/webhook/twilio?agent=rhawk_assistant` | `.claude/skills/twilio-setup/SKILL.md` ou `docs/TWILIO.md` |
 | Meta WhatsApp Cloud API | `https://${DOMAIN}/webhook/meta?agent=rhawk_assistant` | `.claude/skills/meta-setup/SKILL.md` |
 | uazapi (uazapiGO) | `https://${DOMAIN}/webhook/uazapi?agent=rhawk_assistant` | `docs/UAZAPI.md` |
+| Evolution API (integração `WHATSAPP-BUSINESS`) | `https://${DOMAIN}/webhook/evolution?agent=elevec_sdr` | `docs/EVOLUTION.md` — cadastrado direto no painel da instância, não por env var |
+
+> O agente `elevec_sdr` (Renata, SDR da EleveC) roda hoje em **Railway**, não
+> nesta stack Docker+Traefik — ver `docs/RAILWAY.md` e `docs/CUTOVER.md`. Esta
+> seção continua valendo para clientes que optarem pelo caminho self-hosted
+> com qualquer agente do catálogo.
 
 (Substitua `rhawk_assistant` pelo agente que você cadastrou em `langgraph.json`.)
 
@@ -358,5 +364,7 @@ Em qualquer pasta deste projeto, peça ao Claude Code: "preciso fazer deploy" ou
 | `../docs/DEPLOY.md` | Visão geral de deploy (focada em Railway) |
 | `../docs/TWILIO.md` | Integração Twilio detalhada |
 | `../docs/DATABASE.md` | Schema do banco e queries |
-| `../docs/RAILWAY.md` | Deploy alternativo no Railway |
+| `../docs/RAILWAY.md` | Deploy no Railway (caminho usado pelo agente `elevec_sdr`) |
+| `../docs/AGENTE_ELEVEC.md` | A Renata — SDR da EleveC, porte do n8n |
+| `../docs/CUTOVER.md` | Roteiro de corte n8n → harness para o `elevec_sdr` |
 | `../docs/STRESS_TESTING.md` | Stress testing detalhado |
