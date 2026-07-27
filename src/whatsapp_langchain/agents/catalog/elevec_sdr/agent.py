@@ -32,6 +32,7 @@ from langgraph.store.base import BaseStore
 from whatsapp_langchain.agents.middleware import get_context_middleware
 from whatsapp_langchain.shared.llm import create_chat_model
 
+from .contexto import criar_middleware_contexto
 from .prompts import SYSTEM_PROMPT
 
 
@@ -63,8 +64,10 @@ def build_graph(
     # temperature=0.3 replica a configuração do nó AI Agent no n8n.
     model = create_chat_model(temperature=0.3)
 
-    # Middleware de contexto baseado em CONTEXT_STRATEGY
-    middleware = get_context_middleware()
+    # Middleware de contexto baseado em CONTEXT_STRATEGY + o contexto do lead,
+    # que reinterpola {nome}/{origem}/{telefone}/{data_hoje} a cada chamada ao
+    # modelo (ver contexto.py).
+    middleware = [*get_context_middleware(), criar_middleware_contexto()]
 
     return create_agent(
         model=model,
