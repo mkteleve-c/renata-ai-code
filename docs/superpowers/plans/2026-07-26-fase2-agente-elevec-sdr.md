@@ -23,6 +23,33 @@
 
 ---
 
+## Quem a Renata atende — e por que isso muda o portão de faturamento
+
+Levantado depois da primeira versão deste plano, com o workflow `YAY FORMS` na
+mão. **A Renata não é a porta de entrada do funil.**
+
+O formulário classifica por faturamento declarado e roteia: faixa acima de R$ 8
+mil vai direto para closer humano (Silvio ou Ivana, com rodízio), faixa abaixo
+de R$ 5 mil é descartada, e **só a faixa de R$ 5 a 8 mil que não agendou sozinha
+recebe o template e cai na conversa com a IA**.
+
+Isso reinterpreta a Fase 7 do SOP. O prompt exige o faturamento antes de
+agendar, mas **não define nenhum limiar** — e os critérios de desqualificação
+(C1 recolocação, C2 fora de escopo) não mencionam faturamento. Um portão
+obrigatório sem critério de aceite significa que o critério mora antes: no
+formulário.
+
+**Portanto o portão é confirmação, não qualificação.** O lead já declarou a
+faixa; a Renata verifica na conversa. A implementação não muda — `calendar_agendar`
+segue recusando sem `email` e sem `faturamento_mensal` —, mas a razão muda, e a
+razão importa para quem for mexer nisso depois.
+
+> **A entrada é `sendTemplate`, não `sendText`.** É o template
+> `boas_vindas_renata_*` que abre a janela de 24h e puxa o lead para a conversa.
+> Isso é **Fase 3**, junto com o follow-up, que sofre da mesma restrição — o
+> degrau de 23 horas encosta no limite da janela. Esta fase testa com
+> `OUTBOUND_MODE=mock` e não depende disso.
+
 ## Contexto herdado da Fase 1
 
 O canal Evolution está pronto e revisado. O que já existe e esta fase consome:
@@ -30,12 +57,24 @@ O canal Evolution está pronto e revisado. O que já existe e esta fase consome:
 | Peça | Onde |
 |---|---|
 | Gate de ingestão, consolidação de duplicatas | `shared/leads.py::aplicar_gate` |
-| Canonicalização de telefone | `shared/phone.py` |
+| Canonicalização de telefone, recusa de `@lid` | `shared/phone.py` |
 | `leads_crm` com `email`, `faturamento_mensal`, `google_event_id` | migração `007` |
-| Fila com dedupe e `provider_message_key` | `shared/queue.py`, migrações `008`–`012` |
-| Cliente outbound e download de mídia | `worker/evolution_client.py`, `worker/media.py` |
+| Fila com dedupe por `(canal, agente, telefone, id)` | `shared/queue.py`, migrações `008`–`012` |
+| Cliente outbound (`sendText`) e download de mídia | `worker/evolution_client.py`, `worker/media.py` |
 
-**Um item que a Fase 1 deixou explicitamente para cá:** o webhook converte sticker no marcador de texto `[figurinha]`. Esse marcador **precisa** aparecer no prompt, senão o agente improvisa em cima de um símbolo que ninguém lhe explicou.
+**Três coisas que a Fase 1 deixou explicitamente para cá:**
+
+1. **O marcador `[figurinha]`.** O webhook converte sticker nesse texto. Precisa
+   aparecer no prompt, senão o agente improvisa em cima de um símbolo que
+   ninguém lhe explicou.
+2. **A resposta ao template chega como `messageType: "buttonMessage"`**, com o
+   texto em `message.conversation`. Verificado com payload de produção — o
+   webhook trata certo, porque lê pela forma do conteúdo e não pelo tipo. Vale
+   saber ao depurar: é o primeiro turno de toda conversa que vem do formulário.
+3. **Mídia baixa por `GET` com `Bearer`**, não por endpoint de base64 — a
+   integração `WHATSAPP-BUSINESS` não entrega mídia cifrada. Áudio chega como
+   `audio/ogg; codecs=opus` com `ptt: true`, imagem como `image/jpeg`, e o MIME
+   vem em `mime_type` (com underscore).
 
 ## Estrutura de arquivos
 
@@ -602,8 +641,8 @@ Em `CLAUDE.md`, acrescente `elevec_sdr` à lista do catálogo na convenção 12.
 
 ## O que vem depois
 
-| Fase | Conteúdo |
-|---|---|
-| 3 | Follow-up com reivindicação atômica, webhook do ChatWoot |
-| 4 | `migrar_supabase.py`: normalização, fusão de duplicatas, histórico |
-| 5 | Cutover e deploy no Railway |
+| Fase | Conteúdo | Ajuste desde o desenho original |
+|---|---|---|
+| 3 | Follow-up com reivindicação atômica, webhook do ChatWoot | **+ `sendTemplate` no `EvolutionClient`** e consciência da janela de 24h: o degrau de 23 horas encosta no limite, e texto livre é rejeitado pela Meta se a janela fechou |
+| 4 | `migrar_supabase.py`: normalização, fusão de duplicatas, histórico | **escopo possivelmente menor**: se a IA só atende a faixa de R$ 5 a 8 mil sem agendamento, os 2.559 leads em `formulario_preenchido` não são todos dela — conferir a distribuição antes de migrar |
+| 5 | Cutover e deploy no Railway | — |
