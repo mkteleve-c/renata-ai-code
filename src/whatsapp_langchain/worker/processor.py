@@ -32,12 +32,15 @@ Uso:
     )
 """
 
+import asyncio
+
 import structlog
 from langchain_core.messages import HumanMessage
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.store.base import BaseStore
 from psycopg_pool import AsyncConnectionPool
 
+from whatsapp_langchain.agents.catalog.elevec_sdr.saida import extrair_baloes
 from whatsapp_langchain.agents.loader import load_graph
 from whatsapp_langchain.shared.models import MessageQueue, MessagingChannel
 from whatsapp_langchain.shared.queue import (
@@ -57,6 +60,20 @@ from whatsapp_langchain.worker.uazapi_client import UazapiClient
 logger = structlog.get_logger()
 
 OutboundClient = TwilioClient | MetaClient | UazapiClient | EvolutionClient
+
+# Único agente do catálogo que devolve JSON estruturado (`{"messages": [...]}`)
+# no texto final — os demais (illumi_assistant, rhawk_assistant) respondem
+# texto puro e não podem passar por extrair_baloes.
+BALOES_AGENT_ID = "elevec_sdr"
+
+# Espaçamento entre balões em sequência. Não é um "digitando…" — é puramente
+# temporal. O `delay_ms` do EvolutionClient existe e vai no payload do
+# sendText, mas na integração WHATSAPP-BUSINESS desta conta ele é descartado
+# pelo serviço (nenhum efeito, nem temporal nem visual — ver
+# worker/evolution_client.py). Por isso o espaçamento é feito aqui, com
+# asyncio.sleep, igual para os quatro canais, em vez de depender de um
+# parâmetro que só existe em um cliente e só funciona em instâncias Baileys.
+BALAO_DELAY_MS = 700
 
 
 def _normalize_outbounds(
@@ -140,6 +157,43 @@ async def _send_typing(
             to, message.message_id, token=message.outbound_token
         )
     return await outbound.send_typing(to, message.message_id)
+
+
+async def _send_baloes(
+    outbound: OutboundClient,
+    message: MessageQueue,
+    baloes: list[str],
+) -> None:
+    """Envia os balões em sequência, espaçados por `BALAO_DELAY_MS`.
+
+    Cada balão é um `_send_message` independente. Se um deles falhar no
+    meio da sequência, os anteriores já foram entregues e **não são
+    reenviados aqui** — a exceção sobe para o `except Exception` de
+    `process_message`, que aciona `mark_failed` e o retry existente.
+
+    Efeito herdado (não corrigido nesta task, comum aos quatro canais e já
+    registrado como backlog na Fase 1): o retry do processor reenvia a
+    mensagem inteira a partir do zero, então uma falha no meio duplica os
+    balões que já chegaram ao lead quando o próximo attempt roda. Por isso
+    logamos o índice exato que falhou — é o dado que faltaria para
+    diagnosticar a duplicação no retry.
+    """
+    total = len(baloes)
+    for idx, balao in enumerate(baloes):
+        try:
+            await _send_message(outbound, message.phone_number, balao, message)
+        except Exception:
+            logger.error(
+                "balao_send_failed",
+                message_id=message.id,
+                phone=message.phone_number,
+                channel=message.channel.value,
+                balao_index=idx,
+                balao_total=total,
+            )
+            raise
+        if idx < total - 1:
+            await asyncio.sleep(BALAO_DELAY_MS / 1000)
 
 
 async def process_message(
@@ -276,8 +330,20 @@ async def process_message(
         # 4. Extrair resposta
         response_text = result["messages"][-1].content
 
-        # 5. Enviar resposta outbound antes de mark_done
-        await _send_message(client, message.phone_number, response_text, message)
+        # 5. Enviar resposta outbound antes de mark_done. Só a Renata
+        # (elevec_sdr) devolve JSON estruturado em balões — mesmo mecanismo
+        # do outputParserStructured do n8n: parse do TEXTO FINAL, depois que
+        # o ciclo de tools terminou, não `response_format` nativo (que
+        # quebra o schema quando há tool call pendente no mesmo turno). Os
+        # demais agentes do catálogo respondem texto puro; extrair_baloes
+        # não é acionado para eles, e o comportamento existente (um único
+        # send_message com o texto integral) fica idêntico.
+        if message.agent_id == BALOES_AGENT_ID:
+            baloes = extrair_baloes(response_text)
+        else:
+            baloes = [response_text]
+
+        await _send_baloes(client, message, baloes)
 
         # 6. mark_done somente após envio confirmado
         await mark_done(
@@ -302,6 +368,7 @@ async def process_message(
             agent_id=message.agent_id,
             channel=message.channel.value,
             response_length=len(response_text),
+            balao_count=len(baloes),
         )
 
     except Exception as e:
