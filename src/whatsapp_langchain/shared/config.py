@@ -293,20 +293,27 @@ class Settings(BaseSettings):
         """Retorna (touched, missing) para o agente SDR em modo real.
 
         Mesma doutrina de "toque parcial" dos canais, e pelo mesmo motivo: o
-        SDR só funciona inteiro. As três credenciais fazem coisas diferentes
-        e cada ausência tem um custo próprio:
+        que está no grupo só funciona inteiro.
 
         - **Google Calendar** ausente → a Renata não consulta nem marca nada.
-          Falha ruidosa, o lead percebe.
-        - **`PIPEDRIVE_API_TOKEN`** ausente → a fase é gravada no banco e o
-          card fica parado. Falha silenciosa para o time comercial, que só
-          descobre pelo funil vazio.
         - **`HANDOVER_NOTIFY_PHONE`** ausente → o pior caso: `human_handover`
           desliga o agente, o lead fica em silêncio esperando, e **nenhuma
           pessoa é acionada**. O único sinal é uma frase que só o modelo lê.
+          É a única falha desta task cujo sintoma não aparece em lugar
+          nenhum, e por isso é boot em vez de checklist.
+
+        **`PIPEDRIVE_API_TOKEN` ficou de fora, de propósito.** Ele é o único
+        do conjunto cuja ausência tem um comportamento definido e desejável:
+        a fase continua sendo gravada no banco, o card não se move, e
+        `mover_card` registra `crm_pipedrive_nao_configurado` sem devolver
+        aviso ao agente. Exigi-lo aqui contradizia o próprio código, que diz
+        que rodar sem Pipedrive é escolha válida, e travava o caso concreto
+        de staging em modo real sem sandbox de CRM. O funil interno é quem
+        alimenta a régua de follow-up e o gate de ingestão; o Pipedrive é
+        espelho para o time comercial.
 
         Deploys que não usam `elevec_sdr` (illumi, rhawk) não tocam nenhuma
-        das seis variáveis e continuam subindo normalmente — é o que o
+        das cinco variáveis e continuam subindo normalmente — é o que o
         `touched` garante.
         """
         campos = (
@@ -314,7 +321,6 @@ class Settings(BaseSettings):
             ("GOOGLE_CLIENT_SECRET", self.google_client_secret),
             ("GOOGLE_REFRESH_TOKEN", self.google_refresh_token),
             ("GOOGLE_CALENDAR_ID", self.google_calendar_id),
-            ("PIPEDRIVE_API_TOKEN", self.pipedrive_api_token),
             ("HANDOVER_NOTIFY_PHONE", self.handover_notify_phone),
         )
 
@@ -424,8 +430,8 @@ class Settings(BaseSettings):
         - completo → habilitado
 
         O agente SDR (`elevec_sdr`) segue a mesma doutrina, como um grupo só:
-        Google Calendar + Pipedrive + telefone de handover. Ver
-        `_sdr_credentials_status`.
+        Google Calendar + telefone de handover. `PIPEDRIVE_API_TOKEN` fica
+        fora — ver `_sdr_credentials_status`.
         """
         token = self.internal_service_token.strip()
         if not token:
@@ -457,7 +463,7 @@ class Settings(BaseSettings):
             if sdr_touched and sdr_missing:
                 errors.append(
                     "Agente SDR está parcialmente configurado em modo real — "
-                    f"preencha: {', '.join(sdr_missing)} (ou zere todas as seis "
+                    f"preencha: {', '.join(sdr_missing)} (ou zere todas as cinco "
                     "variáveis para desabilitá-lo). Sem HANDOVER_NOTIFY_PHONE o "
                     "human_handover desliga o agente sem avisar ninguém."
                 )

@@ -63,6 +63,7 @@ async def criar_lead(**campos: Any) -> None:
         "agent_active": True,
         "email": None,
         "faturamento_mensal": None,
+        "google_event_id": None,
     }
     base.update(campos)
     pool = await get_pool()
@@ -70,9 +71,9 @@ async def criar_lead(**campos: Any) -> None:
         await conn.execute(
             "insert into leads_crm"
             " (phone, name, pipedriveid, email, faturamento_mensal,"
-            "  source, phase, followup_active, agent_active)"
+            "  source, phase, followup_active, agent_active, google_event_id)"
             " values (%s, 'Ana', %s, %s, %s, 'whatsapp_direct',"
-            "         %s::lead_phase, %s, %s)",
+            "         %s::lead_phase, %s, %s, %s)",
             (
                 CANONICO,
                 base["pipedriveid"],
@@ -81,6 +82,7 @@ async def criar_lead(**campos: Any) -> None:
                 base["phase"],
                 base["followup_active"],
                 base["agent_active"],
+                base["google_event_id"],
             ),
         )
 
@@ -342,10 +344,18 @@ async def test_alvos_concorrentes_nunca_terminam_com_o_funil_para_tras(
     Vale a mesma doutrina de `shared/leads.py`: reunião marcada é fato
     verificável, `qualificado` é julgamento — o fato vence.
 
+    O lead entra com `google_event_id` preenchido porque é assim que ele
+    chega em `agendou_sessao` na vida real: `calendar_agendar` cria o evento
+    e grava o vínculo antes de qualquer `update_crm`. É esse vínculo que
+    sustenta a recusa — sem evento não há fato a preservar (coberto por
+    `test_update_crm_aceita_qualificado_quando_nao_ha_evento`).
+
     O que a guarda no `where` garante além disso é que **não existe
-    movimento de card sem gravação correspondente**.
+    movimento de card sem gravação correspondente** — invariante do BANCO.
+    Os dois `PUT` do Pipedrive saem depois dos commits e sem ordenação entre
+    si, então o estágio final do card não é aferido aqui.
     """
-    await criar_lead(phase="iniciou_conversa")
+    await criar_lead(phase="iniciou_conversa", google_event_id="ev-vivo")
 
     resultados = await asyncio.gather(
         update_crm.ainvoke({"phase": "qualificado"}),
@@ -359,14 +369,17 @@ async def test_alvos_concorrentes_nunca_terminam_com_o_funil_para_tras(
 
 async def test_qualificado_nao_desfaz_uma_sessao_agendada(limpar, turno, pipedrive):
     # Sequencial, sem corrida: a recusa não é um detalhe de concorrência, é
-    # regra de funil. Reunião marcada existe no Google Calendar.
-    await criar_lead(phase="agendou_sessao", followup_active=False)
+    # regra de funil. O `google_event_id` é o que a sustenta — é ele que
+    # torna "reunião marcada" um fato verificável, e não um julgamento.
+    await criar_lead(
+        phase="agendou_sessao", google_event_id="ev-vivo", followup_active=False
+    )
 
     saida = await update_crm.ainvoke({"phase": "qualificado"})
 
     assert (await ler_lead())["phase"] == "agendou_sessao"
     assert pipedrive.movidos == []
-    assert "já tem sessão agendada" in saida
+    assert "tem sessão agendada" in saida
 
 
 async def test_desqualificado_pode_sobrescrever_sessao_agendada(
@@ -741,3 +754,185 @@ async def test_email_gravado_pelo_update_crm_vence_o_argumento_do_agendar(
     assert falsa.participantes == ["real@exemplo.com"]
     assert "real@exemplo.com" in saida
     assert "inventado@exemplo.com" not in saida
+
+
+# --- O ciclo agenda → cancela → reagenda ------------------------------------
+#
+# A guarda de retrocesso da fix round 1 fechou a volta legítima: `agenda.py`
+# não escrevia `phase` em lugar nenhum, então uma reunião cancelada deixava o
+# lead preso em `agendou_sessao` com o follow-up morto. Duas correções, e as
+# duas precisam de teste porque cobrem caminhos diferentes:
+#
+# 1. `calendar_delete` devolve a fase (garantido em código, não depende do
+#    modelo lembrar de chamar `update_crm`);
+# 2. `update_crm` volta a aceitar `qualificado` quando não há
+#    `google_event_id` — o cancelamento feito fora do sistema não vira beco.
+
+
+class AgendaFalsa:
+    """Cria e apaga evento. Nenhuma chamada ao Google."""
+
+    def __init__(self):
+        self.criados: list[str] = []
+        self.deletados: list[str] = []
+
+    async def listar_eventos(self, inicio, fim, max_results=250):
+        return []
+
+    async def criar_evento(
+        self, summary, inicio, fim, participantes=None, event_id=None, **kwargs
+    ):
+        self.criados.append(event_id)
+        return {
+            "id": event_id,
+            "status": "confirmed",
+            "start": {"dateTime": inicio.isoformat()},
+            "end": {"dateTime": fim.isoformat()},
+            "attendees": [{"email": e} for e in (participantes or [])],
+        }
+
+    async def deletar_evento(self, event_id, notificar=True):
+        self.deletados.append(event_id)
+
+
+@pytest.fixture
+def agenda_falsa(monkeypatch):
+    falsa = AgendaFalsa()
+    monkeypatch.setattr(agenda, "obter_cliente", lambda: falsa)
+    monkeypatch.setattr(agenda, "agora_sp", lambda: TERCA)
+    return falsa
+
+
+async def test_ciclo_completo_agenda_cancela_reagenda(
+    limpar, turno, pipedrive, agenda_falsa
+):
+    """O caminho que a guarda de retrocesso tinha fechado, ponta a ponta."""
+    await criar_lead(email="ana@exemplo.com", faturamento_mensal="30 mil")
+    await update_crm.ainvoke({"phase": "qualificado"})
+
+    # --- agenda ---
+    await agenda.calendar_agendar.ainvoke({"inicio": "2026-02-12T13:00"})
+    await update_crm.ainvoke({"phase": "agendou_sessao"})
+
+    marcado = await ler_lead()
+    assert marcado["phase"] == "agendou_sessao"
+    assert marcado["followup_active"] is False
+    assert marcado["google_event_id"] is not None
+
+    # --- cancela ---
+    await agenda.calendar_delete.ainvoke({})
+
+    cancelado = await ler_lead()
+    assert cancelado["google_event_id"] is None
+    assert cancelado["phase"] == "qualificado", "o funil precisa voltar junto"
+    assert cancelado["followup_active"] is True, "o lead volta para a régua"
+
+    # --- reagenda ---
+    await agenda.calendar_agendar.ainvoke({"inicio": "2026-02-13T14:00"})
+    saida = await update_crm.ainvoke({"phase": "agendou_sessao"})
+
+    remarcado = await ler_lead()
+    assert remarcado["phase"] == "agendou_sessao"
+    assert remarcado["google_event_id"] is not None
+    assert "Fase atualizada" in saida
+    assert len(agenda_falsa.criados) == 2
+    assert len(agenda_falsa.deletados) == 1
+    # 12 (qualificado) → 13 (agendou) → 13 de novo, depois do ciclo.
+    assert pipedrive.movidos == [(DEAL, 12), (DEAL, 13), (DEAL, 13)]
+
+
+async def test_cancelamento_nao_religa_followup_de_lead_pausado(
+    limpar, turno, agenda_falsa
+):
+    # `human_handover` zerou `agent_active`. Religar a cobrança aqui
+    # desfaria a decisão de uma pessoa.
+    await criar_lead(
+        phase="agendou_sessao",
+        google_event_id="ev-1",
+        followup_active=False,
+        agent_active=False,
+    )
+
+    await agenda.calendar_delete.ainvoke({})
+
+    lido = await ler_lead()
+    assert lido["phase"] == "qualificado"
+    assert lido["followup_active"] is False
+
+
+async def test_cancelamento_nao_promove_lead_desqualificado(
+    limpar, turno, agenda_falsa
+):
+    # Tinha reunião marcada e foi desqualificado depois. Cancelar o evento
+    # não pode devolvê-lo ao funil como se ainda fosse oportunidade.
+    await criar_lead(phase="desqualificado", google_event_id="ev-1")
+
+    await agenda.calendar_delete.ainvoke({})
+
+    lido = await ler_lead()
+    assert lido["phase"] == "desqualificado"
+    assert lido["google_event_id"] is None
+
+
+async def test_reverter_e_idempotente(limpar, turno):
+    await criar_lead(phase="agendou_sessao", followup_active=False)
+
+    assert await crm.reverter_fase_apos_cancelamento(E164) == "revertida"
+    assert await crm.reverter_fase_apos_cancelamento(E164) == "nao_aplicavel"
+    assert (await ler_lead())["phase"] == "qualificado"
+
+
+# --- A guarda de retrocesso, agora condicionada ao evento -------------------
+
+
+async def test_update_crm_aceita_qualificado_quando_nao_ha_evento(
+    limpar, turno, pipedrive
+):
+    """Cancelamento feito fora do sistema não pode virar beco sem saída.
+
+    A doutrina de `shared/leads.py` diz que `agendou_sessao` vence porque
+    "reunião marcada é fato verificável (existe evento no Google Calendar)".
+    Sem `google_event_id` não há fato a preservar — e `qualificado` deixa de
+    ser retrocesso.
+    """
+    await criar_lead(
+        phase="agendou_sessao", google_event_id=None, followup_active=False
+    )
+
+    saida = await update_crm.ainvoke({"phase": "qualificado"})
+
+    lido = await ler_lead()
+    assert lido["phase"] == "qualificado"
+    assert lido["followup_active"] is True, "voltar para qualificado religa a régua"
+    assert "Fase atualizada" in saida
+
+
+async def test_update_crm_recusa_qualificado_com_evento_ainda_vinculado(
+    limpar, turno, pipedrive
+):
+    await criar_lead(phase="agendou_sessao", google_event_id="ev-vivo")
+
+    saida = await update_crm.ainvoke({"phase": "qualificado"})
+
+    assert (await ler_lead())["phase"] == "agendou_sessao"
+    assert pipedrive.movidos == []
+    # A instrução da recusa precisa apontar para um caminho que existe.
+    assert "calendar_delete" in saida
+    assert "já devolve o lead" in saida
+
+
+async def test_volta_para_qualificado_nao_religa_followup_de_lead_pausado(
+    limpar, turno, pipedrive
+):
+    await criar_lead(
+        phase="agendou_sessao",
+        google_event_id=None,
+        followup_active=False,
+        agent_active=False,
+    )
+
+    await update_crm.ainvoke({"phase": "qualificado"})
+
+    lido = await ler_lead()
+    assert lido["phase"] == "qualificado"
+    assert lido["followup_active"] is False

@@ -88,6 +88,7 @@ from whatsapp_langchain.shared.google_calendar import (
 from whatsapp_langchain.shared.phone import canonico_do_lead
 
 from ..contexto import sanitizar_nome, telefone_do_turno
+from .crm import reverter_fase_apos_cancelamento
 from .interno import interno
 
 logger = structlog.get_logger()
@@ -1159,6 +1160,19 @@ async def calendar_delete(event_id: str = "") -> str:
             "Cancelado na agenda. ATENÇÃO: não consegui limpar o registro no "
             "cadastro do lead — acione o human_handover."
         )
+
+    # O funil anda junto com a agenda. Sem isto o lead fica preso em
+    # `agendou_sessao` sem reunião e com o follow-up desligado — nenhuma
+    # tool de agenda escreve `phase`, então não haveria caminho de volta.
+    # Ver `reverter_fase_apos_cancelamento`.
+    revertida = await reverter_fase_apos_cancelamento(telefone)
+    if revertida == "erro":
+        logger.error("agenda_fase_nao_revertida", telefone=telefone)
+        return interno(
+            "Cancelado na agenda. ATENÇÃO: não consegui devolver o lead para "
+            "'qualificado' no funil — acione o human_handover."
+        )
+
     return "Cancelado. A consultoria foi removida da agenda."
 
 

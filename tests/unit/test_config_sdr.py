@@ -16,7 +16,6 @@ COMPLETO = {
     "google_client_secret": "csecret",
     "google_refresh_token": "rtoken",
     "google_calendar_id": "silvio@exemplo.com",
-    "pipedrive_api_token": "tok",
     "handover_notify_phone": "+5511999998888",
 }
 
@@ -31,10 +30,10 @@ def _real(**kwargs) -> Settings:
 
 def test_sdr_intocado_nao_derruba_o_boot():
     # Deploys que não usam elevec_sdr (illumi, rhawk) não tocam nenhuma das
-    # seis variáveis e continuam subindo.
+    # cinco variáveis e continuam subindo.
     touched, missing = _real()._sdr_credentials_status()
     assert touched is False
-    assert len(missing) == 6
+    assert len(missing) == 5
     _real().validate_runtime_settings()
 
 
@@ -56,13 +55,25 @@ def test_sem_telefone_de_handover_derruba_o_boot():
     assert "sem avisar ninguém" in str(exc.value)
 
 
-def test_sem_token_do_pipedrive_derruba_o_boot():
-    incompleto = {**COMPLETO, "pipedrive_api_token": ""}
+def test_sem_token_do_pipedrive_o_boot_passa():
+    """O Pipedrive é opcional, e o código inteiro precisa concordar com isso.
 
-    with pytest.raises(ValueError) as exc:
-        _real(**incompleto).validate_runtime_settings()
+    `mover_card` diz que rodar sem Pipedrive é escolha válida e trata token
+    vazio como `info` sem aviso ao agente. Exigi-lo no boot contradizia o
+    próprio código e travava staging em modo real sem sandbox de CRM. O
+    funil interno (banco) é quem alimenta a régua de follow-up e o gate de
+    ingestão; o card é espelho para o time comercial.
+    """
+    _real(**COMPLETO, pipedrive_api_token="").validate_runtime_settings()
 
-    assert "PIPEDRIVE_API_TOKEN" in str(exc.value)
+    touched, missing = _real(**COMPLETO)._sdr_credentials_status()
+    assert touched is True
+    assert "PIPEDRIVE_API_TOKEN" not in missing
+
+
+def test_token_do_pipedrive_sozinho_nao_liga_o_grupo():
+    # Ele não faz parte do grupo, então preenchê-lo não obriga o resto.
+    _real(pipedrive_api_token="tok").validate_runtime_settings()
 
 
 def test_so_o_telefone_de_handover_ja_conta_como_tocado():

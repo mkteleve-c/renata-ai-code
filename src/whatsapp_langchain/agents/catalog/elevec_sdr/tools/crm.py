@@ -181,11 +181,28 @@ async def gravar_fase(
     `DEFAULT`, não `NOT NULL`), e `phase <> 'qualificado'` é NULL — logo
     falso — para um lead com fase nula, que nunca sairia do lugar.
 
-    `followup_active = followup_active and not %s` desliga sem religar: uma
-    fase que não desliga o follow-up deixa a coluna exatamente como estava,
-    inclusive `false` posto por um `human_handover` anterior. Um
-    `followup_active = %s` com `true` religaria a cobrança de um lead que um
-    humano pausou.
+    **A recusa vale enquanto o evento existir.** O predicado carrega
+    `google_event_id is not null` porque é ele que sustenta a doutrina: em
+    `shared/leads.py` a razão de `agendou_sessao` vencer é *"reunião marcada
+    é fato verificável (existe evento no Google Calendar)"*. Sem evento
+    vinculado não há fato a preservar, e `qualificado` deixa de ser
+    retrocesso — vira a volta legítima de uma reunião cancelada. Sem essa
+    condição a fase virava terminal: `agenda.py` não escreve `phase` em
+    lugar nenhum, então um lead com a reunião cancelada ficava preso em
+    `agendou_sessao` com o follow-up morto e nenhum caminho de volta.
+
+    `followup_active` tem duas regras, e a ordem do `case` importa:
+
+    - **voltar de `agendou_sessao` para `qualificado` religa a cobrança**,
+      mas só se `agent_active` — o lead precisa ser perseguido para
+      remarcar, exceto quando um `human_handover` pausou o agente.
+    - qualquer outra transição usa `followup_active and not %s`, que desliga
+      sem religar: um `followup_active = %s` com `true` religaria a cobrança
+      de um lead que uma pessoa pausou.
+
+    O lado direito do `SET` enxerga a linha **antiga**, então `phase` dentro
+    do `case` é a fase de origem — é o que permite decidir pelo par
+    (origem, destino) sem um `select` extra.
 
     `email` e `faturamento_mensal` usam `coalesce(nullif(%s, ''), coluna)`:
     argumento vazio nunca apaga o que já está cadastrado.
@@ -205,7 +222,11 @@ async def gravar_fase(
             cur = await conn.execute(
                 "update leads_crm set"
                 "  phase = %s::lead_phase,"
-                "  followup_active = followup_active and not %s,"
+                "  followup_active = case"
+                "    when %s::lead_phase = 'qualificado'"
+                "     and phase = 'agendou_sessao' then agent_active"
+                "    else followup_active and not %s"
+                "  end,"
                 "  email = coalesce(nullif(%s, ''), email),"
                 "  faturamento_mensal ="
                 "    coalesce(nullif(%s, ''), faturamento_mensal)"
@@ -214,9 +235,11 @@ async def gravar_fase(
                 "   and not ("
                 "     %s::lead_phase = 'qualificado'"
                 "     and phase = 'agendou_sessao'"
+                "     and google_event_id is not null"
                 "   )"
                 " returning phase",
                 (
+                    phase,
                     phase,
                     desliga,
                     email or "",
@@ -263,6 +286,60 @@ async def gravar_fase(
         followup_desligado=desliga,
     )
     return "gravou"
+
+
+async def reverter_fase_apos_cancelamento(telefone: str) -> str:
+    """Devolve o lead de `agendou_sessao` para `qualificado`. Nunca levanta.
+
+    Desfechos: `"revertida"`, `"nao_aplicavel"` (o lead não estava em
+    `agendou_sessao`) e `"erro"`.
+
+    **Quem cancela a reunião é quem mexe na fase.** Deixar isso a cargo de o
+    modelo lembrar de chamar `update_crm` depois de `calendar_delete` seria
+    o mesmo erro que este projeto vem trocando por `if`: três parágrafos
+    pedem, um `if` garante. `calendar_delete` chama esta função no caminho
+    de sucesso e o funil anda junto com a agenda, atomicamente do ponto de
+    vista de quem olha o CRM.
+
+    **`where phase = 'agendou_sessao'` faz o trabalho de três guardas.** Ele
+    (a) impede que um lead `desqualificado` que tinha reunião marcada seja
+    promovido de volta a `qualificado` por um cancelamento, (b) torna a
+    função idempotente — cancelar duas vezes não reescreve nada — e (c)
+    dispensa ler a fase antes.
+
+    **`followup_active = agent_active` é a religada com trava.** O lead sem
+    reunião precisa voltar para a régua de cobrança, senão o cancelamento o
+    aposenta em silêncio. Mas `human_handover` desliga `agent_active`, e
+    religar a cobrança de um lead que uma pessoa pausou desfaria a decisão
+    dela. Copiar `agent_active` resolve os dois casos numa expressão.
+    """
+    canonico = canonico_do_lead(telefone)
+    try:
+        pool = await get_pool()
+        async with pool.connection() as conn:
+            cur = await conn.execute(
+                "update leads_crm set"
+                "  phase = 'qualificado'::lead_phase,"
+                "  followup_active = agent_active"
+                " where phone = %s and phase = 'agendou_sessao'"
+                " returning followup_active",
+                (canonico,),
+            )
+            linha = await cur.fetchone()
+    except Exception as erro:
+        logger.error("crm_reversao_falhou", phone=canonico, erro=str(erro))
+        return "erro"
+
+    if linha is None:
+        logger.info("crm_reversao_nao_aplicavel", phone=canonico)
+        return "nao_aplicavel"
+
+    logger.info(
+        "crm_fase_revertida_apos_cancelamento",
+        phone=canonico,
+        followup_religado=linha[0],
+    )
+    return "revertida"
 
 
 async def mover_card(pipedriveid: Any, phase: str) -> tuple[bool, str]:
@@ -383,10 +460,14 @@ async def update_crm(
         return interno(f"O lead já está em '{alvo}'. Nada a atualizar.")
 
     if resultado == "recusada":
+        # Só chega aqui com o evento AINDA vinculado ao lead. Cancelar de
+        # verdade é o que libera a volta — e `calendar_delete` já devolve a
+        # fase sozinho, então esta instrução é verificável.
         return interno(
-            "Este lead já tem sessão agendada — não vou voltar o funil para "
-            f"'{alvo}'. Se a reunião foi cancelada, use calendar_delete; se "
-            "ele foi desqualificado, use 'desqualificado'."
+            "Este lead tem sessão agendada e o evento continua na agenda, "
+            f"então não vou voltar o funil para '{alvo}'. Se a reunião foi "
+            "cancelada, chame calendar_delete — ele já devolve o lead para "
+            "'qualificado'. Se ele foi desqualificado, use 'desqualificado'."
         )
 
     moveu, aviso_card = await mover_card(estado["pipedriveid"], alvo)
