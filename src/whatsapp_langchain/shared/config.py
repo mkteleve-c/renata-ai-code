@@ -153,6 +153,21 @@ class Settings(BaseSettings):
     lease_seconds: int = 60
     max_attempts: int = 3
 
+    # --- Follow-up (régua de reengajamento do SDR) ---
+    # Desligada por padrão: um deploy que herda este template e esquece de
+    # decidir não pode sair mandando WhatsApp de follow-up para leads reais.
+    followup_enabled: bool = False
+    followup_interval_seconds: int = 300
+    followup_batch_size: int = 10
+    # Os três degraus ancoram em last_inbound_at (o último inbound DO lead),
+    # não em last_interaction_at — ver worker/followup.py.
+    followup_nivel1_minutos: int = 15
+    followup_nivel2_minutos: int = 75
+    followup_nivel3_minutos: int = 1380
+    # Corte da janela de 24h da Cloud API, com folga. janela efetiva =
+    # 24*60 - esta margem.
+    followup_janela_margem_minutos: int = 30
+
     # --- Balões (resposta em múltiplas mensagens, hoje só elevec_sdr) ---
     # Espaçamento entre balões enviados em sequência. Não é indicador de
     # "digitando" — é puramente temporal (o delay_ms do EvolutionClient não
