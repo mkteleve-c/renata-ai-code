@@ -14,9 +14,15 @@ import httpx
 import pytest
 
 from whatsapp_langchain.shared.google_calendar import (
+    ALFABETO_EVENT_ID,
+    EXPIRACAO_PADRAO_SEGUNDOS,
+    STATUS_SEM_RESPOSTA,
     GoogleCalendarClient,
     GoogleCalendarError,
+    _segundos_de_expiracao,
     formatar_iso,
+    gerar_event_id,
+    validar_event_id,
 )
 
 CALENDAR_ID = "silvio@exemplo.com"
@@ -139,6 +145,97 @@ async def test_renovacao_concorrente_dispara_um_unico_refresh(client):
     client._transport = httpx.MockTransport(handler)
 
     await asyncio.gather(*(client.obter_access_token() for _ in range(5)))
+
+    assert len(tokens) == 1
+
+
+async def test_401_concorrente_dispara_um_unico_refresh_extra(client):
+    """O caminho que o retry existe para cobrir não pode estourar o endpoint.
+
+    Cinco operações em voo levando 401 ao mesmo tempo — token revogado — é
+    exatamente o cenário do retry. A versão anterior usava `forcar=True`, que
+    pulava a dupla checagem: o lock apenas SERIALIZAVA as renovações em vez de
+    deduplicá-las, e este teste media 6 refreshes (1 inicial + 5). O correto é
+    2: o inicial e um único para substituir o token recusado.
+    """
+    tokens = []
+    chamadas_api = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host == "oauth2.googleapis.com":
+            tokens.append(request)
+            await asyncio.sleep(0.01)
+            return httpx.Response(
+                200, json={"access_token": f"tok-{len(tokens)}", "expires_in": 3600}
+            )
+
+        chamadas_api.append(request.headers.get("authorization"))
+        await asyncio.sleep(0.01)
+        # Só o primeiro token é recusado; o segundo já vale.
+        if request.headers.get("authorization") == "Bearer tok-1":
+            return httpx.Response(401, json={"error": {"message": "revoked"}})
+        return httpx.Response(200, json={"items": []})
+
+    client._transport = httpx.MockTransport(handler)
+
+    inicio = datetime(2026, 7, 28, 8, 0)
+    fim = datetime(2026, 7, 28, 22, 0)
+    resultados = await asyncio.gather(
+        *(client.listar_eventos(inicio, fim) for _ in range(5))
+    )
+
+    assert resultados == [[]] * 5
+    assert len(tokens) == 2, f"refreshes disparados: {len(tokens)}"
+    # 5 chamadas com o token velho (401) + 5 repetidas com o novo.
+    assert chamadas_api.count("Bearer tok-1") == 5
+    assert chamadas_api.count("Bearer tok-2") == 5
+
+
+@pytest.mark.parametrize(
+    ("bruto", "esperado"),
+    [
+        (3600, 3600),
+        (1800, 1800),
+        ("1800", 1800),  # o Google já devolveu expires_in como string
+        (3599.9, 3599),  # float trunca, não estoura
+        (None, EXPIRACAO_PADRAO_SEGUNDOS),  # campo ausente
+        ("", EXPIRACAO_PADRAO_SEGUNDOS),
+        ("uma hora", EXPIRACAO_PADRAO_SEGUNDOS),  # não numérico
+        ({"segundos": 3600}, EXPIRACAO_PADRAO_SEGUNDOS),  # shape errado
+        (0, EXPIRACAO_PADRAO_SEGUNDOS),  # zero viraria renovação por chamada
+        (-10, EXPIRACAO_PADRAO_SEGUNDOS),  # negativo idem
+    ],
+)
+def test_segundos_de_expiracao_nunca_estoura(bruto, esperado):
+    """A blindagem que o relatório chama de "a forma que um KeyError tomaria".
+
+    `expires_in` ausente, não numérico ou <= 0 nunca era exercitado: os
+    testes de token mandavam sempre inteiro válido.
+    """
+    assert _segundos_de_expiracao(bruto) == esperado
+
+
+async def test_token_sem_expires_in_ainda_e_cacheado(client):
+    """Comportamental: campo ausente não pode virar renovação por chamada.
+
+    Sem o fallback, `_expira_em` ficaria no passado e cada operação pagaria
+    um refresh — o desperdício que o cache existe para evitar.
+    """
+    tokens = []
+
+    async def api(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"items": []})
+
+    def token(request: httpx.Request) -> httpx.Response:
+        tokens.append(request)
+        return httpx.Response(200, json={"access_token": "tok"})
+
+    montar_transport(client, api, resposta_token=token)
+
+    inicio = datetime(2026, 7, 28, 8, 0)
+    fim = datetime(2026, 7, 28, 22, 0)
+    await client.listar_eventos(inicio, fim)
+    await client.listar_eventos(inicio, fim)
 
     assert len(tokens) == 1
 
@@ -378,6 +475,9 @@ async def test_criar_evento_envia_summary_attendees_e_janela(client):
     ]
     assert corpo["description"] == "Lead veio do Instagram"
     assert evento["id"] == "ev-novo"
+    # O id vai no corpo do insert — é o que torna o retry idempotente.
+    assert set(corpo["id"]) <= set(ALFABETO_EVENT_ID)
+    assert len(corpo["id"]) == 32
 
 
 async def test_criar_evento_sem_notificar_nao_manda_convite(client):
@@ -399,13 +499,16 @@ async def test_criar_evento_sem_notificar_nao_manda_convite(client):
     assert capturado["url"].params["sendUpdates"] == "none"
 
 
-async def test_criar_evento_com_2xx_e_corpo_estranho_nao_levanta(client):
-    """O evento já está na agenda — levantar aqui criaria um segundo no retry."""
-    chamadas = 0
+async def test_criar_evento_com_2xx_e_corpo_estranho_devolve_o_id_conhecido(client):
+    """O evento já está na agenda — levantar aqui criaria um segundo no retry.
+
+    E devolver `{}` deixaria a Renata sem id para remarcar ou cancelar. O id
+    foi gerado ANTES do POST, então a identidade nunca se perde.
+    """
+    chamadas = []
 
     async def api(request: httpx.Request) -> httpx.Response:
-        nonlocal chamadas
-        chamadas += 1
+        chamadas.append(json.loads(request.content)["id"])
         return httpx.Response(
             200, content=b"nao e json", headers={"content-type": "text/plain"}
         )
@@ -418,13 +521,13 @@ async def test_criar_evento_com_2xx_e_corpo_estranho_nao_levanta(client):
         fim=datetime(2026, 7, 30, 15, 0),
     )
 
-    assert evento == {}
-    assert chamadas == 1
+    assert len(chamadas) == 1
+    assert evento == {"id": chamadas[0]}
 
 
 async def test_criar_evento_com_erro_http_vira_google_calendar_error(client):
     async def api(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(409, json={"error": {"message": "conflito"}})
+        return httpx.Response(403, json={"error": {"message": "sem permissao"}})
 
     montar_transport(client, api)
 
@@ -435,8 +538,206 @@ async def test_criar_evento_com_erro_http_vira_google_calendar_error(client):
             fim=datetime(2026, 7, 30, 15, 0),
         )
 
-    assert exc.value.status_code == 409
-    assert "conflito" in exc.value.detail
+    assert exc.value.status_code == 403
+    assert "sem permissao" in exc.value.detail
+
+
+# --- Idempotência da criação --------------------------------------------
+
+
+async def test_timeout_no_post_repete_com_o_mesmo_id_e_nao_duplica(client):
+    """O caso que motivou a idempotência.
+
+    Timeout num POST que o Google JÁ processou. Sem id fornecido pelo
+    cliente, a repetição criaria um segundo evento na agenda de trabalho do
+    Silvio e o lead veria o horário duplicado. Com id, a repetição colide em
+    409 e o cliente lê o evento que já existe.
+    """
+    ids_tentados = []
+    gets = []
+
+    async def api(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            ids_tentados.append(json.loads(request.content)["id"])
+            if len(ids_tentados) == 1:
+                raise httpx.ConnectTimeout("timeout simulado")
+            return httpx.Response(
+                409,
+                json={"error": {"message": "The requested identifier already exists"}},
+            )
+        gets.append(request.url.path)
+        return httpx.Response(200, json={"id": ids_tentados[0], "status": "confirmed"})
+
+    montar_transport(client, api)
+
+    evento = await client.criar_evento(
+        summary="Consultoria",
+        inicio=datetime(2026, 7, 30, 14, 0),
+        fim=datetime(2026, 7, 30, 15, 0),
+    )
+
+    assert len(ids_tentados) == 2
+    assert ids_tentados[0] == ids_tentados[1], "o retry precisa reusar o MESMO id"
+    assert evento == {"id": ids_tentados[0], "status": "confirmed"}
+    assert len(gets) == 1, "o 409 é resolvido lendo o evento existente"
+
+
+async def test_timeout_no_post_que_nao_chegou_cria_na_segunda_tentativa(client):
+    """A outra metade: se o POST realmente não chegou, repetir cria mesmo."""
+    posts = []
+
+    async def api(request: httpx.Request) -> httpx.Response:
+        posts.append(json.loads(request.content)["id"])
+        if len(posts) == 1:
+            raise httpx.ReadTimeout("timeout simulado")
+        return httpx.Response(200, json={"id": posts[-1], "status": "confirmed"})
+
+    montar_transport(client, api)
+
+    evento = await client.criar_evento(
+        summary="Consultoria",
+        inicio=datetime(2026, 7, 30, 14, 0),
+        fim=datetime(2026, 7, 30, 15, 0),
+    )
+
+    assert posts[0] == posts[1]
+    assert evento["status"] == "confirmed"
+
+
+async def test_timeout_nas_duas_tentativas_vira_erro_sem_resposta(client):
+    """Duas tentativas e para — não é laço infinito.
+
+    `STATUS_SEM_RESPOSTA` diz a quem chama que NÃO SE SABE se o Google
+    processou, que é diferente de "não processou".
+    """
+    posts = 0
+
+    async def api(request: httpx.Request) -> httpx.Response:
+        nonlocal posts
+        posts += 1
+        raise httpx.ConnectTimeout("timeout simulado")
+
+    montar_transport(client, api)
+
+    with pytest.raises(GoogleCalendarError) as exc:
+        await client.criar_evento(
+            summary="x",
+            inicio=datetime(2026, 7, 30, 14, 0),
+            fim=datetime(2026, 7, 30, 15, 0),
+        )
+
+    assert exc.value.status_code == STATUS_SEM_RESPOSTA
+    assert posts == 2
+    assert "não respondeu" in str(exc.value)
+
+
+async def test_409_direto_devolve_o_evento_existente(client):
+    """Id determinístico já usado num turno anterior: lê, não duplica."""
+
+    async def api(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            return httpx.Response(409, json={"error": {"reason": "duplicate"}})
+        return httpx.Response(200, json={"id": "aaaaa11111", "status": "confirmed"})
+
+    montar_transport(client, api)
+
+    evento = await client.criar_evento(
+        summary="x",
+        inicio=datetime(2026, 7, 30, 14, 0),
+        fim=datetime(2026, 7, 30, 15, 0),
+        event_id="aaaaa11111",
+    )
+
+    assert evento == {"id": "aaaaa11111", "status": "confirmed"}
+
+
+async def test_criar_evento_usa_o_event_id_fornecido(client):
+    capturado = {}
+
+    async def api(request: httpx.Request) -> httpx.Response:
+        capturado["id"] = json.loads(request.content)["id"]
+        return httpx.Response(200, json={"id": capturado["id"]})
+
+    montar_transport(client, api)
+
+    # "lead" + telefone: nada de `x`, `w`, `y` ou `z` — não são base32hex.
+    # (a primeira versão deste teste usava um `x` no fim e o validador pegou,
+    # que é exatamente o erro que ele existe para evitar num id determinístico)
+    await client.criar_evento(
+        summary="x",
+        inicio=datetime(2026, 7, 30, 14, 0),
+        fim=datetime(2026, 7, 30, 15, 0),
+        event_id="lead5511987654321a",
+    )
+
+    assert capturado["id"] == "lead5511987654321a"
+
+
+async def test_criar_evento_recusa_event_id_invalido_sem_tocar_a_rede(client):
+    """Um `@` ou `+` morreria num 400 no meio do agendamento."""
+
+    async def api(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("não deveria sair pela rede")
+
+    montar_transport(client, api)
+
+    with pytest.raises(ValueError, match="base32hex"):
+        await client.criar_evento(
+            summary="x",
+            inicio=datetime(2026, 7, 30, 14, 0),
+            fim=datetime(2026, 7, 30, 15, 0),
+            event_id="lead+5511987654321@wa",
+        )
+
+
+async def test_falha_de_rede_na_leitura_vira_erro_tipado(client):
+    """Nenhum `httpx.TimeoutException` cru escapa do cliente."""
+
+    async def api(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("dns falhou")
+
+    montar_transport(client, api)
+
+    with pytest.raises(GoogleCalendarError) as exc:
+        await client.listar_eventos(
+            datetime(2026, 7, 28, 8, 0), datetime(2026, 7, 28, 22, 0)
+        )
+
+    assert exc.value.status_code == STATUS_SEM_RESPOSTA
+
+
+# --- Ids de evento ------------------------------------------------------
+
+
+def test_gerar_event_id_respeita_o_formato_do_google():
+    ids = {gerar_event_id() for _ in range(100)}
+
+    assert len(ids) == 100, "colisão em 100 ids"
+    for gerado in ids:
+        assert 5 <= len(gerado) <= 1024
+        assert set(gerado) <= set(ALFABETO_EVENT_ID)
+
+
+@pytest.mark.parametrize(
+    "invalido",
+    [
+        "abc",  # curto demais
+        "a" * 1025,  # longo demais
+        "lead@exemplo",  # arroba fora do base32hex
+        "lead+5511",  # mais
+        "ABCDEF",  # maiúsculas fora do base32hex
+        "wxyz12",  # w-z fora do base32hex
+        "abc def",  # espaço
+    ],
+)
+def test_validar_event_id_recusa_fora_do_base32hex(invalido):
+    with pytest.raises(ValueError):
+        validar_event_id(invalido)
+
+
+@pytest.mark.parametrize("valido", ["abcde", "0123456789", "a" * 1024, "v0v0v"])
+def test_validar_event_id_aceita_base32hex(valido):
+    assert validar_event_id(valido) == valido
 
 
 # --- atualizar_evento ---------------------------------------------------
@@ -477,13 +778,15 @@ async def test_atualizar_evento_sem_nenhum_campo_recusa(client):
         await client.atualizar_evento("ev-1")
 
 
-async def test_atualizar_evento_com_2xx_e_corpo_estranho_nao_levanta(client):
+async def test_atualizar_evento_com_2xx_e_corpo_estranho_devolve_o_id(client):
+    """A identidade veio de quem chamou — não há como perdê-la aqui."""
+
     async def api(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, content=b"", headers={"content-type": "text/plain"})
 
     montar_transport(client, api)
 
-    assert await client.atualizar_evento("ev-1", summary="novo") == {}
+    assert await client.atualizar_evento("ev-1", summary="novo") == {"id": "ev-1"}
 
 
 # --- obter_evento -------------------------------------------------------

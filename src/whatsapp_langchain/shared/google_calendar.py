@@ -25,15 +25,35 @@ diferentes**:
   Devolver lista vazia diante de um corpo irreconhecível faria a Renata ler
   "agenda livre" e oferecer um horário já ocupado — errar calado é pior que
   falhar.
-- escrita (`criar_evento`, `atualizar_evento`) devolve `{}` com warning.
-  O 2xx significa que o evento já existe na agenda; levantar aqui levaria o
-  processor ao retry e criaria o evento de novo.
+- escrita (`criar_evento`, `atualizar_evento`) devolve `{"id": ...}` com
+  warning. O 2xx significa que o evento já existe na agenda; levantar aqui
+  levaria o processor ao retry e criaria o evento de novo. O `id` é sempre
+  conhecido antes da resposta, então nunca existe o estado "escrevi e não
+  sei qual é" — que deixaria a Renata sem como remarcar ou cancelar.
+
+**Idempotência da criação.** O `events.insert` aceita um `id` escolhido pelo
+cliente; um segundo insert com o mesmo id responde `409 Conflict` em vez de
+criar outro evento. Como o id é gerado antes de sair pela rede, um timeout
+num POST que o Google já processou é retentável: a segunda tentativa colide
+e o 409 é resolvido lendo o evento existente. Sem isso, o caminho de falha
+**mais comum** — a rede — duplicaria evento na agenda de trabalho de uma
+pessoa real, exatamente o que a tolerância a corpo estranho quis evitar no
+caminho raro.
+
+Ressalva registrada, da própria documentação do Google: *"we cannot
+guarantee that ID collisions will be detected at event creation time"* por
+causa da natureza distribuída do serviço. O 409 é best-effort, então isso
+reduz muito a janela de duplicata, mas não é exactly-once. Fechar de vez
+exigiria reconciliação por `extendedProperties.private` + `events.list`, que
+não vale o custo para um retry que acontece segundos depois da primeira
+tentativa, do mesmo processo.
 """
 
 from __future__ import annotations
 
 import asyncio
 import time
+import uuid
 from datetime import datetime
 from typing import Any
 from urllib.parse import quote
@@ -64,14 +84,46 @@ EXPIRACAO_PADRAO_SEGUNDOS = 3600
 # dias; sem teto, uma agenda cheia pagaria paginação que ninguém lê.
 MAX_RESULTS_PADRAO = 250
 
+# O Google devolve 409 no insert quando o `id` fornecido pelo cliente já
+# existe no calendário. É o que torna a criação idempotente: o retry não
+# duplica, ele colide.
+HTTP_CONFLITO = 409
+
+# Sentinela de `GoogleCalendarError.status_code` para falha de transporte —
+# timeout, DNS, conexão recusada. Não houve resposta HTTP, então nenhum
+# código real cabe, e distinguir isso importa: só neste caso o cliente sabe
+# que **não sabe** se o Google processou a requisição.
+STATUS_SEM_RESPOSTA = 0
+
+# Caracteres válidos num id de evento fornecido pelo cliente: base32hex.
+ALFABETO_EVENT_ID = "abcdefghijklmnopqrstuv0123456789"
+EVENT_ID_MIN = 5
+EVENT_ID_MAX = 1024
+
 
 class GoogleCalendarError(Exception):
-    """Erro em qualquer operação contra o Google Calendar ou o endpoint OAuth."""
+    """Erro em qualquer operação contra o Google Calendar ou o endpoint OAuth.
+
+    **`detail` é para log, nunca para o usuário final.** Ele carrega o corpo
+    cru da resposta (truncado em 500 caracteres) porque é o que permite
+    diagnosticar um `invalid_grant` ou uma quota estourada. Repassar
+    `str(exc)` para o texto que a Renata manda ao lead entregaria mensagem de
+    erro do Google — e eventualmente o e-mail da agenda ou detalhe de
+    projeto do Google Cloud — no WhatsApp de quem só queria marcar um
+    horário. As tools da Task 5 devem traduzir para uma frase própria e
+    deixar o `detail` no `logger`.
+
+    `status_code` é `STATUS_SEM_RESPOSTA` quando não houve resposta HTTP
+    (timeout, DNS, conexão recusada).
+    """
 
     def __init__(self, status_code: int, detail: str):
         self.status_code = status_code
         self.detail = detail
-        super().__init__(f"Google Calendar respondeu {status_code}: {detail}")
+        if status_code == STATUS_SEM_RESPOSTA:
+            super().__init__(f"Google Calendar não respondeu: {detail}")
+        else:
+            super().__init__(f"Google Calendar respondeu {status_code}: {detail}")
 
 
 class GoogleCalendarClient:
@@ -118,19 +170,40 @@ class GoogleCalendarClient:
 
     # --- Autenticação ---------------------------------------------------
 
-    async def obter_access_token(self, forcar: bool = False) -> str:
+    async def obter_access_token(self, token_invalido: str | None = None) -> str:
         """Access token válido, renovando pelo refresh token quando preciso.
 
-        O lock evita a corrida do primeiro turno: várias tools da Renata
-        podem cair aqui juntas e sem ele cada uma dispararia sua própria
-        renovação. Quem chega depois do lock revalida antes de gastar rede.
+        Dois caminhos, e **os dois deduplicam**:
+
+        - partida a frio / token vencido (`token_invalido=None`): quem chega
+          depois do lock revalida `_token_valido()` e sai com o token que o
+          primeiro acabou de buscar.
+        - reação a 401 (`token_invalido=<token que a API recusou>`): quem
+          chega depois do lock compara o token guardado com o que falhou. Se
+          alguém já trocou, o guardado serve — não há por que renovar de novo.
+
+        A versão anterior tinha um `forcar=True` que **pulava** a dupla
+        checagem, e com isso o lock só serializava os refreshes em vez de
+        deduplicá-los: cinco operações em voo levando 401 ao mesmo tempo
+        rendiam cinco renovações enfileiradas (mais a inicial). Justamente o
+        cenário que o retry existe para cobrir — token revogado com várias
+        tools em voo — era o que estourava o endpoint de token. A Renata tem
+        cinco tools de calendário e o SOP manda consultar a agenda duas vezes
+        antes de agendar.
         """
-        if not forcar and self._token_valido():
+        if token_invalido is None and self._token_valido():
             return self._access_token  # type: ignore[return-value]
 
         async with self._lock:
-            if not forcar and self._token_valido():
-                return self._access_token  # type: ignore[return-value]
+            if token_invalido is None:
+                if self._token_valido():
+                    return self._access_token  # type: ignore[return-value]
+            elif self._access_token and self._access_token != token_invalido:
+                # Outro chamador já substituiu o token recusado enquanto este
+                # esperava o lock. Aproveita em vez de gastar outra renovação.
+                logger.info("gcal_token_ja_renovado_por_outro")
+                return self._access_token
+
             return await self._renovar_access_token()
 
     def _token_valido(self) -> bool:
@@ -260,17 +333,39 @@ class GoogleCalendarClient:
         participantes: list[str] | None = None,
         descricao: str | None = None,
         notificar: bool = True,
+        event_id: str | None = None,
     ) -> dict[str, Any]:
-        """Cria o evento e devolve o corpo do Google (com `id`, `htmlLink`).
+        """Cria o evento e devolve o corpo do Google. **O `id` sempre volta.**
 
         `participantes` vira `attendees` — é o que faz o convite chegar no
         e-mail do lead. `notificar` liga `sendUpdates=all`; desligar cria o
         evento sem avisar ninguém.
 
-        2xx com corpo irreconhecível devolve `{}` com warning, não exceção:
-        o evento já está na agenda e levantar aqui geraria um segundo no
-        retry. Ver o docstring do módulo.
+        **Idempotência.** O `events.insert` do Google aceita um `id` escolhido
+        pelo cliente, e um segundo insert com o mesmo id responde
+        `409 Conflict` em vez de criar outro evento. O cliente gera esse id
+        (`gerar_event_id`) antes de sair pela rede, então:
+
+        - um timeout no POST que o Google **já processou** é retentável sem
+          medo: a segunda tentativa colide em 409, e o 409 é resolvido lendo
+          o evento que já existe. Sem isso, o caminho de falha mais comum
+          (rede) criaria dois eventos na agenda de trabalho de uma pessoa
+          real, e o lead receberia confirmação de um horário duplicado.
+        - o `id` é conhecido antes da resposta, então mesmo um 2xx com corpo
+          irreconhecível devolve `{"id": ...}` em vez de `{}`. Não existe
+          mais o estado "criei e não sei qual é" — que deixaria a Renata sem
+          como remarcar ou cancelar depois.
+
+        `event_id` pode ser fornecido por quem chama (a Task 5 pode derivar
+        um id determinístico do lead, tornando a operação idempotente
+        também entre turnos). Precisa ser base32hex — ver `validar_event_id`.
+
+        Corpo irreconhecível com 2xx **não** levanta: o evento está na
+        agenda, e levantar aqui levaria o processor ao retry. Ver o docstring
+        do módulo.
         """
+        event_id = validar_event_id(event_id) if event_id else gerar_event_id()
+
         corpo = self._corpo_evento(
             summary=summary,
             inicio=inicio,
@@ -278,20 +373,50 @@ class GoogleCalendarClient:
             participantes=participantes,
             descricao=descricao,
         )
+        corpo["id"] = event_id
 
-        dados = await self._requisitar(
-            "POST",
-            self._eventos_url(),
-            operacao="criar_evento",
-            params={"sendUpdates": "all" if notificar else "none"},
-            json=corpo,
+        params = {"sendUpdates": "all" if notificar else "none"}
+        dados: Any = None
+
+        for tentativa in (1, 2):
+            try:
+                dados = await self._requisitar(
+                    "POST",
+                    self._eventos_url(),
+                    operacao="criar_evento",
+                    params=params,
+                    json=corpo,
+                )
+                break
+            except GoogleCalendarError as exc:
+                if exc.status_code == HTTP_CONFLITO:
+                    # O id já existe: ou é o retry desta mesma criação, ou
+                    # outra execução já marcou este horário. Nos dois casos o
+                    # evento desejado está lá — ler é melhor que duplicar.
+                    logger.info(
+                        "gcal_evento_ja_existia",
+                        event_id=event_id,
+                        tentativa=tentativa,
+                    )
+                    return await self.obter_evento(event_id)
+
+                if exc.status_code == STATUS_SEM_RESPOSTA and tentativa == 1:
+                    logger.warning(
+                        "gcal_criar_evento_repetindo_apos_falha_de_rede",
+                        event_id=event_id,
+                        detail=exc.detail,
+                    )
+                    continue
+
+                raise
+
+        evento = self._objeto_tolerante(
+            dados, "criar_evento", fallback={"id": event_id}
         )
-
-        evento = self._objeto_tolerante(dados, "criar_evento")
         logger.info(
             "gcal_evento_criado",
             calendar_id=self.calendar_id,
-            event_id=evento.get("id"),
+            event_id=evento.get("id", event_id),
             inicio=corpo["start"]["dateTime"],
         )
         return evento
@@ -312,7 +437,10 @@ class GoogleCalendarClient:
         remarcar o horário apagaria `attendees` e `description` que não
         fossem reenviados. Campos `None` simplesmente não vão no corpo.
 
-        Mesma tolerância de `criar_evento` para corpo estranho com 2xx.
+        Naturalmente idempotente — reaplicar o mesmo PATCH leva ao mesmo
+        estado —, então uma falha de rede aqui é retentável pelo processor
+        sem tratamento especial, ao contrário do insert. Corpo estranho com
+        2xx devolve `{"id": event_id}`: a identidade veio de quem chamou.
         """
         corpo: dict[str, Any] = {}
         if summary is not None:
@@ -337,7 +465,9 @@ class GoogleCalendarClient:
             json=corpo,
         )
 
-        evento = self._objeto_tolerante(dados, "atualizar_evento")
+        evento = self._objeto_tolerante(
+            dados, "atualizar_evento", fallback={"id": event_id}
+        )
         logger.info(
             "gcal_evento_atualizado",
             calendar_id=self.calendar_id,
@@ -421,7 +551,7 @@ class GoogleCalendarClient:
                 operacao=operacao,
                 detail=response.text[:200],
             )
-            token = await self.obter_access_token(forcar=True)
+            token = await self.obter_access_token(token_invalido=token)
             response = await self._enviar(metodo, url, token, params, json)
 
         if response.status_code in status_tolerados:
@@ -453,19 +583,32 @@ class GoogleCalendarClient:
         params: dict[str, str] | None,
         json: dict[str, Any] | None,
     ) -> httpx.Response:
-        async with httpx.AsyncClient(
-            transport=self._transport, timeout=TIMEOUT
-        ) as client:
-            return await client.request(
-                metodo,
-                url,
-                headers={
-                    "Authorization": f"Bearer {token}",
-                    "Content-Type": "application/json",
-                },
-                params=params,
-                json=json,
-            )
+        """Requisição autenticada. Falha de transporte vira `GoogleCalendarError`.
+
+        Deixar um `httpx.TimeoutException` subir cru daria ao processor um
+        `Exception` genérico → `mark_failed` → retry, sem ninguém saber que a
+        requisição pode ter sido processada. Com `STATUS_SEM_RESPOSTA` quem
+        chama consegue distinguir "não deu certo" de "não sei se deu certo",
+        que é a diferença entre um retry seguro e um evento duplicado.
+        """
+        try:
+            async with httpx.AsyncClient(
+                transport=self._transport, timeout=TIMEOUT
+            ) as client:
+                return await client.request(
+                    metodo,
+                    url,
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "Content-Type": "application/json",
+                    },
+                    params=params,
+                    json=json,
+                )
+        except httpx.RequestError as exc:
+            detail = f"{type(exc).__name__}: {exc}"
+            logger.error("gcal_falha_de_transporte", metodo=metodo, detail=detail)
+            raise GoogleCalendarError(STATUS_SEM_RESPOSTA, detail) from exc
 
     def _exigir_objeto(self, dados: Any, operacao: str) -> dict[str, Any]:
         """Corpo de leitura precisa ser objeto JSON — senão levanta com log."""
@@ -480,8 +623,17 @@ class GoogleCalendarClient:
         )
         raise GoogleCalendarError(200, detail)
 
-    def _objeto_tolerante(self, dados: Any, operacao: str) -> dict[str, Any]:
-        """Corpo de escrita irreconhecível vira `{}` com warning, não exceção."""
+    def _objeto_tolerante(
+        self, dados: Any, operacao: str, fallback: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Corpo de escrita irreconhecível cai no `fallback`, não em exceção.
+
+        O `fallback` carrega o `id` do evento, que quem chama sempre conhece
+        — foi gerado antes do POST, ou passado no PATCH. Antes esta função
+        devolvia `{}`, e o chamador ficava sem distinguir "criou e não sei o
+        id" de "não criou": o evento existia na agenda do Silvio e a Renata
+        não tinha como remarcar nem cancelar depois.
+        """
         if isinstance(dados, dict):
             return dados
 
@@ -489,8 +641,48 @@ class GoogleCalendarClient:
             "gcal_escrita_resposta_inesperada",
             operacao=operacao,
             tipo=type(dados).__name__,
+            fallback=fallback,
         )
-        return {}
+        return dict(fallback)
+
+
+def gerar_event_id() -> str:
+    """Id de evento válido para o `events.insert`, no formato do Google.
+
+    O id precisa ser base32hex (`a-v` e `0-9`), de 5 a 1024 caracteres, e
+    único **por calendário**. `uuid4().hex` são 32 caracteres de `0-9a-f`,
+    subconjunto próprio do alfabeto — e a própria documentação do Google
+    recomenda "an established UUID algorithm such as one described in
+    RFC4122" justamente para minimizar colisão.
+
+    Gerar o id no cliente é o que torna a criação idempotente: ver
+    `GoogleCalendarClient.criar_evento`.
+    """
+    return uuid.uuid4().hex
+
+
+def validar_event_id(event_id: str) -> str:
+    """Recusa id que o Google rejeitaria, com mensagem que diz o porquê.
+
+    Existe para quem quiser um id determinístico (derivado do lead, por
+    exemplo) em vez do aleatório: um telefone com `+` ou um e-mail com `@`
+    passariam pelo tipo e morreriam num 400 no meio do agendamento.
+    Maiúsculas e as letras `w`-`z` estão fora do base32hex.
+    """
+    if not EVENT_ID_MIN <= len(event_id) <= EVENT_ID_MAX:
+        raise ValueError(
+            f"event_id deve ter entre {EVENT_ID_MIN} e {EVENT_ID_MAX} "
+            f"caracteres, recebido {len(event_id)}"
+        )
+
+    invalidos = sorted(set(event_id) - set(ALFABETO_EVENT_ID))
+    if invalidos:
+        raise ValueError(
+            "event_id deve ser base32hex (a-v e 0-9); caracteres inválidos: "
+            f"{''.join(invalidos)!r}"
+        )
+
+    return event_id
 
 
 def formatar_iso(momento: datetime) -> str:
