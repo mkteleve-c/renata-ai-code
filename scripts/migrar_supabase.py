@@ -6,12 +6,18 @@ e `legacy_chat_history`, valida, e emite `relatorio_migracao.md` para
 revisão humana antes do cutover. Idempotente -- rodar duas vezes dá o
 mesmo resultado.
 
-Este módulo concentra hoje a normalização (`normalizar_telefone`) e a
-fusão de duplicatas em memória (`agrupar_por_canonico`, `fundir_grupo`,
-`gerar_relatorio`) -- nenhuma das duas depende de rede nem de banco, e
-por isso são testáveis isoladamente. A leitura via REST do Supabase e a
-escrita em `leads_crm`/`legacy_chat_history`/`leads_descartados` entram
-na task seguinte da Fase 4 (importação e validações bloqueantes).
+Este módulo concentra a normalização (`normalizar_telefone`), a fusão de
+duplicatas em memória (`agrupar_por_canonico`, `fundir_grupo`,
+`gerar_relatorio`), a importação validada de `leads_crm`/`leads_descartados`
+(`importar_leads`) e a extração/importação do histórico de conversa
+(`montar_historico_por_sessao`, `importar_historico`) para
+`legacy_chat_history`. A leitura via REST do Supabase que alimenta este
+módulo com `LinhaOrigem`/`LinhaHistoricoOrigem` reais, e a orquestração de
+ponta a ponta (`main()`), ficam para a execução do cutover (Fase 5) -- as
+funções puras (normalização, fusão, filtro de histórico) não dependem de
+rede nem de banco, e por isso são testáveis isoladamente; as que escrevem
+(`importar_leads`, `importar_historico`) são testadas contra o Postgres
+real, nunca monkeypatchadas.
 
 A credencial do Supabase é segredo: entra por variável de ambiente,
 nunca é versionada, e nunca deve ser impressa -- nem em log, nem no
@@ -21,6 +27,7 @@ carrega telefone e nome de gente real.
 
 from __future__ import annotations
 
+import json
 import re
 from collections import defaultdict
 from collections.abc import Iterable, Sequence
@@ -31,6 +38,7 @@ from typing import Any
 from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
 
+from whatsapp_langchain.agents.catalog.elevec_sdr.saida import extrair_baloes
 from whatsapp_langchain.shared.phone import (
     _digitos_do_jid,
     _e_endereco_sem_telefone,
@@ -1342,3 +1350,196 @@ async def importar_leads(
         descartes_gravados=len(descartes),
         reunioes_legadas_marcadas=reunioes_legadas,
     )
+
+
+# =============================================================================
+# Histórico e continuidade (Task 5)
+# =============================================================================
+#
+# `n8n_chat_histories` guarda o formato serializado do LangChain: cada linha
+# é `{type, content, additional_kwargs, response_metadata}`. Medido contra a
+# origem em 27/07/2026 -- 8.920 linhas em 736 sessões --, a distribuição por
+# `type` é:
+#
+#   ai:    4.460 linhas, das quais 3.316 têm `content` que PARECE JSON
+#   human: 3.316 linhas, nenhuma com `content` em formato JSON
+#   tool:  1.144 linhas
+#
+# `4460 - 3316 = 1144`, exatamente a contagem de `tool`. Isso não é
+# coincidência: os `ai` cujo `content` NÃO parece JSON são os PEDIDOS de
+# chamada de ferramenta que o modelo emitia (o texto ali é irrelevante ou
+# vazio -- a chamada de fato mora em `additional_kwargs.tool_calls`, que este
+# módulo nunca lê); os `ai` cujo `content` PARECE JSON são as respostas
+# FINAIS -- o envelope de balões `{"messages": [...]}` que o output parser do
+# n8n produzia, o mesmo formato que `extrair_baloes` (elevec_sdr/saida.py)
+# desembrulha em produção hoje. `extrair_turno_de_conversa` classifica pela
+# MESMA distinção -- tenta `json.loads` no `content` de um `ai`; sucesso é
+# resposta final (desembrulhada via `extrair_baloes`, REUSADO, não
+# reimplementado), falha é ruído de tool call e o turno é descartado.
+#
+# `tool` nunca entra: é resultado de execução de ferramenta, nunca texto que
+# o lead leu. As tools referenciadas por esse ruído mudaram de assinatura
+# nesta migração (ver plano da Fase 4) -- injetar essas chamadas como
+# histórico confundiria o modelo com contratos que não existem mais, além de
+# nunca ter sido conversa que o lead viveu.
+#
+# DECISÃO DOCUMENTADA sobre a "janela de 12": o n8n usava uma janela de 12
+# mensagens na Postgres Chat Memory (docs/evidencias/prompt-renata-n8n.md),
+# contando TODA linha -- inclusive `tool` e os `ai` de chamada de ferramenta.
+# Esta migração conta os 12 DEPOIS do filtro de ruído -- ou seja, até 12
+# TURNOS DE CONVERSA REAL (`human` + `ai` final), não 12 linhas brutas da
+# origem. A diferença importa: 12 linhas brutas podiam conter só 4 ou 5
+# turnos reais de conversa quando o resto era ruído de tool em volta; 12
+# turnos filtrados é estritamente MAIS contexto de conversa do que o n8n
+# jamais teve na janela dele -- nunca menos. Isso é intencional (ver o plano
+# da Fase 4, seção "A janela de 12"): o lead "lembra" mais depois da
+# migração do que a Renata do n8n lembrava, nunca menos.
+
+
+def _eh_json_valido(texto: str) -> bool:
+    try:
+        json.loads(texto)
+    except (ValueError, TypeError):
+        return False
+    return True
+
+
+@dataclass(frozen=True)
+class LinhaHistoricoOrigem:
+    """Uma linha bruta de `n8n_chat_histories`.
+
+    `id_origem` é o autoincremento (`id serial`) da tabela de origem -- o
+    schema padrão da Postgres Chat Memory do LangChain (`id`, `session_id`,
+    `message`) não tem coluna de timestamp. `id_origem` é por isso a ÚNICA
+    fonte de ordem cronológica disponível, inclusive entre duas formas
+    diferentes de `session_id` (bruto) que convergem para o mesmo telefone
+    canônico -- ele cresce globalmente na tabela, não só dentro de uma
+    sessão, então continua válido como chave de ordenação depois da fusão.
+
+    `session_id` é o valor BRUTO da origem (o telefone tal como o n8n
+    gravou) -- passa por `normalizar_telefone` (mesma função da Task 2) só
+    dentro de `montar_historico_por_sessao`, nunca aqui.
+    """
+
+    id_origem: int
+    session_id: str | None
+    mensagem: dict[str, Any]
+
+
+def extrair_turno_de_conversa(mensagem: dict[str, Any]) -> tuple[str, str] | None:
+    """Decide se uma linha de `n8n_chat_histories` faz parte da conversa que
+    o lead viveu, e devolve `(papel, conteudo)` pronto para
+    `legacy_chat_history` -- ou `None` se é ruído de ferramenta.
+
+    - `type == "human"`: sempre entra, com o `content` tal como está (texto
+      puro do lead, nunca passa por `extrair_baloes` -- esse desembrulho é
+      só para o envelope de balões que o parser do n8n produzia nas
+      respostas da Renata).
+    - `type == "ai"`: só entra se `content` parsear como JSON -- é a
+      distinção medida acima entre resposta final (JSON) e pedido de
+      chamada de ferramenta (não-JSON). Quando entra, `content` passa por
+      `extrair_baloes` (reusado de `elevec_sdr/saida.py`, nunca
+      reimplementado) e os balões saem juntos numa string só, separados por
+      linha em branco -- é UM turno de conversa, mesmo tendo sido enviado
+      como vários balões de WhatsApp.
+    - `type == "tool"`, ou qualquer outro valor: nunca entra.
+
+    `content` vazio ou só espaço, em qualquer ramo, também descarta o
+    turno -- um turno vazio não é conversa, é lixo de formatação.
+    """
+    tipo = mensagem.get("type")
+
+    if tipo == "human":
+        bruto = mensagem.get("content")
+        conteudo = str(bruto).strip() if isinstance(bruto, str) else ""
+        return ("human", conteudo) if conteudo else None
+
+    if tipo == "ai":
+        bruto = mensagem.get("content")
+        if not isinstance(bruto, str) or not _eh_json_valido(bruto):
+            return None
+        conteudo = "\n\n".join(extrair_baloes(bruto)).strip()
+        return ("ai", conteudo) if conteudo else None
+
+    return None
+
+
+def montar_historico_por_sessao(
+    linhas: Sequence[LinhaHistoricoOrigem], janela: int = 12
+) -> dict[str, list[tuple[str, str]]]:
+    """Agrupa `n8n_chat_histories` por telefone CANÔNICO, filtra ruído de
+    ferramenta e mantém só os `janela` turnos mais recentes por telefone --
+    contados DEPOIS do filtro (ver a decisão documentada acima do módulo).
+
+    `session_id` passa por `normalizar_telefone` (mesma função da Task 2) --
+    duas formas brutas que convergem para o mesmo canônico têm seus turnos
+    fundidos e reordenados juntos por `id_origem`, não tratadas como
+    sessões separadas. Uma sessão cujo `session_id` não normaliza (mesmos
+    motivos de descarte de leads: telefone ausente, colide com forma local
+    BR, etc.) simplesmente não contribui história nenhuma -- ela não tem
+    como ter virado um lead migrado, então não há `phone` em `leads_crm`
+    para a FK de `legacy_chat_history` apontar; `validar_session_ids_
+    historico` (Task 4) é quem torna esse caso um abort visível, não esta
+    função.
+    """
+    por_canonico: dict[str, list[tuple[int, str, str]]] = defaultdict(list)
+
+    for linha in linhas:
+        canonico = normalizar_telefone(linha.session_id).canonico
+        if canonico is None:
+            continue
+        turno = extrair_turno_de_conversa(linha.mensagem)
+        if turno is None:
+            continue
+        papel, conteudo = turno
+        por_canonico[canonico].append((linha.id_origem, papel, conteudo))
+
+    resultado: dict[str, list[tuple[str, str]]] = {}
+    for canonico, turnos in por_canonico.items():
+        turnos.sort(key=lambda t: t[0])
+        janela_final = turnos[-janela:] if janela > 0 else turnos
+        resultado[canonico] = [(papel, conteudo) for _, papel, conteudo in janela_final]
+    return resultado
+
+
+_SQL_DELETE_HISTORICO_DO_TELEFONE = "delete from legacy_chat_history where phone = %s"
+_SQL_INSERT_HISTORICO = """
+insert into legacy_chat_history (phone, ordem, papel, conteudo)
+values (%s, %s, %s, %s)
+"""
+
+
+async def importar_historico(
+    pool: AsyncConnectionPool,
+    historico_por_sessao: dict[str, list[tuple[str, str]]],
+) -> int:
+    """Grava o histórico filtrado (Task 5) em `legacy_chat_history`.
+
+    Chamar DEPOIS de `importar_leads` -- a FK de `legacy_chat_history.phone`
+    (migração 015) exige que o canônico já exista em `leads_crm`; escrever
+    antes quebraria com `ForeignKeyViolation` no primeiro telefone.
+
+    Idempotente POR TELEFONE: apaga as linhas existentes daquele canônico e
+    reinsere na ordem corrente -- mais simples e mais correto que um
+    `ON CONFLICT (phone, ordem) DO UPDATE`, porque o TAMANHO da janela pode
+    encolher entre execuções (ex.: uma reexecução contra uma origem que
+    ganhou mais ruído de tool no meio da janela anterior). Um UPSERT por
+    `ordem` deixaria sobrar linhas de uma execução anterior com `ordem`
+    maior que a nova contagem -- `UNIQUE (phone, ordem)` não detecta isso
+    sozinho, e sobra vira história fantasma (mensagens de uma execução
+    anterior que a nova janela já não inclui, mas que continuam no banco).
+    DELETE-then-INSERT por telefone, dentro do mesmo bloco de conexão,
+    evita esse resíduo -- e cada telefone é uma unidade atômica pequena o
+    bastante para não precisar de uma transação explícita além da que o
+    pool já aplica por bloco.
+    """
+    total = 0
+    async with pool.connection() as conn:
+        for canonico, turnos in historico_por_sessao.items():
+            await conn.execute(_SQL_DELETE_HISTORICO_DO_TELEFONE, (canonico,))
+            for ordem, (papel, conteudo) in enumerate(turnos, start=1):
+                await conn.execute(
+                    _SQL_INSERT_HISTORICO, (canonico, ordem, papel, conteudo)
+                )
+                total += 1
+    return total

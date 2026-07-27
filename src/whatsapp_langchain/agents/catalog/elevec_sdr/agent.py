@@ -29,6 +29,9 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.store.base import BaseStore
 
 from whatsapp_langchain.agents.middleware import get_context_middleware
+from whatsapp_langchain.agents.middleware.historico_legado import (
+    criar_middleware_historico_legado,
+)
 from whatsapp_langchain.shared.llm import create_chat_model
 
 from .contexto import criar_middleware_contexto
@@ -71,10 +74,22 @@ def build_graph(
     # temperature=0.3 replica a configuração do nó AI Agent no n8n.
     model = create_chat_model(temperature=0.3)
 
-    # Middleware de contexto baseado em CONTEXT_STRATEGY + o contexto do lead,
-    # que reinterpola {nome}/{origem}/{telefone}/{data_hoje} a cada chamada ao
-    # modelo (ver contexto.py).
-    middleware = [*get_context_middleware(), criar_middleware_contexto()]
+    # Middleware de contexto baseado em CONTEXT_STRATEGY + histórico legado do
+    # Supabase (Fase 4, Task 5) + o contexto do lead, que reinterpola
+    # {nome}/{origem}/{telefone}/{data_hoje} a cada chamada ao modelo (ver
+    # contexto.py). Ordem importa: trim/summarize entram ANTES do histórico
+    # legado -- no primeiro turno de uma thread nova o `state` só tem a
+    # mensagem que acabou de chegar, então trim não corta nada; ele roda
+    # DEPOIS que o histórico legado já injetou os até 12 turnos, e passa a
+    # tratá-los como qualquer outro turno anterior a partir da segunda
+    # mensagem em diante. `criar_middleware_contexto` é `@dynamic_prompt`
+    # (outra camada, não concorre por posição no encadeamento de
+    # `before_model`).
+    middleware = [
+        *get_context_middleware(),
+        criar_middleware_historico_legado(),
+        criar_middleware_contexto(),
+    ]
 
     return create_agent(
         model=model,

@@ -15,15 +15,18 @@ import pytest
 from scripts.migrar_supabase import (
     Descarte,
     LinhaFundida,
+    LinhaHistoricoOrigem,
     LinhaOrigem,
     MigracaoAbortada,
     Normalizado,
     _contagem_cumulativa_por_rank,
     agrupar_por_canonico,
+    extrair_turno_de_conversa,
     fundir_grupo,
     fundir_todos,
     gerar_relatorio,
     marcar_reunioes_legadas,
+    montar_historico_por_sessao,
     normalizar_telefone,
     validar_canonicos_no_check,
     validar_fases_nao_retrocederam,
@@ -955,3 +958,207 @@ def test_validar_fases_nao_retrocederam_aborta_quando_persistido_e_menor():
 
     with pytest.raises(MigracaoAbortada, match="rank>=5"):
         validar_fases_nao_retrocederam(esperado, {3: 5, 4: 2, 5: 0})
+
+
+# =============================================================================
+# Task 5 -- histórico e continuidade: extrair_turno_de_conversa,
+# montar_historico_por_sessao
+# =============================================================================
+#
+# `n8n_chat_histories.message` é o formato serializado do LangChain:
+# {type, content, additional_kwargs, response_metadata}. Medido contra a
+# origem: `human` (3.316 linhas) nunca tem `content` em JSON; `ai` (4.460
+# linhas) tem 3.316 com `content` que PARECE JSON (as respostas finais,
+# envelope de balões) e 1.144 sem (pedidos de chamada de tool -- e
+# 4460-3316 = 1144, exatamente a contagem de `tool`). Os fixtures abaixo
+# reproduzem essa forma exata, não uma aproximação.
+
+
+def _msg_human(texto: str) -> dict:
+    return {
+        "type": "human",
+        "content": texto,
+        "additional_kwargs": {},
+        "response_metadata": {},
+    }
+
+
+def _msg_ai_final(baloes: list[str]) -> dict:
+    """Um `ai` cujo `content` é o envelope de balões do output parser do
+    n8n -- o formato que `extrair_baloes` desembrulha em produção."""
+    import json as _json
+
+    return {
+        "type": "ai",
+        "content": _json.dumps({"messages": baloes}),
+        "additional_kwargs": {},
+        "response_metadata": {},
+    }
+
+
+def _msg_ai_tool_call() -> dict:
+    """Um `ai` de PEDIDO de chamada de ferramenta -- `content` vazio, a
+    chamada de verdade mora em `additional_kwargs.tool_calls` (nunca lido
+    por este módulo)."""
+    return {
+        "type": "ai",
+        "content": "",
+        "additional_kwargs": {"tool_calls": [{"name": "buscar_agenda", "args": {}}]},
+        "response_metadata": {},
+    }
+
+
+def _msg_tool(resultado: str) -> dict:
+    return {
+        "type": "tool",
+        "content": resultado,
+        "additional_kwargs": {},
+        "response_metadata": {},
+    }
+
+
+def test_extrair_turno_de_conversa_mantem_human():
+    assert extrair_turno_de_conversa(_msg_human("Oi, quero saber mais")) == (
+        "human",
+        "Oi, quero saber mais",
+    )
+
+
+def test_extrair_turno_de_conversa_desembrulha_envelope_de_baloes_do_ai():
+    """O `content` do `ai` final é o JSON `{"messages": [...]}` -- este
+    teste morre sob a mutação "injeta o envelope sem desembrulhar": se
+    `extrair_turno_de_conversa` devolver o JSON cru em vez do texto dos
+    balões, as chaves `{"messages":` apareceriam no conteúdo, e o join com
+    linha em branco não bateria."""
+    turno = extrair_turno_de_conversa(
+        _msg_ai_final(["Oi, Fulano!", "Posso te fazer uma pergunta rápida?"])
+    )
+
+    assert turno == ("ai", "Oi, Fulano!\n\nPosso te fazer uma pergunta rápida?")
+    assert "messages" not in turno[1]
+    assert "{" not in turno[1]
+
+
+def test_extrair_turno_de_conversa_descarta_ai_de_chamada_de_tool():
+    """`content` vazio (ou qualquer texto que não parseie como JSON) é
+    pedido de chamada de ferramenta, não resposta final -- nunca entra."""
+    assert extrair_turno_de_conversa(_msg_ai_tool_call()) is None
+
+
+def test_extrair_turno_de_conversa_descarta_ai_com_texto_puro_nao_json():
+    """Um `ai` com `content` de texto puro (não JSON) também é ruído --
+    cobre o caso de um `content` não vazio mas ainda assim não é o
+    envelope de balões."""
+    mensagem = {
+        "type": "ai",
+        "content": "Deixa eu checar sua agenda",
+        "additional_kwargs": {},
+        "response_metadata": {},
+    }
+    assert extrair_turno_de_conversa(mensagem) is None
+
+
+def test_extrair_turno_de_conversa_descarta_tool():
+    """`tool` nunca entra na conversa -- é resultado de execução de
+    ferramenta, nunca texto que o lead leu. Referencia tools cuja
+    assinatura mudou nesta migração (ver cabeçalho do módulo)."""
+    assert extrair_turno_de_conversa(_msg_tool('{"eventos": []}')) is None
+
+
+def test_extrair_turno_de_conversa_descarta_human_vazio():
+    assert extrair_turno_de_conversa(_msg_human("   ")) is None
+
+
+def test_extrair_turno_de_conversa_tipo_desconhecido_descarta():
+    assert extrair_turno_de_conversa({"type": "system", "content": "x"}) is None
+
+
+def _linha_hist(
+    id_origem: int, session_id: str, mensagem: dict
+) -> LinhaHistoricoOrigem:
+    return LinhaHistoricoOrigem(
+        id_origem=id_origem, session_id=session_id, mensagem=mensagem
+    )
+
+
+def test_montar_historico_filtra_ruido_e_preserva_ordem_cronologica():
+    """`tool` e o `ai` de chamada de tool nunca aparecem no resultado; o que
+    sobra vem na ordem de `id_origem`, não na ordem em que as linhas foram
+    passadas para a função."""
+    linhas = [
+        _linha_hist(3, "5511987654321", _msg_ai_final(["Segunda resposta"])),
+        _linha_hist(1, "5511987654321", _msg_human("Primeira mensagem")),
+        _linha_hist(2, "5511987654321", _msg_ai_tool_call()),
+        _linha_hist(4, "5511987654321", _msg_tool('{"ok": true}')),
+    ]
+
+    resultado = montar_historico_por_sessao(linhas)
+
+    assert resultado["551187654321"] == [
+        ("human", "Primeira mensagem"),
+        ("ai", "Segunda resposta"),
+    ]
+
+
+def test_montar_historico_janela_conta_turnos_depois_do_filtro_nao_linhas_brutas():
+    """DECISÃO DA TASK: a janela de 12 conta turnos DEPOIS de descartar
+    ruído de tool -- não as últimas 12 linhas brutas da origem. Aqui, 4
+    turnos reais de conversa ficam cercados por ruído de tool tanto ANTES
+    quanto DEPOIS deles (uma sessão que terminou com uma chamada de
+    ferramenta sem resposta final, ex.: o lead sumiu no meio). Se a janela
+    contasse linhas BRUTAS, as últimas 2 linhas seriam as 2 de ruído
+    FINAL, e o resultado ficaria vazio -- perdendo os 2 turnos reais mais
+    recentes. Contando depois do filtro, são exatamente esses 2 turnos que
+    sobrevivem."""
+    ruido_antes = [
+        _linha_hist(i, "5511987654321", _msg_tool('{"ok": true}')) for i in range(1, 11)
+    ]
+    conversa = [
+        _linha_hist(11, "5511987654321", _msg_human("m1")),
+        _linha_hist(12, "5511987654321", _msg_ai_final(["r1"])),
+        _linha_hist(13, "5511987654321", _msg_human("m2")),
+        _linha_hist(14, "5511987654321", _msg_ai_final(["r2"])),
+    ]
+    ruido_depois = [
+        _linha_hist(15, "5511987654321", _msg_ai_tool_call()),
+        _linha_hist(16, "5511987654321", _msg_tool('{"ok": true}')),
+    ]
+
+    resultado = montar_historico_por_sessao(
+        ruido_antes + conversa + ruido_depois, janela=2
+    )
+
+    assert resultado["551187654321"] == [("human", "m2"), ("ai", "r2")]
+
+
+def test_montar_historico_funde_duas_formas_de_session_id_no_mesmo_canonico():
+    """`session_id` bruto com e sem o 9º dígito convergem para o mesmo
+    canônico -- os turnos das duas formas se fundem em ORDEM CRONOLÓGICA
+    real (por `id_origem`), não como duas sessões separadas."""
+    linhas = [
+        _linha_hist(1, "5511987654321", _msg_human("com o 9")),
+        _linha_hist(2, "551187654321", _msg_ai_final(["sem o 9"])),
+    ]
+
+    resultado = montar_historico_por_sessao(linhas)
+
+    assert resultado == {"551187654321": [("human", "com o 9"), ("ai", "sem o 9")]}
+
+
+def test_montar_historico_session_id_que_nao_normaliza_nao_aparece():
+    linhas = [_linha_hist(1, "null", _msg_human("oi"))]
+
+    resultado = montar_historico_por_sessao(linhas)
+
+    assert resultado == {}
+
+
+def test_montar_historico_sessao_so_com_ruido_nao_aparece():
+    linhas = [
+        _linha_hist(1, "5511987654321", _msg_ai_tool_call()),
+        _linha_hist(2, "5511987654321", _msg_tool('{"ok": true}')),
+    ]
+
+    resultado = montar_historico_por_sessao(linhas)
+
+    assert resultado == {}

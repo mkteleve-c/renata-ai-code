@@ -33,6 +33,7 @@ from scripts.migrar_supabase import (
     LinhaFundida,
     LinhaOrigem,
     MigracaoAbortada,
+    importar_historico,
     importar_leads,
     normalizar_telefone,
 )
@@ -612,3 +613,106 @@ async def test_normalizar_telefone_bate_com_o_check_real_do_banco():
             assert await _contar_leads_crm(resultado.canonico) == 0
 
     assert algum_canonico_produzido
+
+
+# =============================================================================
+# `importar_historico` (Fase 4, Task 5) contra o Postgres real
+# =============================================================================
+#
+# `legacy_chat_history.phone` tem FK para `leads_crm(phone)` (migração 015) --
+# todo teste abaixo precisa de um lead já gravado antes de importar histórico
+# para ele. `limpar` (acima) já cobre a limpeza: `ON DELETE CASCADE` na FK
+# apaga o histórico junto quando o lead do prefixo de teste é apagado.
+
+
+async def _criar_lead_para_historico(phone: str) -> None:
+    pool = await get_pool()
+    async with pool.connection() as conn:
+        await conn.execute(
+            "insert into leads_crm (phone, phase, followup_active, agent_active) "
+            "values (%s, 'iniciou_conversa', true, true) "
+            "on conflict (phone) do nothing",
+            (phone,),
+        )
+
+
+async def _ler_historico(phone: str) -> list[tuple[int, str, str]]:
+    pool = await get_pool()
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            "select ordem, papel, conteudo from legacy_chat_history "
+            "where phone = %s order by ordem",
+            (phone,),
+        )
+        linhas = await cur.fetchall()
+    return [(ordem, papel, conteudo) for ordem, papel, conteudo in linhas]
+
+
+async def test_importar_historico_grava_turnos_em_ordem():
+    await _criar_lead_para_historico(_P1)
+
+    total = await importar_historico(
+        await get_pool(),
+        {_P1: [("human", "oi"), ("ai", "Oi! Tudo bem?"), ("human", "tudo")]},
+    )
+
+    assert total == 3
+    assert await _ler_historico(_P1) == [
+        (1, "human", "oi"),
+        (2, "ai", "Oi! Tudo bem?"),
+        (3, "human", "tudo"),
+    ]
+
+
+async def test_importar_historico_sem_linhas_para_o_telefone_nao_grava_nada():
+    await _criar_lead_para_historico(_P1)
+
+    total = await importar_historico(await get_pool(), {_P1: []})
+
+    assert total == 0
+    assert await _ler_historico(_P1) == []
+
+
+async def test_importar_historico_reexecucao_com_janela_menor_nao_deixa_residuo():
+    """Idempotência: uma reexecução cuja janela filtrada encolheu (ex.: a
+    origem ganhou mais ruído de tool no meio da janela anterior) não pode
+    deixar sobrar `ordem` de uma execução anterior -- é exatamente o
+    cenário que o DELETE-then-INSERT por telefone existe para evitar (ver
+    o docstring de `importar_historico`)."""
+    await _criar_lead_para_historico(_P1)
+    pool = await get_pool()
+
+    await importar_historico(
+        pool,
+        {_P1: [("human", "m1"), ("ai", "r1"), ("human", "m2"), ("ai", "r2")]},
+    )
+    assert len(await _ler_historico(_P1)) == 4
+
+    # reexecução com janela menor (ex.: filtro mais estrito) -- 2 turnos
+    await importar_historico(pool, {_P1: [("human", "m2"), ("ai", "r2")]})
+
+    historico = await _ler_historico(_P1)
+    assert historico == [(1, "human", "m2"), (2, "ai", "r2")]
+
+
+async def test_importar_historico_reexecucao_identica_nao_duplica():
+    await _criar_lead_para_historico(_P1)
+    pool = await get_pool()
+
+    historico_por_sessao = {_P1: [("human", "oi"), ("ai", "Oi!")]}
+    await importar_historico(pool, historico_por_sessao)
+    await importar_historico(pool, historico_por_sessao)
+
+    assert await _ler_historico(_P1) == [(1, "human", "oi"), (2, "ai", "Oi!")]
+
+
+async def test_importar_historico_sem_lead_correspondente_levanta_fk():
+    """FK de `legacy_chat_history.phone -> leads_crm(phone)` -- gravar
+    histórico para um telefone que não foi migrado como lead precisa
+    quebrar alto, não silenciosamente inserir órfão. `validar_session_ids_
+    historico` (Task 4) existe para pegar isso ANTES de chegar aqui; este
+    teste prova que, se ela for pulada por engano, o banco ainda protege."""
+    with pytest.raises(psycopg.errors.ForeignKeyViolation):
+        await importar_historico(
+            await get_pool(), {f"{_PREFIXO_TESTE}99": [("human", "oi")]}
+        )
