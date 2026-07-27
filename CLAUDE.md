@@ -65,7 +65,7 @@ tests/             # unit/ + integration/ (pytest, asyncio_mode=auto)
 9. **`OUTBOUND_MODE=mock` em dev**, `real` em produção. Em modo `real`, `settings.validate_runtime_settings()` no boot da API e do Worker faz fail-fast se algum canal está parcialmente configurado (toque parcial) ou se `INTERNAL_SERVICE_TOKEN` é fraco/ausente.
 10. **Em produção, validação de assinatura ATIVA** — Twilio (`VALIDATE_TWILIO_SIGNATURE=true` + `TWILIO_AUTH_TOKEN` + `TWILIO_WEBHOOK_URL`) ou Meta (`META_VALIDATE_SIGNATURE=true` + `META_APP_SECRET`). uazapi não assina o body — o próprio token da instância vem no payload e é o que autentica o outbound; restrinja por IP no Traefik se quiser hardening adicional.
 11. **Roteamento por canal é automático** — cada webhook (`/webhook/twilio`, `/webhook/meta`, `/webhook/uazapi`, `/webhook/evolution`) grava `message_queue.channel` ao enfileirar; o worker mantém clientes outbound dos canais habilitados (todos os com credenciais preenchidas) e seleciona o cliente pelo `channel` da mensagem. Não há env `MESSAGING_CHANNEL`. Canal "tocado parcialmente" no `.env.prod` em modo real → fail-fast no boot. Para uazapi, o token da instância chega via webhook por mensagem e é persistido em `message_queue.outbound_token` (migração `005_uazapi_outbound_token.sql`).
-12. **Agentes vivem em `src/whatsapp_langchain/agents/catalog/<id>/`** — registrados em `langgraph.json`, selecionados via `?agent=<id>` na query string do webhook. Catálogo atual: **`illumi_assistant`** (interno Illumi, prompt = doutrina estratégica) e **`rhawk_assistant`** (cliente Top Hawks). Para criar mais → skill `create-agent`.
+12. **Agentes vivem em `src/whatsapp_langchain/agents/catalog/<id>/`** — registrados em `langgraph.json`, selecionados via `?agent=<id>` na query string do webhook. Catálogo atual: **`illumi_assistant`** (interno Illumi, prompt = doutrina estratégica), **`rhawk_assistant`** (cliente Top Hawks) e **`elevec_sdr`** (a Renata, SDR da EleveC — porte do n8n, 7 tools de agenda/CRM/handover, resposta em balões; ver `docs/AGENTE_ELEVEC.md`). Para criar mais → skill `create-agent`.
 13. **Postgres NÃO é exposto publicamente** em produção. Acesso ao banco é via:
     - **`pgweb` em `https://${DOMAIN}/banco`** (visualizador web, BasicAuth via `PGWEB_AUTH_USER`/`PGWEB_AUTH_PASS` no `.env.prod`) — caminho oficial.
     - **SSH tunnel** para acesso direto (DBeaver, psql): `ssh -L 5432:localhost:5432 user@vps` (eventualmente exigindo bind manual `127.0.0.1:5432:5432` no compose).
@@ -97,6 +97,7 @@ make ci            # check + testes
 | Configurar Twilio | skill `twilio-setup` (e `docs/TWILIO.md`) |
 | Configurar Meta WhatsApp Cloud API | skill `meta-setup` |
 | Configurar/entender uazapi | `docs/UAZAPI.md` + `webhook_uazapi.py` |
+| Entender a Renata (agente SDR da EleveC) | `docs/AGENTE_ELEVEC.md` |
 | Deploy em VPS (Docker+Traefik) | `deploy/README.md` + skills `infra-setup`/`domain-setup`/`deploy` |
 | Deploy em Railway | `docs/RAILWAY.md` |
 | Debugar fila travada | skill `debug-queue` |
