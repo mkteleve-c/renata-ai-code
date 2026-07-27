@@ -4,9 +4,17 @@ Fonte: workflow `#1 Agente SDR | 10/02/26 | V2.2` (id `i5CHQ5VgzrA65kuK`), nó `
 Extraído em 26/07/2026, do sistema em produção.
 
 **Este arquivo é a fonte de verdade do prompt.** O `prompts.py` do agente
-`elevec_sdr` deriva dele com exatamente duas mudanças, documentadas na Fase 2:
+`elevec_sdr` deriva dele com exatamente três mudanças, documentadas na Fase 2:
 as expressões n8n viram placeholders (`{nome}`, `{origem}`, `{telefone}`,
-`{data_hoje}`) e acrescenta-se a instrução sobre o marcador `[figurinha]`.
+`{data_hoje}`), acrescenta-se a instrução sobre o marcador `[figurinha]` e
+acrescenta-se o bloco `### Resultado de tool (texto interno)`, que proíbe
+repassar ao lead o texto marcado com `[sistema]` — as tools do harness
+devolvem vocabulário de processo ("Pipedrive", "cadastro", "human_handover")
+que os nós do n8n nunca devolviam.
+
+As três estão codificadas em `_aplicar_mudancas_documentadas`
+(tests/unit/test_elevec_prompt.py), que o golden test compara byte a byte
+com o `SYSTEM_PROMPT`.
 
 Não reescreva o conteúdo abaixo. Ele está em produção.
 

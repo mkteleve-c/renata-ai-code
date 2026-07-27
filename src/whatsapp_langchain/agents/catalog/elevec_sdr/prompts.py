@@ -4,20 +4,31 @@ Origem: workflow n8n `#1 Agente SDR | 10/02/26 | V2.2` (id `i5CHQ5VgzrA65kuK`),
 nó `AI Agent`. Fonte de verdade completa (com metadados de configuração do
 n8n): docs/evidencias/prompt-renata-n8n.md.
 
-O texto abaixo é o system message extraído verbatim, com duas mudanças de
+O texto abaixo é o system message extraído verbatim, com três mudanças de
 conteúdo e a remoção de sintaxe do n8n que não é conteúdo do prompt:
 1. As expressões n8n (`{{ $(...) }}`) viram os placeholders `{nome}`,
    `{origem}`, `{telefone}`, `{data_hoje}`, interpolados na Task 3.
 2. Acréscimo da regra sobre o marcador `[figurinha]` no bloco de
    formatação, ausente no prompt original de produção.
-3. (não é mudança de conteúdo) O `=` inicial do valor extraído do n8n é o
+3. Acréscimo do bloco `### Resultado de tool (texto interno)` em RULES
+   (CRITICAL), ausente no prompt original. **É a contrapartida obrigatória
+   do marcador `[sistema]`** (ver `tools/interno.py`): as tools desta
+   migração devolvem ao modelo texto operacional — "o card no Pipedrive não
+   foi movido", "acione o human_handover", "cadastro do lead" — e no n8n
+   nada disso existia, porque lá as tools eram nós do workflow e o retorno
+   nunca era vocabulário de processo. Sem a regra, o marcador é só um
+   prefixo que o modelo repete junto com o resto para um lead da EleveC.
+4. (não é mudança de conteúdo) O `=` inicial do valor extraído do n8n é o
    marcador de modo-expressão do parâmetro `systemMessage` — o resolvedor do
    n8n o consome antes do texto chegar ao nó. A Renata em produção recebe
    `## OVERVIEW` como primeira linha; removê-lo aqui reproduz esse
    comportamento em vez do artefato de serialização do JSON exportado.
 
-Não editar o conteúdo do SOP além da mudança 1 e 2 documentadas acima — é o
-ativo mais valioso desta migração.
+Não editar o conteúdo do SOP além das mudanças 1, 2 e 3 documentadas acima —
+é o ativo mais valioso desta migração. Toda mudança precisa estar refletida
+em `_aplicar_mudancas_documentadas`, em tests/unit/test_elevec_prompt.py: o
+golden compara byte a byte com a evidência, e o lugar de registrar a
+transformação é lá, nunca afrouxando o teste.
 """
 
 SYSTEM_PROMPT = """## OVERVIEW
@@ -150,6 +161,14 @@ update_crm:
 - Quando a mensagem do lead vier como `[figurinha]`, ele mandou uma figurinha
   (sticker), não texto. Trate como uma reação positiva breve — reconheça e siga
   a conversa do ponto em que estava. Não peça para ele mandar texto.
+
+### Resultado de tool (texto interno):
+- Resultado de tool que começa com `[sistema]` é instrução para VOCÊ, não
+  conteúdo para o lead.
+- Nunca repita, cite, traduza nem resuma esse texto para o lead. Aja sobre
+  ele e responda ao lead com suas próprias palavras.
+- Nunca mencione ao lead nome de ferramenta, sistema interno ou cadastro
+  (human_handover, update_crm, calendar_*, Pipedrive, CRM, event_id).
 
 ### Sequência de Agendamento (INVIOLÁVEL):
 - A ordem obrigatória é: horário escolhido → e-mail → faturamento → consulta de disponibilidade → calendar_agendar.

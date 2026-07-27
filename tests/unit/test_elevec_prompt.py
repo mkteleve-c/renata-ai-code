@@ -14,6 +14,9 @@ import pytest
 
 from whatsapp_langchain.agents.catalog.elevec_sdr.prompts import SYSTEM_PROMPT
 from whatsapp_langchain.agents.catalog.elevec_sdr.tools import TOOLS_ELEVEC
+from whatsapp_langchain.agents.catalog.elevec_sdr.tools.interno import (
+    PREFIXO_INTERNO,
+)
 
 EVIDENCE_PATH = (
     Path(__file__).resolve().parents[2] / "docs" / "evidencias" / "prompt-renata-n8n.md"
@@ -36,6 +39,13 @@ def _aplicar_mudancas_documentadas(bruto: str) -> str:
        conteúdo do prompt (ver nota em docs/evidencias/prompt-renata-n8n.md).
     2. As 4 expressões n8n de contexto viram os placeholders de interpolação.
     3. Acrescenta a instrução do marcador [figurinha] ao bloco de formatação.
+    4. Acrescenta o bloco `### Resultado de tool (texto interno)` antes da
+       Sequência de Agendamento — a regra do marcador `[sistema]`.
+
+    Quando o prompt mudar, é ESTA função que muda. Afrouxar o golden (trocar
+    a igualdade por um `in`, por exemplo) devolveria o SOP ao estado em que
+    um parágrafo some sem ninguém notar, que é exatamente o que ele existe
+    para impedir.
     """
     texto = bruto.removeprefix("=")
 
@@ -69,11 +79,29 @@ def _aplicar_mudancas_documentadas(bruto: str) -> str:
     assert texto.count(ancora_formatacao) == 1
     texto = texto.replace(ancora_formatacao, ancora_formatacao + instrucao_figurinha)
 
+    ancora_sequencia = "### Sequência de Agendamento (INVIOLÁVEL):\n"
+    regra_texto_interno = (
+        "### Resultado de tool (texto interno):\n"
+        "- Resultado de tool que começa com `[sistema]` é instrução para VOCÊ,"
+        " não\n"
+        "  conteúdo para o lead.\n"
+        "- Nunca repita, cite, traduza nem resuma esse texto para o lead. Aja"
+        " sobre\n"
+        "  ele e responda ao lead com suas próprias palavras.\n"
+        "- Nunca mencione ao lead nome de ferramenta, sistema interno ou"
+        " cadastro\n"
+        "  (human_handover, update_crm, calendar_*, Pipedrive, CRM,"
+        " event_id).\n"
+        "\n"
+    )
+    assert texto.count(ancora_sequencia) == 1
+    texto = texto.replace(ancora_sequencia, regra_texto_interno + ancora_sequencia)
+
     return texto
 
 
 def test_prompt_e_identico_a_evidencia_com_as_mudancas_documentadas():
-    """Golden test: SYSTEM_PROMPT == evidência + as 2 mudanças documentadas.
+    """Golden test: SYSTEM_PROMPT == evidência + as 3 mudanças documentadas.
 
     Qualquer deriva no SOP — apagar um parágrafo, reescrever uma frase,
     mudar a ordem de uma fase — quebra este teste, mesmo que nenhuma das
@@ -120,6 +148,20 @@ def test_prompt_tem_as_nove_fases_do_sop(fase, cabecalho):
     """Fase 0 inclusa: é ela que impede a Renata de repetir a saudação."""
     assert f"\n{cabecalho}" in SYSTEM_PROMPT, (
         f"fase {fase} sumiu ou mudou de título no SOP"
+    )
+
+
+def test_prompt_proibe_repassar_texto_interno_de_tool_ao_lead():
+    """A contrapartida do marcador `[sistema]` (ver `tools/interno.py`).
+
+    O marcador sozinho não protege ninguém: sem esta regra o modelo lê
+    "[sistema] ATENÇÃO: o card no Pipedrive não foi movido" e não tem
+    nenhum motivo para não repassar a frase inteira ao lead. A ancora é o
+    prefixo literal — é ele que as tools escrevem.
+    """
+    assert PREFIXO_INTERNO in SYSTEM_PROMPT
+    assert "Nunca repita, cite, traduza nem resuma esse texto para o lead" in (
+        SYSTEM_PROMPT
     )
 
 
