@@ -9,6 +9,8 @@ cada um.
 
 import asyncio
 
+import pytest_asyncio
+
 from whatsapp_langchain.agents.catalog.elevec_sdr.tools.crm import (
     reverter_fase_apos_cancelamento,
 )
@@ -17,6 +19,7 @@ from whatsapp_langchain.shared.leads import aplicar_gate
 from whatsapp_langchain.worker import followup
 from whatsapp_langchain.worker.evolution_client import EvolutionSendError
 from whatsapp_langchain.worker.followup import (
+    _FATOR_SOBRA_BUSCA,
     LeadReivindicado,
     _enviar_reivindicados,
     _reivindicar_na_conexao,
@@ -53,6 +56,29 @@ async def _followup_count(phone: str) -> int:
 class _ClienteMudo:
     async def send_message(self, to, body, **kwargs):
         raise AssertionError("cliente mudo não deveria ser chamado neste teste")
+
+
+@pytest_asyncio.fixture
+async def bloquear():
+    """Insere na `blocklist` e limpa no teardown — `lead_factory` não toca
+    essa tabela, então os testes de opt-out precisam da própria limpeza."""
+    pool = await get_pool()
+    inseridos: list[str] = []
+
+    async def _bloquear(phone: str, motivo: str = "opt-out") -> None:
+        async with pool.connection() as conn:
+            await conn.execute(
+                "insert into blocklist (phone, motivo) values (%s, %s)",
+                (phone, motivo),
+            )
+            await conn.commit()
+        inseridos.append(phone)
+
+    yield _bloquear
+
+    async with pool.connection() as conn:
+        await conn.execute("delete from blocklist where phone = any(%s)", (inseridos,))
+        await conn.commit()
 
 
 async def test_os_tres_degraus_ancoram_no_inbound(lead_factory):
@@ -172,10 +198,22 @@ async def test_duas_transacoes_realmente_sobrepostas_nao_pegam_o_mesmo_lead(
     lead_factory,
 ):
     """Sem barreira, asyncio.gather não garante sobreposição: a primeira pode
-    commitar antes de a segunda abrir, e o teste passaria sem SKIP LOCKED."""
-    for i in range(6):
+    commitar antes de a segunda abrir, e o teste passaria sem SKIP LOCKED.
+
+    `_SQL_CANDIDATOS` busca `limite * _FATOR_SOBRA_BUSCA` candidatos (sobra
+    para capturar pares/trios duplicados inteiros — ver o comentário no
+    módulo) e trava TODOS via `FOR UPDATE SKIP LOCKED`, mesmo que só
+    `limite` identidades acabem avançando. Por isso o lote de leads aqui
+    precisa ser maior que `limite_busca` de uma única chamada — senão a
+    primeira transação travaria o pool inteiro sozinha e a segunda não
+    teria candidato nenhum para pegar, o que provaria o teste errado
+    (ausência de disputa, não ausência de duplicata)."""
+    limite = 3
+    limite_busca = limite * _FATOR_SOBRA_BUSCA
+    total_leads = limite_busca + limite + 5
+    for i in range(total_leads):
         await lead_factory(
-            f"55119000005{i:02d}", followup_count=0, minutos_desde_inbound=30
+            f"5511900010{i:03d}", followup_count=0, minutos_desde_inbound=30
         )
 
     segurando = asyncio.Event()
@@ -184,7 +222,7 @@ async def test_duas_transacoes_realmente_sobrepostas_nao_pegam_o_mesmo_lead(
     async def primeira():
         pool = await get_pool()
         async with pool.connection() as conn:
-            resultado = await _reivindicar_na_conexao(conn, limite=3)
+            resultado = await _reivindicar_na_conexao(conn, limite=limite)
             segurando.set()
             await pode_soltar.wait()  # segura a transação aberta
             await conn.commit()
@@ -193,14 +231,14 @@ async def test_duas_transacoes_realmente_sobrepostas_nao_pegam_o_mesmo_lead(
     async def segunda():
         await segurando.wait()  # só entra com a primeira ainda aberta
         try:
-            return await _reivindicar(limite=3)
+            return await _reivindicar(limite=limite)
         finally:
             pode_soltar.set()
 
     a, b = await asyncio.gather(primeira(), segunda())
     telefones = [r.phone for r in a] + [r.phone for r in b]
     assert len(telefones) == len(set(telefones)), "o mesmo lead saiu duas vezes"
-    assert len(telefones) == 6
+    assert len(telefones) == limite * 2
 
 
 async def test_par_duplicado_e_reivindicado_uma_unica_vez(lead_factory):
@@ -211,6 +249,12 @@ async def test_par_duplicado_e_reivindicado_uma_unica_vez(lead_factory):
     vezes. Duplicata é realidade documentada desta base (~155 casos, ver
     a especificação), alcançável tanto pelo backfill da 013 quanto pelo
     caminho `agente_desligado` do gate — nenhum dos dois deduplica.
+
+    Só UM lado é devolvido para envio — mas os DOIS avançam
+    `followup_count` juntos (ver
+    `test_par_duplicado_nao_manda_mensagem_de_novo_na_proxima_rodada` para
+    o porquê: sem isso, o lado que não avança fica desbloqueado e
+    reivindicado sozinho na rodada seguinte).
     """
     sem_9 = await lead_factory(
         "551187654321", followup_count=0, minutos_desde_inbound=30
@@ -228,9 +272,9 @@ async def test_par_duplicado_e_reivindicado_uma_unica_vez(lead_factory):
         "mesma pessoa receberia a mesma mensagem duas vezes"
     )
 
-    # o lado de fora não perde estado — só não participou deste lote.
+    # o lado de fora não é enviado, mas avança followup_count junto.
     de_fora = com_9 if achados == {sem_9} else sem_9
-    assert await _followup_count(de_fora) == 0
+    assert await _followup_count(de_fora) == 1
 
 
 async def test_par_duplicado_com_last_inbound_at_identico_ainda_desempata(lead_factory):
@@ -275,6 +319,202 @@ async def test_rodada_nao_manda_duas_mensagens_para_o_mesmo_par_duplicado(lead_f
     resumo = await rodada(await get_pool(), ClienteQueRegistra())
     assert resumo["enviados"] == 1
     assert len(enviados) == 1
+
+
+async def test_par_duplicado_nao_manda_mensagem_de_novo_na_proxima_rodada(lead_factory):
+    """O dedup por si só só ADIA a duplicata um round: o vencedor avança
+    `followup_count` e deixa de casar o predicado de elegibilidade — o
+    irmão, que nunca avançou, continua elegível e é reivindicado sozinho
+    na rodada seguinte. Com a Task 4 rodando a cada 5 minutos, as duas
+    mensagens saem quase coladas. Reproduzido ao vivo com o par
+    `551197755555`/`5511997755555`.
+
+    O fix: o claim avança `followup_count` de TODAS as linhas que
+    compartilham a chave canônica, não só do vencedor — o par anda em
+    bloco. Por isso este teste chama `rodada` duas vezes seguidas: nenhum
+    teste de uma rodada só prova isso.
+    """
+    sem_9 = await lead_factory(
+        "551197755555", followup_count=0, minutos_desde_inbound=30
+    )
+    com_9 = await lead_factory(
+        "5511997755555", followup_count=0, minutos_desde_inbound=30
+    )
+
+    enviados = []
+
+    class ClienteQueRegistra:
+        async def send_message(self, to, body, **kwargs):
+            enviados.append(to)
+            return "id"
+
+    resumo1 = await rodada(await get_pool(), ClienteQueRegistra())
+    assert resumo1["enviados"] == 1
+
+    resumo2 = await rodada(await get_pool(), ClienteQueRegistra())
+    assert resumo2["enviados"] == 0, (
+        "a segunda rodada não pode mandar mensagem pro irmão que ficou de "
+        "fora da primeira — o par tem que ter avançado followup_count "
+        "junto na primeira rodada"
+    )
+    assert len(enviados) == 1
+
+    assert await _followup_count(sem_9) == 1
+    assert await _followup_count(com_9) == 1
+
+
+async def test_par_duplicado_no_degrau_2_tambem_nao_duplica_entre_rodadas(lead_factory):
+    """Mesma prova acima, mas partindo do degrau 2 (`followup_count=1`) —
+    o brief da revisão mediu que uma mutação que restringe o avanço em
+    bloco só ao degrau 1 (`and irmao.followup_count = 0`) sobrevive à
+    suíte inteira se nenhum teste exercitar outro degrau."""
+    sem_9 = await lead_factory(
+        "551197712377", followup_count=1, minutos_desde_inbound=80
+    )
+    com_9 = await lead_factory(
+        "5511997712377", followup_count=1, minutos_desde_inbound=80
+    )
+
+    enviados = []
+
+    class ClienteQueRegistra:
+        async def send_message(self, to, body, **kwargs):
+            enviados.append(to)
+            return "id"
+
+    resumo1 = await rodada(await get_pool(), ClienteQueRegistra())
+    assert resumo1["enviados"] == 1
+
+    resumo2 = await rodada(await get_pool(), ClienteQueRegistra())
+    assert resumo2["enviados"] == 0
+    assert len(enviados) == 1
+
+    assert await _followup_count(sem_9) == 2
+    assert await _followup_count(com_9) == 2
+
+
+async def test_trio_duplicado_incluindo_forma_legada_e_reivindicado_uma_vez(
+    lead_factory,
+):
+    """A especificação registra casos reais de três linhas para a mesma
+    pessoa. A terceira forma (`55011...`, zero de tronco) é exatamente o
+    perfil dos ~26 malformados que `phone.py` documenta — uma regex SQL
+    reimplementada não cobria isso; `canonicalizar()` (reaproveitado em
+    Python) cobre.
+
+    Limpeza manual da forma malformada no fim: o teardown padrão de
+    `lead_factory` apaga `variacoes(canonicalizar(phone))`, que para
+    `"55011997712399"` dá `("5511997712399", "551197712399")` — a própria
+    string malformada não está nessas duas variações e vazaria para a
+    próxima suíte.
+    """
+    a = await lead_factory("551197712399", followup_count=0, minutos_desde_inbound=30)
+    b = await lead_factory("5511997712399", followup_count=0, minutos_desde_inbound=30)
+    c = "55011997712399"
+    await lead_factory(c, followup_count=0, minutos_desde_inbound=30)
+
+    try:
+        reivindicados = await _reivindicar()
+        achados = {r.phone for r in reivindicados} & {a, b, c}
+        assert len(achados) == 1, achados
+
+        assert await _followup_count(a) == 1
+        assert await _followup_count(b) == 1
+        assert await _followup_count(c) == 1
+    finally:
+        pool = await get_pool()
+        async with pool.connection() as conn:
+            await conn.execute("delete from leads_crm where phone = %s", (c,))
+            await conn.commit()
+
+
+async def test_telefone_na_blocklist_nao_e_reivindicado(lead_factory, bloquear):
+    """A régua é o único caminho do sistema que fala sem o lead ter
+    falado — é onde o opt-out mais importa, e nem `reivindicar` nem
+    `ainda_vale_enviar` consultavam `blocklist` até este fix (só o gate
+    consultava). Reproduzido: telefone bloqueado com linha elegível em
+    `leads_crm` → `rodada` → mensagem entregue a quem pediu para parar."""
+    phone = await lead_factory(
+        "5511900000140", followup_count=0, minutos_desde_inbound=30
+    )
+    await bloquear(phone)
+
+    assert await _reivindicar() == []
+
+    resumo = await rodada(await get_pool(), _ClienteMudo())
+    assert resumo["enviados"] == 0
+
+
+async def test_telefone_bloqueado_por_variacao_nao_e_reivindicado(
+    lead_factory, bloquear
+):
+    """A blocklist pode ter a OUTRA forma (com/sem o 9º dígito) do mesmo
+    telefone — o `CHECK` da blocklist aceita as duas, igual ao gate."""
+    await lead_factory("551190000141", followup_count=0, minutos_desde_inbound=30)
+    await bloquear("5511990000141")  # forma com o 9º dígito
+
+    assert await _reivindicar() == []
+
+
+async def test_ainda_vale_enviar_falso_para_telefone_bloqueado(lead_factory, bloquear):
+    phone = await lead_factory(
+        "5511900000142",
+        followup_count=1,
+        minutos_desde_inbound=5,
+        minutos_desde_interacao=0,
+    )
+    await bloquear(phone)
+
+    assert await ainda_vale_enviar(await get_pool(), phone, nivel=1) is False
+
+
+async def test_par_com_um_lado_pausado_prova_o_ramo_de_timestamp_alcancavel(
+    lead_factory,
+):
+    """O achado da rodada anterior não sumiu — trocou de direção: a
+    docstring de `ainda_vale_enviar` afirmava que o ramo de timestamp era
+    inalcançável hoje, mas um par duplicado com um lado pausado (`com_9`,
+    `agent_active=False`) e outro ativo (`sem_9`, já reivindicado) chega
+    lá. Quando `sem_9` recebe um inbound novo, `aplicar_gate` funde as
+    duas linhas e a pausa vence (`_vencedor_pausa`) — o gate cai no ramo
+    `agente_desligado`, que bumpa `last_inbound_at` das DUAS linhas físicas
+    sem tocar `agent_active`/`followup_active`/`followup_count` de
+    `sem_9`. As quatro checagens anteriores de `ainda_vale_enviar` passam
+    limpo nela; só a comparação de relógios pega.
+    """
+    sem_9 = "551197799911"
+    com_9 = "5511997799911"
+    await lead_factory(
+        sem_9, agent_active=True, followup_count=0, minutos_desde_inbound=30
+    )
+    await lead_factory(
+        com_9, agent_active=False, followup_count=0, minutos_desde_inbound=30
+    )
+
+    reivindicados = await _reivindicar()
+    assert {r.phone for r in reivindicados} == {sem_9}
+
+    await aplicar_gate(
+        await get_pool(),
+        key={"remoteJid": f"{sem_9}@s.whatsapp.net", "fromMe": False},
+        push_name="Fulano",
+    )
+
+    pool = await get_pool()
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            "select agent_active, followup_active, followup_count"
+            " from leads_crm where phone = %s",
+            (sem_9,),
+        )
+        linha = await cur.fetchone()
+    assert linha is not None
+    agent_active, followup_active, followup_count = linha
+    assert agent_active is True, "as quatro checagens anteriores passam limpo"
+    assert followup_active is True
+    assert followup_count == 1
+
+    assert await ainda_vale_enviar(pool, sem_9, nivel=1) is False
 
 
 async def test_lead_que_falou_entre_o_claim_e_o_envio_nao_recebe(lead_factory):

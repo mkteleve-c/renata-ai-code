@@ -36,7 +36,7 @@ from whatsapp_langchain.agents.catalog.elevec_sdr.contexto import (
 )
 from whatsapp_langchain.shared.config import settings
 from whatsapp_langchain.shared.db import get_pool
-from whatsapp_langchain.shared.phone import to_e164
+from whatsapp_langchain.shared.phone import canonicalizar, to_e164, variacoes
 
 logger = structlog.get_logger()
 
@@ -54,12 +54,23 @@ class LeadReivindicado:
     nivel: int  # 1, 2 ou 3 — já é o novo followup_count
 
 
-# `for update skip locked` fica DENTRO da subquery que seleciona os
-# candidatos, não no UPDATE externo: só assim duas rodadas concorrentes
-# pulam as linhas uma da outra sem bloquear. O predicado de janela
-# (`last_inbound_at > now() - ... janela`) fica DENTRO desta mesma cláusula
-# de reivindicação — um lead fora da janela não é reivindicado, então não
-# queima degrau; reivindicar e descartar depois gastaria o degrau à toa.
+# `for update skip locked` fica numa consulta simples (sem CTE, sem
+# `DISTINCT`) direto em `leads_crm` — medido neste Postgres (16.14): `FOR
+# UPDATE` sobre uma REFERÊNCIA de CTE é descartado em silêncio (a CTE não
+# é uma relação travável; confere mesmo com `AS MATERIALIZED`, então não é
+# efeito de inlining), e `DISTINCT ON` no mesmo nível do `FOR UPDATE` dá
+# erro alto (`FOR UPDATE is not allowed with DISTINCT clause`). Uma
+# subquery derivada em `FROM` (sem CTE) preserva o lock — mas nem essa
+# forma é usada aqui: o dedup de duplicata não roda em SQL nenhuma, roda
+# em Python (`_reivindicar_na_conexao`, abaixo), reaproveitando
+# `shared/phone.canonicalizar` em vez de reimplementar a regra em regex
+# SQL — foi assim que a primeira versão deste dedup perdeu casos (forma
+# local de 11/10 dígitos, zero de tronco) que `canonicalizar` já cobre.
+#
+# O predicado de janela (`last_inbound_at > now() - ... janela`) fica
+# DENTRO desta cláusula — um lead fora da janela não é candidato, então
+# não queima degrau; reivindicar e descartar depois gastaria o degrau à
+# toa.
 #
 # `qualificado` está no filtro de fases e NÃO PODE sair dele: a Fase 2
 # (`reverter_fase_apos_cancelamento`, em catalog/elevec_sdr/tools/crm.py)
@@ -67,91 +78,48 @@ class LeadReivindicado:
 # para `qualificado`. Se `qualificado` entrar na régua, esse lead volta a
 # ser perseguido — WhatsApp indevido para gente de verdade.
 #
-# `phone` NÃO é identidade — é isso que o resto do repositório trata
-# diferente (gate, blocklist, `variacoes()`), e é o que faltava aqui. Um
-# lead duplicado (mesma pessoa com/sem o 9º dígito — ~155 casos
-# documentados na base, alguns com 3 linhas) tem DUAS linhas físicas que
-# frequentemente vencem o mesmo degrau no mesmo instante (o backfill da
-# 013 acende `last_inbound_at` nas duas metades sem dedup; o caminho
-# `agente_desligado` do gate grava `where phone in (com_9, sem_9)`, idem).
-# Sem o `not exists` de dedup abaixo, as duas entram no mesmo lote e a
-# mesma pessoa recebe a mesma mensagem duas vezes — reproduzido ao vivo
-# neste banco.
-#
-# O dedup é um `NOT EXISTS` correlato sobre `leads_crm` DIRETO, com o
-# predicado de elegibilidade repetido — NÃO um CTE nem `DISTINCT ON`.
-# Medido via `EXPLAIN` neste Postgres: qualquer forma que passe a seleção
-# de candidatos por uma CTE (mesmo uma sem `DISTINCT`, referenciada uma
-# única vez) ou por `DISTINCT ON` faz o planner **descartar o `LockRows`
-# em silêncio** — a query roda sem erro, mas `for update skip locked` para
-# de bloquear/pular linha nenhuma, e a segunda transação concorrente
-# trava esperando o lock de linha da primeira em vez de pular para o
-# próximo candidato (reproduzido: trocar por qualquer uma dessas formas
-# trava o teste de concorrência real). Com o `NOT EXISTS` direto em
-# `leads_crm`, o `EXPLAIN` mostra `LockRows` logo abaixo do `Limit` — a
-# forma que preserva SKIP LOCKED.
-#
-# `chave_canonica` (calculada duas vezes, uma por lado do join) extrai a
-# forma sem o 9º dígito — mesma regra de `shared/phone.canonicalizar` para
-# o caso BR-com-9, só que em SQL. Entre duas linhas da mesma identidade, a
-# de `last_inbound_at` mais antigo (mais urgente) vence e a outra fica de
-# fora deste lote — não é descartada nem perde estado, só não participa
-# agora. O desempate por `(last_inbound_at, phone)` como tupla, não só por
-# `last_inbound_at`, existe porque o backfill da 013 grava a mesma marca
-# de tempo nas duas metades do par: sem o telefone como critério de
-# desempate, empate exato faria as duas passarem no `NOT EXISTS` — a
-# mesma duplicidade que esta cláusula existe para fechar.
-_SQL_REIVINDICAR = r"""
+# `limite_busca` busca mais candidatos do que `limite` pede — o suficiente
+# para capturar pares/trios duplicados inteiros dentro do lote (a
+# especificação registra casos reais de três linhas para a mesma pessoa).
+# Isso NÃO garante exaustividade contra clusters patológicos maiores que
+# a sobra, mas cobre o perfil real medido (~155 duplicatas em ~3.300
+# leads, a maioria pares). Ver `_FATOR_SOBRA_BUSCA`.
+_SQL_CANDIDATOS = """
+select phone, name, followup_count, last_inbound_at
+from leads_crm
+where followup_active
+  and agent_active
+  and phase not in ('agendou_sessao','desqualificado','perdido','qualificado')
+  and last_inbound_at is not null
+  and (
+        (followup_count = 0
+         and last_inbound_at < now() - make_interval(mins => %(n1)s))
+     or (followup_count = 1
+         and last_inbound_at < now() - make_interval(mins => %(n2)s))
+     or (followup_count = 2
+         and last_inbound_at < now() - make_interval(mins => %(n3)s))
+  )
+  and last_inbound_at > now() - make_interval(mins => %(janela)s)
+order by last_inbound_at
+limit %(limite_busca)s
+for update skip locked
+"""
+
+# Avança `followup_count` de TODAS as linhas físicas decididas em Python
+# (vencedor de cada identidade canônica + seus irmãos presentes no MESMO
+# lote) — não só do vencedor. Sem isso, o vencedor avança e para de casar
+# o predicado de elegibilidade de `_SQL_CANDIDATOS` na próxima rodada
+# (mudou de degrau), enquanto o irmão — que nunca avançou — continua
+# elegível e é reivindicado sozinho na rodada seguinte: duas mensagens em
+# rodadas diferentes em vez de duas na mesma. Reproduzido ao vivo com a
+# `Task 4` rodando a cada 5 minutos. Avançar o par inteiro junto faz as
+# duas linhas saírem do degrau atual ao mesmo tempo e entrarem no próximo
+# também juntas — o par anda em bloco, nunca diverge de novo.
+_SQL_AVANCAR = """
 update leads_crm
 set followup_count = followup_count + 1,
     last_interaction_at = now()
-where phone in (
-    select t.phone from leads_crm t
-    where t.followup_active
-      and t.agent_active
-      and t.phase not in ('agendou_sessao','desqualificado','perdido','qualificado')
-      and t.last_inbound_at is not null
-      and (
-            (t.followup_count = 0
-             and t.last_inbound_at < now() - make_interval(mins => %(n1)s))
-         or (t.followup_count = 1
-             and t.last_inbound_at < now() - make_interval(mins => %(n2)s))
-         or (t.followup_count = 2
-             and t.last_inbound_at < now() - make_interval(mins => %(n3)s))
-      )
-      and t.last_inbound_at > now() - make_interval(mins => %(janela)s)
-      and not exists (
-          select 1 from leads_crm irmao
-          where irmao.phone <> t.phone
-            and (case when irmao.phone ~ '^55\d{2}9\d{8}$'
-                 then substring(irmao.phone from 1 for 4)
-                      || substring(irmao.phone from 6)
-                 else irmao.phone
-                 end)
-                = (case when t.phone ~ '^55\d{2}9\d{8}$'
-                   then substring(t.phone from 1 for 4) || substring(t.phone from 6)
-                   else t.phone
-                   end)
-            and irmao.followup_active
-            and irmao.agent_active
-            and irmao.phase not in
-                ('agendou_sessao','desqualificado','perdido','qualificado')
-            and irmao.last_inbound_at is not null
-            and (
-                  (irmao.followup_count = 0
-                   and irmao.last_inbound_at < now() - make_interval(mins => %(n1)s))
-               or (irmao.followup_count = 1
-                   and irmao.last_inbound_at < now() - make_interval(mins => %(n2)s))
-               or (irmao.followup_count = 2
-                   and irmao.last_inbound_at < now() - make_interval(mins => %(n3)s))
-              )
-            and irmao.last_inbound_at > now() - make_interval(mins => %(janela)s)
-            and (irmao.last_inbound_at, irmao.phone) < (t.last_inbound_at, t.phone)
-      )
-    order by t.last_inbound_at
-    limit %(limite)s
-    for update skip locked
-)
+where phone = any(%s)
 returning phone, name, followup_count
 """
 
@@ -190,6 +158,43 @@ def _janela_minutos(janela_min: int) -> int:
     return _MINUTOS_POR_DIA - janela_min
 
 
+# Multiplicador de sobra na busca de candidatos — ver o comentário acima de
+# `_SQL_CANDIDATOS`.
+_FATOR_SOBRA_BUSCA = 5
+
+
+async def _telefones_bloqueados(
+    conn: AsyncConnection[Any], telefones: set[str]
+) -> set[str]:
+    """Subconjunto de `telefones` presente na `blocklist`, em qualquer forma.
+
+    A régua é o ÚNICO caminho do sistema que fala sem o lead ter falado —
+    é exatamente onde o opt-out mais importa, e é o que faltava aqui: nem
+    a reivindicação nem `ainda_vale_enviar` consultavam `blocklist` (só o
+    gate consultava, `shared/leads.py:301`). Usa as mesmas duas variações
+    (com/sem o 9º dígito) que o gate usa — o `CHECK` da blocklist aceita
+    as duas formas, e uma pessoa pode ter pedido opt-out sob qualquer uma
+    delas.
+    """
+    if not telefones:
+        return set()
+
+    por_variacao: dict[str, set[str]] = {}
+    for telefone in telefones:
+        canonico = canonicalizar(telefone) or telefone
+        for variacao in variacoes(canonico):
+            por_variacao.setdefault(variacao, set()).add(telefone)
+
+    cur = await conn.execute(
+        "select phone from blocklist where phone = any(%s)",
+        (list(por_variacao.keys()),),
+    )
+    bloqueados: set[str] = set()
+    for (variacao,) in await cur.fetchall():
+        bloqueados |= por_variacao.get(variacao, set())
+    return bloqueados
+
+
 # `int | None = None` em vez de `int = settings.followup_x` de propósito:
 # um default lido de `settings` no cabeçalho da função é resolvido UMA VEZ,
 # na importação do módulo — `monkeypatch.setattr(settings, "followup_x",
@@ -216,6 +221,16 @@ async def _reivindicar_na_conexao(
     `asyncio.Event` — `asyncio.gather` de duas corrotinas no mesmo pool não
     garante sobreposição, então sem essa barreira o teste passaria mesmo
     sem `for update skip locked`.
+
+    Duas consultas nesta MESMA transação, não uma: `_SQL_CANDIDATOS`
+    busca e trava (via `FOR UPDATE SKIP LOCKED`) uma sobra de candidatos
+    físicos; o agrupamento por identidade canônica e o corte em `limite`
+    identidades rodam aqui em Python; `_SQL_AVANCAR` escreve só as linhas
+    decididas. Linhas travadas mas não escolhidas (sobra além de `limite`
+    identidades, ou membro de um grupo não selecionado) simplesmente
+    liberam o lock no commit sem nunca serem escritas — o mesmo padrão de
+    "buscar mais do que processar" de qualquer fila baseada em SKIP
+    LOCKED.
     """
     if limite is None:
         limite = settings.followup_batch_size
@@ -233,10 +248,49 @@ async def _reivindicar_na_conexao(
         "n2": n2_min,
         "n3": n3_min,
         "janela": _janela_minutos(janela_min),
-        "limite": limite,
+        "limite_busca": limite * _FATOR_SOBRA_BUSCA,
     }
-    cur = await conn.execute(_SQL_REIVINDICAR, params)
-    linhas = await cur.fetchall()
+    cur = await conn.execute(_SQL_CANDIDATOS, params)
+    candidatos = await cur.fetchall()
+    if not candidatos:
+        return []
+
+    bloqueados = await _telefones_bloqueados(conn, {c[0] for c in candidatos})
+    candidatos = [c for c in candidatos if c[0] not in bloqueados]
+    if not candidatos:
+        return []
+
+    # Agrupa por (identidade canônica, degrau atual) — não só por
+    # identidade. Duas linhas do mesmo par só andam juntas quando estão no
+    # MESMO degrau: uma dupla que já divergiu (uma delas mais adiantada
+    # por algum motivo anterior a este fix) não pode ser empurrada para o
+    # degrau da mais adiantada só por compartilhar telefone — isso pularia
+    # um degrau legítimo da mais atrasada. `followup_count` no agrupamento
+    # é o que faz esse fix funcionar em qualquer degrau (1, 2 ou 3), não
+    # só no primeiro.
+    grupos: dict[tuple[str, int], list[tuple[str, str | None, int, Any]]] = {}
+    for phone, name, followup_count, last_inbound_at in candidatos:
+        chave = canonicalizar(phone) or phone
+        grupos.setdefault((chave, followup_count), []).append(
+            (phone, name, followup_count, last_inbound_at)
+        )
+
+    grupos_ordenados = sorted(
+        grupos.values(), key=lambda grupo: min(item[3] for item in grupo)
+    )[:limite]
+
+    telefones_a_avancar: list[str] = []
+    vencedores: set[str] = set()
+    for grupo in grupos_ordenados:
+        grupo_ordenado = sorted(grupo, key=lambda item: (item[3], item[0]))
+        vencedores.add(grupo_ordenado[0][0])
+        telefones_a_avancar.extend(item[0] for item in grupo_ordenado)
+
+    if not telefones_a_avancar:
+        return []
+
+    cur = await conn.execute(_SQL_AVANCAR, (telefones_a_avancar,))
+    linhas = [linha for linha in await cur.fetchall() if linha[0] in vencedores]
     return [LeadReivindicado(phone=p, name=n, nivel=c) for p, n, c in linhas]
 
 
@@ -249,14 +303,15 @@ async def reivindicar(
     n3_min: int | None = None,
     janela_min: int | None = None,
 ) -> list[LeadReivindicado]:
-    """Reivindica até `limite` leads vencidos e devolve o degrau de cada um.
+    """Reivindica até `limite` leads (identidades canônicas) vencidos.
 
-    **Nenhuma transação fica aberta durante HTTP.** O `UPDATE ... RETURNING`
-    roda e commita aqui dentro (o `async with pool.connection()` do psycopg
-    commita ao sair sem exceção); o envio pelo canal de WhatsApp acontece
-    inteiramente depois, em `rodada`/`_enviar_reivindicados`, sem segurar
-    linha nenhuma. Segurar `FOR UPDATE` enquanto se espera a Evolution
-    responder é exatamente o defeito que este desenho evita.
+    **Nenhuma transação fica aberta durante HTTP.** As duas consultas desta
+    função (busca de candidatos + avanço) rodam e commitam aqui dentro (o
+    `async with pool.connection()` do psycopg commita ao sair sem exceção);
+    o envio pelo canal de WhatsApp acontece inteiramente depois, em
+    `rodada`/`_enviar_reivindicados`, sem segurar linha nenhuma. Segurar
+    `FOR UPDATE` enquanto se espera a Evolution responder é exatamente o
+    defeito que este desenho evita.
 
     **Sem advisory lock.** O lock do Postgres é por sessão: com pool, a
     conexão volta para o pool ainda segurando o lock, e ele evapora sem
@@ -267,6 +322,13 @@ async def reivindicar(
     **`followup_count` do `RETURNING` já é o novo valor** (1, 2 ou 3) —
     é o nível da mensagem a enviar, o mesmo `next_level` que o n8n calculava
     separado como `followup_count + 1`.
+
+    **Um telefone não é uma pessoa.** Duas ou mais linhas físicas
+    compartilhando a mesma identidade canônica (com/sem o 9º dígito, ou
+    formas legadas malformadas) avançam `followup_count` juntas; só a
+    linha mais urgente do grupo é devolvida para envio. Ver o comentário
+    acima de `_SQL_AVANCAR` para o porquê. Telefones na `blocklist` (em
+    qualquer variação) nunca são devolvidos.
 
     Os degraus (`n1_min`, `n2_min`, `n3_min`) e a janela aceitam override
     explícito por chamada e, sem ele, caem no valor corrente de `settings`
@@ -330,15 +392,19 @@ async def ainda_vale_enviar(pool: AsyncConnectionPool, phone: str, nivel: int) -
     desta régua: é justamente 15 minutos depois de falar que ele mais tende
     a voltar.
 
-    Cinco checagens, cada uma cobrindo um caminho diferente — medido contra
+    Seis checagens, cada uma cobrindo um caminho diferente — medido contra
     o código real dos outros módulos, não hipótese:
 
+    - **telefone entrou na `blocklist`** desde o claim: a régua é o único
+      caminho do sistema que fala sem o lead ter falado, então é onde o
+      opt-out mais importa. Mesma checagem de `_telefones_bloqueados` usada
+      na reivindicação — ver o comentário lá.
     - **lead sumiu** (linha não existe mais sob este `phone`): uma fusão de
       duplicata em `shared/leads.py` pode ter renomeado a chave.
     - **`agent_active` virou `false`**: é o que pega, hoje, tanto
       `human_handover` quanto um humano pausando pelo ChatWoot quanto o
-      caminho `agente_desligado` do gate — os três desligam o agente antes
-      de tocar em qualquer outra coisa.
+      caminho `agente_desligado` do gate quando a linha revalidada É a
+      mesma que ficou com `agent_active=false`.
     - **`followup_active` virou `false`**: caminho de desligamento
       independente do `agent_active` (ex.: religamento futuro do ChatWoot
       que reative o agente sem reativar a régua).
@@ -348,18 +414,26 @@ async def ainda_vale_enviar(pool: AsyncConnectionPool, phone: str, nivel: int) -
       em todo inbound aceito, e é esse zeramento, não o relógio, que este
       código enxerga primeiro.
     - **`last_inbound_at` mais recente que `last_interaction_at`** (que
-      `reivindicar` acabou de gravar como o instante do claim): guarda
-      defensiva para um caminho de escrita FUTURO que toque
-      `last_inbound_at` sem resetar `followup_count` e sem desligar
-      `agent_active` — nenhum caminho do gate faz isso hoje (o
-      `agente_desligado` já cai na checagem de `agent_active` acima; o
-      caminho normal zera `followup_count` E grava `last_inbound_at` igual
-      a `last_interaction_at` no mesmo `now()`, então esta comparação nunca
-      dispara sozinha neste código). Mantida porque a Task 5 adiciona um
-      webhook do ChatWoot que também escreve estado do lead, e esta
-      checagem é barata.
+      `reivindicar` acabou de gravar como o instante do claim): **é
+      alcançável hoje**, e não só por um caminho futuro — o caminho real é
+      um par duplicado com um lado pausado. Se `com_9` está com
+      `agent_active=false` e `sem_9` (já reivindicado, `agent_active=true`)
+      recebe um inbound novo, `aplicar_gate` funde as duas linhas
+      (`_fundir`/`_vencedor_pausa`) e o `agent_active` da FUSÃO vale
+      `false` (pausa vence, mesmo vindo da linha irmã) — o gate cai no
+      ramo `agente_desligado`, cujo `UPDATE` roda `WHERE phone IN (com_9,
+      sem_9)` e bumpa `last_inbound_at` das DUAS linhas físicas, inclusive
+      a de `sem_9`, sem tocar em `agent_active`/`followup_active`/
+      `followup_count` dela. Nesse caso as quatro checagens anteriores
+      passam limpo em `sem_9` — só esta comparação de relógios pega. Log
+      real capturado: `followup_abortado motivo=lead_falou_apos_o_claim`.
     """
     async with pool.connection() as conn:
+        if phone in await _telefones_bloqueados(conn, {phone}):
+            logger.info(
+                "followup_abortado", phone=phone, nivel=nivel, motivo="blocklist"
+            )
+            return False
         cur = await conn.execute(_SQL_AINDA_VALE_ENVIAR, (phone,))
         linha = await cur.fetchone()
 
