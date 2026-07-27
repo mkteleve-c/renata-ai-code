@@ -7,10 +7,9 @@ Este arquivo contém a factory `build_graph()`. Para langgraph dev,
 veja graph.py que exporta a variável `graph`.
 
 Diferenças em relação ao illumi_assistant/rhawk_assistant nesta fase:
-- Sem tools (calendário, CRM e handover entram nas tasks 4-6). tools=[] é
-  fixo aqui, não condicional a `store` — a Renata não usa save_memory/
-  read_memory mesmo se um store for passado, para paridade com o n8n, que
-  não tem memória cross-thread.
+- Tools de agenda ligadas (CRM e handover entram na task 6). A Renata não
+  usa save_memory/read_memory mesmo se um store for passado, para paridade
+  com o n8n, que não tem memória cross-thread.
 - temperature=0.3, replicando a configuração do nó AI Agent no n8n
   (ver docs/evidencias/prompt-renata-n8n.md) — um agente cujo valor é
   seguir o SOP à risca não deve rodar no default do provider.
@@ -34,6 +33,7 @@ from whatsapp_langchain.shared.llm import create_chat_model
 
 from .contexto import criar_middleware_contexto
 from .prompts import SYSTEM_PROMPT
+from .tools import TOOLS_AGENDA
 
 
 def build_graph(
@@ -47,8 +47,14 @@ def build_graph(
     - summarize: Sumariza mensagens antigas (custo extra, preserva contexto)
     - none: Sem gerenciamento de contexto
 
-    Não usa memória semântica nem tools nesta fase — paridade com o n8n
-    (sem memória) e escopo desta task (tools entram nas tasks 4-6).
+    As cinco tools de agenda (`calendar_get_many`, `calendar_agendar`,
+    `calendar_update`, `calendar_delete`, `calendar_get_event`) entram
+    sempre: elas resolvem credencial e lead em tempo de chamada e devolvem
+    mensagem — nunca exceção — quando algo falta, então ligar
+    condicionalmente só esconderia a causa do agente.
+
+    Não usa memória semântica — paridade com o n8n, que não tem memória
+    cross-thread.
 
     Args:
         checkpointer: Checkpointer para persistência de estado.
@@ -71,7 +77,7 @@ def build_graph(
 
     return create_agent(
         model=model,
-        tools=[],
+        tools=TOOLS_AGENDA,
         system_prompt=SYSTEM_PROMPT,
         middleware=middleware,
         checkpointer=checkpointer,

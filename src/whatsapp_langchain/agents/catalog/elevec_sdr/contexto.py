@@ -192,12 +192,16 @@ def _configurable() -> dict[str, Any]:
     return {}
 
 
-def _telefone_do_turno() -> str | None:
+def telefone_do_turno() -> str | None:
     """Telefone em E.164 a partir do `configurable` do invoke.
 
     O worker manda `user_id = phone_number`; o `thread_id`
     (`"{phone}:{agent_id}"`) é o fallback para quem invoca sem `user_id`,
     como o LangGraph Studio.
+
+    Público porque as tools de agenda precisam do mesmo telefone que o
+    middleware de contexto — as duas resolvem o lead do turno, e duas
+    implementações do mesmo `configurable` divergiriam em silêncio.
     """
     configurable = _configurable()
 
@@ -221,7 +225,7 @@ def criar_middleware_contexto():
     async def contexto_do_lead(request: ModelRequest) -> str:
         base = request.system_prompt or SYSTEM_PROMPT
 
-        telefone = _telefone_do_turno()
+        telefone = telefone_do_turno()
         if telefone is None:
             logger.warning("contexto_sem_telefone_no_config")
             return interpolar(base, contexto_vazio())
