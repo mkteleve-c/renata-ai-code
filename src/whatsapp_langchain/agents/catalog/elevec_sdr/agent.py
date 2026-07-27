@@ -7,9 +7,13 @@ Este arquivo contém a factory `build_graph()`. Para langgraph dev,
 veja graph.py que exporta a variável `graph`.
 
 Diferenças em relação ao illumi_assistant/rhawk_assistant nesta fase:
-- Sem tools (calendário, CRM e handover entram nas tasks 4-6).
-- Sem memória semântica (save_memory/read_memory) — paridade com o n8n,
-  que não tem memória cross-thread. MEMORY_ENABLED deve ficar false.
+- Sem tools (calendário, CRM e handover entram nas tasks 4-6). tools=[] é
+  fixo aqui, não condicional a `store` — a Renata não usa save_memory/
+  read_memory mesmo se um store for passado, para paridade com o n8n, que
+  não tem memória cross-thread.
+- temperature=0.3, replicando a configuração do nó AI Agent no n8n
+  (ver docs/evidencias/prompt-renata-n8n.md) — um agente cujo valor é
+  seguir o SOP à risca não deve rodar no default do provider.
 
 Configuração via .env:
     OPENROUTER_API_KEY=sk-or-...       # API key do OpenRouter
@@ -55,8 +59,9 @@ def build_graph(
     Returns:
         CompiledStateGraph: Agente compilado pronto para uso.
     """
-    # Modelo principal com rate limiter centralizado (shared/llm.py)
-    model = create_chat_model()
+    # Modelo principal com rate limiter centralizado (shared/llm.py).
+    # temperature=0.3 replica a configuração do nó AI Agent no n8n.
+    model = create_chat_model(temperature=0.3)
 
     # Middleware de contexto baseado em CONTEXT_STRATEGY
     middleware = get_context_middleware()

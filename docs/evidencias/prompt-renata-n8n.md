@@ -40,6 +40,15 @@ Schema do output parser:
 
 ## System message (verbatim)
 
+**Nota sobre o `=` inicial:** o `=` na primeira linha (`=## OVERVIEW`) não é
+conteúdo do prompt — é o marcador de modo-expressão que o n8n grava no início
+de `parameters.options.systemMessage` quando o campo está em modo expressão.
+O resolvedor do n8n consome esse `=` antes do texto chegar ao nó; a Renata em
+produção recebe `## OVERVIEW` como primeira linha, não `=## OVERVIEW`. Mantido
+aqui porque este bloco é a extração bruta e verbatim do JSON do workflow —
+quem reextrair no futuro deve remover o `=` inicial ao portar para código,
+exatamente como já se remove a sintaxe `{{ ... }}` das expressões n8n.
+
 ```
 =## OVERVIEW
 Você é a Renata, assistente de pré-vendas da EleveC. Sua função é atuar como o primeiro ponto de contato humano e empático para profissionais que buscam a mentoria de Silvio Hirata.

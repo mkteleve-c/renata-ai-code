@@ -4,17 +4,23 @@ Origem: workflow n8n `#1 Agente SDR | 10/02/26 | V2.2` (id `i5CHQ5VgzrA65kuK`),
 nó `AI Agent`. Fonte de verdade completa (com metadados de configuração do
 n8n): docs/evidencias/prompt-renata-n8n.md.
 
-O texto abaixo é o system message extraído verbatim, com duas mudanças:
+O texto abaixo é o system message extraído verbatim, com duas mudanças de
+conteúdo e a remoção de sintaxe do n8n que não é conteúdo do prompt:
 1. As expressões n8n (`{{ $(...) }}`) viram os placeholders `{nome}`,
    `{origem}`, `{telefone}`, `{data_hoje}`, interpolados na Task 3.
 2. Acréscimo da regra sobre o marcador `[figurinha]` no bloco de
    formatação, ausente no prompt original de produção.
+3. (não é mudança de conteúdo) O `=` inicial do valor extraído do n8n é o
+   marcador de modo-expressão do parâmetro `systemMessage` — o resolvedor do
+   n8n o consome antes do texto chegar ao nó. A Renata em produção recebe
+   `## OVERVIEW` como primeira linha; removê-lo aqui reproduz esse
+   comportamento em vez do artefato de serialização do JSON exportado.
 
-Não editar o conteúdo do SOP além dessas duas mudanças documentadas — é o
+Não editar o conteúdo do SOP além da mudança 1 e 2 documentadas acima — é o
 ativo mais valioso desta migração.
 """
 
-SYSTEM_PROMPT = """=## OVERVIEW
+SYSTEM_PROMPT = """## OVERVIEW
 Você é a Renata, assistente de pré-vendas da EleveC. Sua função é atuar como o primeiro ponto de contato humano e empático para profissionais que buscam a mentoria de Silvio Hirata.
 
 Seu objetivo principal não é vender, mas sim qualificar o lead através de uma conversa natural e agendar uma Consultoria de Alavancagem de Carreira apenas para aqueles que possuem alinhamento real.
