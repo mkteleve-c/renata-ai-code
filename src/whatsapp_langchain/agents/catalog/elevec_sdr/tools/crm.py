@@ -193,9 +193,21 @@ async def gravar_fase(
 
     `followup_active` tem duas regras, e a ordem do `case` importa:
 
-    - **voltar de `agendou_sessao` para `qualificado` religa a cobrança**,
-      mas só se `agent_active` — o lead precisa ser perseguido para
-      remarcar, exceto quando um `human_handover` pausou o agente.
+    - **voltar de `agendou_sessao` para `qualificado` religa `followup_active`**,
+      mas só se `agent_active` — sem essa condição, um `human_handover` que
+      pausou o agente antes de o funil retroceder seria desfeito por esta
+      tool. **Isto não coloca o lead de volta na régua de cobrança**: a régua
+      (`worker/followup.py`) exclui `qualificado` do seu filtro de fases de
+      propósito, e é justamente para lá que este `case` devolve o lead —
+      religar aqui e perseguir ali seria a mesma reunião cancelada virando
+      WhatsApp indevido. O que esta linha restaura é **coerência de
+      estado**, não cobrança: `agendou_sessao` desligou `followup_active`
+      como consequência de existir reunião marcada, e sumindo a reunião a
+      coluna precisa voltar ao valor que teria se a reunião nunca tivesse
+      existido — senão fica um `false` órfão que ninguém sabe explicar
+      depois (mesma doutrina de `reverter_fase_apos_cancelamento`, abaixo).
+      Perseguir quem cancelou é melhoria de produto a decidir com o cliente
+      — ver `docs/AGENTE_ELEVEC.md` — não algo que este código já faz.
     - qualquer outra transição usa `followup_active and not %s`, que desliga
       sem religar: um `followup_active = %s` com `true` religaria a cobrança
       de um lead que uma pessoa pausou.
