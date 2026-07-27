@@ -1365,15 +1365,22 @@ async def importar_leads(
 #   human: 3.316 linhas, nenhuma com `content` em formato JSON
 #   tool:  1.144 linhas
 #
-# `4460 - 3316 = 1144`, exatamente a contagem de `tool`. Isso não é
-# coincidência: os `ai` cujo `content` NÃO parece JSON são os PEDIDOS de
-# chamada de ferramenta que o modelo emitia -- medido: é TEXTO PURO (ex.:
-# `Calling update_crm1 with input: {...}`), nunca `tool_calls` em
-# `additional_kwargs` (nenhuma das 8.920 linhas da base tem essa chave); os
-# `ai` cujo `content` PARECE JSON são as respostas FINAIS. `extrair_turno_
-# de_conversa` classifica pela MESMA distinção -- tenta `json.loads` no
-# `content` de um `ai`; sucesso é resposta final, falha é ruído de tool call
-# e o turno é descartado.
+# `4460 - 3316 = 1144`, exatamente a contagem de `tool` -- mas essa soma não
+# prova, sozinha, que os 1.144 são "todos chamada de ferramenta"; a
+# decomposição real (fix round 2, corrigida em `docs/evidencias/
+# formato-historico-n8n.md`) é **1.137** com `content` string NÃO-JSON (ex.:
+# `Calling update_crm1 with input: {...}`) mais **7** com `content` igual a
+# `[]` -- um array JSON, não uma string. Os dois grupos são PEDIDOS de
+# chamada de ferramenta, e os dois caem no mesmo `isinstance(bruto, str)`
+# antes mesmo de `_eh_json_valido` rodar -- `extrair_turno_de_conversa`
+# descarta os dois pelo mesmo motivo (não é string), então o resultado do
+# filtro não muda; só a decomposição que se escreveu por engano no primeiro
+# round mudou. Nenhuma das 8.920 linhas tem `tool_calls` em
+# `additional_kwargs`. Os `ai` cujo `content` PARECE JSON são as respostas
+# FINAIS. `extrair_turno_de_conversa` classifica pela MESMA distinção --
+# tenta `json.loads` no `content` de um `ai` (que primeiro precisa SER uma
+# string); sucesso é resposta final, qualquer outra coisa é ruído de tool
+# call e o turno é descartado.
 #
 # FIX ROUND 1 -- o envelope da resposta final está ANINHADO sob `output`,
 # não `{"messages": [...]}` no topo como a primeira versão deste módulo
@@ -1529,6 +1536,13 @@ def montar_historico_por_sessao(
     ferramenta e mantém só os `janela` turnos mais recentes por telefone --
     contados DEPOIS do filtro (ver a decisão documentada acima do módulo).
 
+    `janela <= 0` devolve NENHUM turno (lista vazia) para todo canônico --
+    fix round 2: a versão anterior tratava `janela <= 0` como "sem limite"
+    (`else turnos`, devolvendo TUDO), semântica invertida do que o nome do
+    parâmetro sugere. Hoje inalcançável (o único chamador usa o default de
+    12), mas corrigido porque uma janela de tamanho zero ou negativo só faz
+    sentido como "nada cabe", nunca como "cabe infinito".
+
     `session_id` passa por `normalizar_telefone` (mesma função da Task 2) --
     duas formas brutas que convergem para o mesmo canônico têm seus turnos
     fundidos e reordenados juntos por `id_origem`, não tratadas como
@@ -1555,7 +1569,7 @@ def montar_historico_por_sessao(
     resultado: dict[str, list[tuple[str, str]]] = {}
     for canonico, turnos in por_canonico.items():
         turnos.sort(key=lambda t: t[0])
-        janela_final = turnos[-janela:] if janela > 0 else turnos
+        janela_final = turnos[-janela:] if janela > 0 else []
         resultado[canonico] = [(papel, conteudo) for _, papel, conteudo in janela_final]
     return resultado
 

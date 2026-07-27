@@ -45,6 +45,35 @@ duplicada. A alternativa -- gravar a marca só depois que o turno inteiro
 tiver sucesso -- é exatamente o bug que a task pede para evitar: uma
 falha no meio faria a tentativa seguinte injetar outra vez, e o lead veria
 os mesmos 12 turnos empilhados duas vezes.
+
+FIX ROUND 2 -- ORDEM das mensagens. O reducer de `messages` é `add_messages`,
+que ANEXA ao fim do state existente -- `trim.py` já documenta isso (usa
+`RemoveMessage` porque devolver uma lista menor não troca a lista, só
+adiciona). Devolver `{"messages": mensagens}` aqui faria o histórico
+legado ser ANEXADO depois da mensagem nova do lead, não antes dela --
+prova contra o Postgres real, thread com 4 turnos legados: a mensagem nova
+do lead ficava em `[1]` e a última mensagem do state virava uma fala
+ANTIGA da Renata em `[5]`. Como as 736 sessões da origem terminam em `ai`
+(medido), 100% das injeções produziriam essa inversão -- e para o modelo
+via OpenRouter isso é semântica de PREFILL: ele continua a própria fala
+antiga em vez de responder o lead novo, e a continuação não sai no
+envelope `{"messages": [...]}`, então `extrair_baloes` cai no fallback de
+balão único e o lead vê o texto cru. Os dois problemas que esta task existe
+para evitar, ao mesmo tempo -- e permanente: no turno 2 o state já tem
+`HumanMessage` suficiente para o trim não cortar nada, então a ordem
+quebrada ficava gravada no checkpoint para sempre.
+
+A correção: `RemoveMessage(id=REMOVE_ALL_MESSAGES)` zera o state ANTES do
+merge do reducer, e a lista devolvida passa a ser
+`[*mensagens_do_historico, *state["messages"]]` -- histórico primeiro,
+depois EXATAMENTE o que já estava em `state["messages"]` no momento em que
+este middleware rodou (a mensagem nova do lead, e qualquer coisa que um
+`before_model` anterior na cadeia já tenha colocado ali -- não é
+recomputado, é preservado tal como chegou). `add_messages` processa
+`RemoveMessage(id=REMOVE_ALL_MESSAGES)` como instrução especial de reset
+antes de aplicar o resto da lista na ordem dada (ver
+`langgraph.graph.message`), então o resultado final é: histórico legado,
+em ordem cronológica, seguido da mensagem nova -- nunca o contrário.
 """
 
 from __future__ import annotations
@@ -54,8 +83,9 @@ from typing import Any
 import structlog
 from langchain.agents import AgentState
 from langchain.agents.middleware import before_model
-from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage
 from langchain_core.runnables.config import var_child_runnable_config
+from langgraph.graph.message import REMOVE_ALL_MESSAGES
 from langgraph.runtime import Runtime
 from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
@@ -204,6 +234,17 @@ def criar_middleware_historico_legado():
             for papel, conteudo in historico
         ]
         logger.info("historico_legado_injetado", phone=canonico, turnos=len(mensagens))
-        return {"messages": mensagens}
+        # Histórico ANTES do que já está em `state["messages"]` -- nunca
+        # depois. `add_messages` (o reducer) só ANEXA; sem o
+        # `RemoveMessage(id=REMOVE_ALL_MESSAGES)` a lista devolvida aqui
+        # entraria DEPOIS da mensagem nova do lead, invertendo a conversa
+        # inteira (ver FIX ROUND 2 no docstring do módulo).
+        return {
+            "messages": [
+                RemoveMessage(id=REMOVE_ALL_MESSAGES),
+                *mensagens,
+                *state["messages"],
+            ]
+        }
 
     return historico_legado

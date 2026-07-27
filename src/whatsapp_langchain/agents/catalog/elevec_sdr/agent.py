@@ -77,14 +77,19 @@ def build_graph(
     # Middleware de contexto baseado em CONTEXT_STRATEGY + histórico legado do
     # Supabase (Fase 4, Task 5) + o contexto do lead, que reinterpola
     # {nome}/{origem}/{telefone}/{data_hoje} a cada chamada ao modelo (ver
-    # contexto.py). Ordem importa: trim/summarize entram ANTES do histórico
-    # legado -- no primeiro turno de uma thread nova o `state` só tem a
-    # mensagem que acabou de chegar, então trim não corta nada; ele roda
-    # DEPOIS que o histórico legado já injetou os até 12 turnos, e passa a
-    # tratá-los como qualquer outro turno anterior a partir da segunda
-    # mensagem em diante. `criar_middleware_contexto` é `@dynamic_prompt`
-    # (outra camada, não concorre por posição no encadeamento de
-    # `before_model`).
+    # contexto.py). Ordem importa, e os `@before_model` desta lista RODAM NA
+    # ORDEM EM QUE APARECEM AQUI (confirmado com um probe de dois
+    # `@before_model` reais) -- trim/summarize primeiro, histórico legado
+    # depois. No turno 1 de uma thread nova isso não muda nada na prática:
+    # quando o trim roda, `state["messages"]` só tem a mensagem que acabou
+    # de chegar (nada para cortar); o histórico legado roda em seguida e
+    # injeta os até 12 turnos ANTES dela (ver FIX ROUND 2 em
+    # `historico_legado.py` -- o middleware reordena o próprio state,
+    # não depende de rodar antes ou depois do trim para isso). A partir do
+    # turno 2, o histórico já injetado faz parte do state persistido no
+    # checkpoint, e o trim passa a tratá-lo como qualquer turno anterior,
+    # normalmente. `criar_middleware_contexto` é `@dynamic_prompt` (outra
+    # camada, não concorre por posição no encadeamento de `before_model`).
     middleware = [
         *get_context_middleware(),
         criar_middleware_historico_legado(),

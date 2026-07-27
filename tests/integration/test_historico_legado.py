@@ -20,11 +20,23 @@ Isso evita depender de uma chamada real ao modelo para testar a decisão de
 injetar -- o `runtime` nunca é lido pelo middleware, só o `ContextVar` e o
 Postgres.
 
-`test_marca_sobrevive_a_falha_no_meio_do_turno` é a exceção: end-to-end,
-via `create_agent` + `AsyncPostgresSaver` reais, com um modelo falso que
-levanta exceção -- é o único jeito de provar a alegação central da task
-("a marca protege contra reinjeção mesmo quando o turno falha depois dela
-ser gravada") sem confiar só na leitura direta da tabela.
+`test_marca_sobrevive_a_falha_no_meio_do_turno` e
+`test_modelo_recebe_historico_antes_da_mensagem_nova` são a exceção:
+end-to-end, via `create_agent` + `AsyncPostgresSaver` reais -- são o único
+jeito de provar, respectivamente, que a marca protege contra reinjeção
+quando o turno falha DEPOIS dela ser gravada, e que o MODELO (não só o
+dict que o middleware devolve, não só o checkpoint depois de mesclado) de
+fato recebe o histórico ANTES da mensagem nova.
+
+FIX ROUND 2 -- o Crítico que motivou `test_modelo_recebe_historico_antes_
+da_mensagem_nova`: `test_injeta_historico_no_primeiro_turno_sem_checkpoint`
+inspecionava só o DICT devolvido pelo middleware, nunca o `state` depois do
+merge pelo reducer `add_messages` (que ANEXA, não insere na posição que o
+dict sugere). Isso escondeu que a primeira versão do middleware devolvia
+`{"messages": mensagens}` sem o `RemoveMessage(id=REMOVE_ALL_MESSAGES)` na
+frente -- o histórico entrava DEPOIS da mensagem nova do lead, não antes.
+Toda a fronteira de teste deste arquivo estava do lado de cá do reducer;
+os dois testes abaixo passam por ele.
 """
 
 from __future__ import annotations
@@ -32,6 +44,7 @@ from __future__ import annotations
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.runnables.config import var_child_runnable_config
+from langgraph.graph.message import add_messages
 
 from whatsapp_langchain.agents.middleware.historico_legado import (
     criar_middleware_historico_legado,
@@ -135,11 +148,11 @@ def _mw():
     return criar_middleware_historico_legado()
 
 
-async def _rodar(canonico: str):
+async def _rodar(canonico: str, mensagem_nova: HumanMessage | None = None):
     token = var_child_runnable_config.set(_configurable(canonico))
     try:
         return await _mw().abefore_model(
-            {"messages": [HumanMessage(content="oi")]}, None
+            {"messages": [mensagem_nova or HumanMessage(content="oi")]}, None
         )
     finally:
         var_child_runnable_config.reset(token)
@@ -149,20 +162,32 @@ async def _rodar(canonico: str):
 
 
 async def test_injeta_historico_no_primeiro_turno_sem_checkpoint():
+    """A fronteira certa: aplica o reducer `add_messages` real sobre o
+    dict devolvido -- é o que o LangGraph faz de verdade para produzir o
+    `state` final. Checar só `resultado["messages"]` cru (a versão
+    anterior deste teste) não pega a inversão de ordem -- ver FIX ROUND 2
+    no cabeçalho do módulo."""
     await _criar_lead(_P1)
     await _gravar_historico(
         _P1, [("human", "Oi, quero saber mais"), ("ai", "Oi! Qual seu momento?")]
     )
+    mensagem_nova = HumanMessage(content="Pode ser amanhã às 15h?")
 
-    resultado = await _rodar(_P1)
+    resultado = await _rodar(_P1, mensagem_nova=mensagem_nova)
 
     assert resultado is not None
-    mensagens = resultado["messages"]
-    assert len(mensagens) == 2
-    assert isinstance(mensagens[0], HumanMessage)
-    assert mensagens[0].content == "Oi, quero saber mais"
-    assert isinstance(mensagens[1], AIMessage)
-    assert mensagens[1].content == "Oi! Qual seu momento?"
+    final = add_messages([mensagem_nova], resultado["messages"])
+
+    assert [type(m).__name__ for m in final] == [
+        "HumanMessage",
+        "AIMessage",
+        "HumanMessage",
+    ]
+    assert final[0].content == "Oi, quero saber mais"
+    assert final[1].content == "Oi! Qual seu momento?"
+    # a mensagem NOVA do lead continua por último -- é a resposta que o
+    # modelo precisa dar, não uma fala antiga da Renata para continuar.
+    assert final[2].content == "Pode ser amanhã às 15h?"
     assert await _metadata_marcado(_P1)
 
 
@@ -287,5 +312,104 @@ async def test_marca_sobrevive_a_falha_no_meio_do_turno():
     # que é o que o worker faria numa nova tentativa.
     resultado_retry = await _rodar(canonico)
     assert resultado_retry is None
+
+    await stack.aclose()
+
+
+# --- O que o MODELO recebe, na ordem (Fix round 2) --------------------------
+
+
+class _ModeloCapturaMensagens:
+    """Fake model que GRAVA a lista de mensagens de cada chamada -- é o
+    único jeito de provar o que o modelo de fato recebe. Inspecionar o
+    dict que o middleware devolve, ou o `state` no checkpoint depois do
+    turno, não pega uma inversão de ordem que só existe ENTRE essas duas
+    coisas (no merge do reducer) -- foi exatamente esse ponto cego que
+    deixou passar o Crítico do fix round 2."""
+
+    def __init__(self):
+        self.chamadas: list[list] = []
+
+    def bind_tools(self, *args, **kwargs):
+        return self
+
+    def bind(self, *args, **kwargs):
+        return self
+
+    async def ainvoke(self, messages, *args, **kwargs):
+        self.chamadas.append(list(messages))
+        return AIMessage(content='{"messages": ["resposta simulada"]}')
+
+    def invoke(self, messages, *args, **kwargs):
+        self.chamadas.append(list(messages))
+        return AIMessage(content='{"messages": ["resposta simulada"]}')
+
+
+async def test_modelo_recebe_historico_antes_da_mensagem_nova():
+    """Ponta a ponta com `create_agent` real: roda o grafo inteiro e
+    inspeciona a lista de mensagens que o MODELO recebeu na chamada -- não
+    o dict devolvido pelo middleware, não o state pós-turno. É a fronteira
+    que faltava (apontada no fix round 2): sem ela, uma inversão de ordem
+    introduzida entre o middleware e o merge do reducer passa por todos os
+    testes que só olham um lado ou outro dessa fronteira."""
+    from langchain.agents import create_agent
+
+    canonico = _P1
+    await _criar_lead(canonico)
+    await _gravar_historico(
+        canonico,
+        [
+            ("human", "Oi, vi o anúncio"),
+            ("ai", "Oi, Diego! Qual seu momento de carreira?"),
+            ("human", "Faturo 30 mil por mês"),
+            ("ai", "Posso te chamar de Diego mesmo?"),
+        ],
+    )
+
+    stack, checkpointer = await open_checkpointer()
+    await checkpointer.setup()
+
+    modelo = _ModeloCapturaMensagens()
+    agent = create_agent(
+        model=modelo,
+        tools=[],
+        system_prompt="SOP da Renata",
+        middleware=[criar_middleware_historico_legado()],
+        checkpointer=checkpointer,
+    )
+
+    mensagem_nova = HumanMessage(content="Pode ser amanhã às 15h?")
+    config = {
+        "configurable": {
+            "thread_id": _thread_id(canonico),
+            "user_id": f"+{canonico}",
+        }
+    }
+
+    await agent.ainvoke({"messages": [mensagem_nova]}, config=config)
+
+    assert len(modelo.chamadas) == 1
+    recebidas = modelo.chamadas[0]
+
+    conteudos = [getattr(m, "content", None) for m in recebidas]
+    tipos = [type(m).__name__ for m in recebidas]
+
+    # SystemMessage (SOP) + os 4 turnos legados, em ordem cronológica +
+    # a mensagem NOVA do lead por ÚLTIMO -- nunca uma fala antiga da
+    # Renata por último (que seria lida como prefill pelo modelo).
+    assert tipos == [
+        "SystemMessage",
+        "HumanMessage",
+        "AIMessage",
+        "HumanMessage",
+        "AIMessage",
+        "HumanMessage",
+    ]
+    assert conteudos[1] == "Oi, vi o anúncio"
+    assert conteudos[2] == "Oi, Diego! Qual seu momento de carreira?"
+    assert conteudos[3] == "Faturo 30 mil por mês"
+    assert conteudos[4] == "Posso te chamar de Diego mesmo?"
+    assert conteudos[-1] == "Pode ser amanhã às 15h?"
+    assert tipos[-1] == "HumanMessage"
 
     await stack.aclose()

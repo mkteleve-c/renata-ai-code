@@ -971,15 +971,18 @@ def test_validar_fases_nao_retrocederam_aborta_quando_persistido_e_menor():
 # origem (via MCP do Supabase, base real -- fix round 1, ver
 # `docs/evidencias/formato-historico-n8n.md`): `human` (3.316 linhas) nunca
 # tem `content` em JSON; `ai` (4.460 linhas) tem 3.316 com `content` que
-# PARECE JSON e 1.144 sem (4460-3316 = 1144, exatamente a contagem de
-# `tool`). Dos 3.316 `ai` com `content` JSON, 100% têm a forma
-# `{"output": {"messages": [...]}}` -- ANINHADA sob `output`, não
+# PARECE JSON e 1.144 sem. Dos 3.316 `ai` com `content` JSON, 100% têm a
+# forma `{"output": {"messages": [...]}}` -- ANINHADA sob `output`, não
 # `{"messages": [...]}` no topo (a primeira versão deste módulo assumia o
-# topo, sem medir; corrigido no fix round 1). Os 1.144 `ai` sem JSON são
-# TEXTO PURO (ex.: `Calling update_crm1 with input: {...}`), nunca
-# `tool_calls` em `additional_kwargs` -- 0 das 8.920 linhas da base tem essa
-# chave. Os fixtures abaixo reproduzem essa forma exata, não uma
-# aproximação.
+# topo, sem medir; corrigido no fix round 1). Dos 1.144 `ai` sem `content`
+# JSON, **1.137** são TEXTO PURO (ex.: `Calling update_crm1 with input:
+# {...}`) e **7** têm `content` igual a `[]` -- um array JSON, não uma
+# string (decomposição corrigida no fix round 2 -- a primeira versão desta
+# nota dizia "todos texto puro", que não era o que a base tinha). Os dois
+# grupos são descartados pelo MESMO teste (`content` não é `str`), então o
+# resultado da migração não muda -- só a decomposição estava errada. Nenhuma
+# das 8.920 linhas da base tem `tool_calls` em `additional_kwargs`. Os
+# fixtures abaixo reproduzem essas formas exatas, não uma aproximação.
 
 
 def _msg_human(texto: str) -> dict:
@@ -1056,6 +1059,21 @@ def test_extrair_turno_de_conversa_descarta_ai_de_chamada_de_tool():
     """`content` vazio (ou qualquer texto que não parseie como JSON) é
     pedido de chamada de ferramenta, não resposta final -- nunca entra."""
     assert extrair_turno_de_conversa(_msg_ai_tool_call()) is None
+
+
+def test_extrair_turno_de_conversa_descarta_ai_com_content_lista():
+    """7 das 1.144 linhas `ai` sem resposta final têm `content` igual a
+    `[]` -- um array JSON dentro do JSONB, não uma string (achado do fix
+    round 2). `isinstance(bruto, str)` descarta antes de tentar
+    `json.loads`, que quebraria com `TypeError` numa lista."""
+    mensagem = {
+        "type": "ai",
+        "content": [],
+        "additional_kwargs": {},
+        "response_metadata": {},
+    }
+
+    assert extrair_turno_de_conversa(mensagem) is None
 
 
 def test_extrair_turno_de_conversa_descarta_ai_com_texto_puro_nao_json():
@@ -1255,3 +1273,36 @@ def test_montar_historico_sessao_so_com_ruido_nao_aparece():
     resultado = montar_historico_por_sessao(linhas)
 
     assert resultado == {}
+
+
+@pytest.mark.parametrize("janela_invalida", [0, -1, -12])
+def test_montar_historico_janela_zero_ou_negativa_nao_devolve_nada(janela_invalida):
+    """`janela <= 0` significa "nada cabe" -- fix round 2. A versão
+    anterior tratava isso como "sem limite" (devolvia TUDO), o oposto do
+    que o parâmetro sugere."""
+    linhas = [
+        _linha_hist(1, "5511987654321", _msg_human("m1")),
+        _linha_hist(2, "5511987654321", _msg_ai_final(["r1"])),
+    ]
+
+    resultado = montar_historico_por_sessao(linhas, janela=janela_invalida)
+
+    assert resultado["551187654321"] == []
+
+
+def test_montar_historico_default_da_janela_e_12():
+    """Fixa o DEFAULT do parâmetro `janela` contra mutação -- 185 das 736
+    sessões reais têm mais de 12 turnos, então o default é carga real, não
+    decoração (medido pelo revisor). 13 turnos reais para uma sessão;
+    chamando SEM passar `janela`, o resultado tem que manter exatamente os
+    12 mais recentes (descartando só o mais antigo)."""
+    linhas = [
+        _linha_hist(i, "5511987654321", _msg_human(f"m{i}")) for i in range(1, 14)
+    ]
+
+    resultado = montar_historico_por_sessao(linhas)
+
+    turnos = resultado["551187654321"]
+    assert len(turnos) == 12
+    assert turnos[0] == ("human", "m2")
+    assert turnos[-1] == ("human", "m13")
