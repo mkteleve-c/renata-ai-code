@@ -29,6 +29,9 @@ from whatsapp_langchain.agents.catalog.elevec_sdr.tools.agenda import (
     calendar_update,
     formatar_disponibilidade,
 )
+from whatsapp_langchain.agents.catalog.elevec_sdr.tools.interno import (
+    PREFIXO_INTERNO,
+)
 from whatsapp_langchain.shared.google_calendar import (
     FUSO,
     GoogleCalendarError,
@@ -118,13 +121,17 @@ class ClienteFalso:
             }
         )
         # O cliente real garante que o `id` sempre volta, e devolve o corpo
-        # do evento — com `start` e `status`, que é o que a conferência lê.
+        # do evento — com `start` e `status`, que é o que a conferência lê,
+        # e com `attendees`, que é o que prova que o convite saiu (o
+        # `events.insert` responde com o Event criado, participantes
+        # incluídos). Ver `convite_para`.
         return {
             "id": novo,
             "status": "confirmed",
             "summary": summary,
             "start": {"dateTime": inicio.isoformat()},
             "end": {"dateTime": fim.isoformat()},
+            "attendees": [{"email": email} for email in (participantes or [])],
             "htmlLink": "https://cal/x",
         }
 
@@ -701,6 +708,108 @@ async def test_agendar_recria_quando_a_fonte_diz_que_o_evento_esta_cancelado(
     assert ambiente.cliente.criados[0]["event_id"] is None
 
 
+async def test_agendar_so_promete_convite_quando_o_evento_lista_o_lead(turno, ambiente):
+    """Caminho normal: o insert saiu, com `attendees` — o convite foi.
+
+    O par negativo é `test_409_que_confere_nao_promete_convite`: lá o
+    `events.insert` não chega a acontecer, e a mesma frase seria mentira.
+    """
+    saida = await calendar_agendar.ainvoke({"inicio": "2026-02-12T13:00"})
+
+    assert "Convite enviado para ana@exemplo.com" in saida
+    assert not saida.startswith(PREFIXO_INTERNO)
+    assert "ATENÇÃO" not in saida
+
+
+async def test_409_que_confere_nao_promete_convite(turno, ambiente):
+    """409 resolvido lendo o evento: nada foi inserido, nenhum convite saiu.
+
+    O cliente devolve o evento pré-existente, criado em outro turno e com
+    os participantes que ELE tinha. Antes desta rodada a tool dizia
+    "Convite enviado para ana@exemplo.com" — uma frase que o lead confere
+    na caixa de entrada e não encontra.
+    """
+    momento = datetime(2026, 2, 12, 13, 0, tzinfo=FUSO)
+    colidido = agenda.event_id_deterministico(TELEFONE, momento)
+    ambiente.cliente.conflitos[colidido] = _conflito(
+        colidido, "2026-02-12T13:00:00-03:00", "2026-02-12T14:00:00-03:00"
+    )
+
+    saida = await calendar_agendar.ainvoke({"inicio": "2026-02-12T13:00"})
+
+    # O agendamento vale: o evento está lá, no horário certo.
+    assert ambiente.cliente.criados == []
+    assert ambiente.gravacoes[0]["google_event_id"] == colidido
+    assert "12/02" in saida
+    # Mas o convite não foi prometido.
+    assert "Convite enviado" not in saida
+    assert "convite" in saida.lower()
+    assert saida.startswith(PREFIXO_INTERNO)
+
+
+async def test_409_com_lead_nos_attendees_confirma_o_convite(turno, ambiente):
+    """O evento pré-existente já tem o lead: o convite chegou lá atrás."""
+    momento = datetime(2026, 2, 12, 13, 0, tzinfo=FUSO)
+    colidido = agenda.event_id_deterministico(TELEFONE, momento)
+    corpo = _conflito(
+        colidido, "2026-02-12T13:00:00-03:00", "2026-02-12T14:00:00-03:00"
+    )
+    corpo["attendees"] = [{"email": "ANA@Exemplo.com"}]
+    ambiente.cliente.conflitos[colidido] = corpo
+
+    saida = await calendar_agendar.ainvoke({"inicio": "2026-02-12T13:00"})
+
+    assert "Convite enviado para ana@exemplo.com" in saida
+    assert not saida.startswith(PREFIXO_INTERNO)
+
+
+async def test_409_com_evento_vivo_em_outro_horario_avisa_do_orfao(turno, ambiente):
+    """O colidido VIVO fica na agenda do Silvio, e ninguém mais o alcança.
+
+    Recriar com id novo resolve a mentira do horário, mas o evento antigo
+    continua marcado — e o cadastro passa a apontar para o novo, então nem
+    `calendar_delete` chega nele. Sem este aviso, uma reunião fantasma fica
+    na agenda de uma pessoa real e a resposta ao lead é "Agendado" liso.
+    """
+    momento = datetime(2026, 2, 12, 13, 0, tzinfo=FUSO)
+    colidido = agenda.event_id_deterministico(TELEFONE, momento)
+    ambiente.cliente.conflitos[colidido] = _conflito(
+        colidido, "2026-02-20T10:00:00-03:00", "2026-02-20T11:00:00-03:00"
+    )
+
+    saida = await calendar_agendar.ainvoke({"inicio": "2026-02-12T13:00"})
+
+    assert ambiente.gravacoes[0]["google_event_id"] != colidido
+    assert "12/02" in saida
+    assert "human_handover" in saida
+    assert saida.startswith(PREFIXO_INTERNO)
+
+
+async def test_409_com_evento_cancelado_nao_avisa_de_orfao(turno, ambiente):
+    """Lixeira não deixa órfão: o colidido já não existe na agenda.
+
+    O par do teste acima. Avisar aqui mandaria alguém procurar um evento
+    que não está lá — o aviso perde valor se dispara nos dois casos.
+    """
+    momento = datetime(2026, 2, 12, 13, 0, tzinfo=FUSO)
+    colidido = agenda.event_id_deterministico(TELEFONE, momento)
+    ambiente.cliente.conflitos[colidido] = _conflito(
+        colidido,
+        "2026-02-12T13:00:00-03:00",
+        "2026-02-12T14:00:00-03:00",
+        status="cancelled",
+    )
+
+    saida = await calendar_agendar.ainvoke({"inicio": "2026-02-12T13:00"})
+
+    assert "12/02" in saida
+    assert "órfão" not in saida.lower()
+    assert "duplicado" not in saida.lower()
+    # Recriou com id aleatório e o insert levou os attendees.
+    assert "Convite enviado para ana@exemplo.com" in saida
+    assert "human_handover" not in saida
+
+
 async def test_agendar_recusa_lead_que_ja_tem_consultoria_marcada(turno, ambiente):
     # Marcar um segundo evento deixaria o primeiro órfão — o cadastro só
     # guarda um id — e o lead com duas consultorias.
@@ -971,3 +1080,88 @@ async def test_sem_credencial_configurada_devolve_mensagem(turno, monkeypatch):
     monkeypatch.setattr(agenda, "obter_cliente", sem_credencial)
     saida = await calendar_get_many.ainvoke({"periodo": "tarde"})
     assert "não consegui" in saida.lower()
+
+
+# --- Marcador [sistema] -----------------------------------------------------
+
+# Vocabulário que não existe para o lead. A Renata fala de "horário",
+# "convite" e "reunião"; "human_handover", "event_id" e "cadastro" são
+# processo interno, e o lead da EleveC recebendo qualquer um deles pelo
+# WhatsApp é vazamento.
+VOCABULARIO_INTERNO = (
+    "human_handover",
+    "calendar_agendar",
+    "calendar_update",
+    "calendar_delete",
+    "event_id",
+    "cadastro",
+    "Pipedrive",
+    # As recusas de portão mandam o agente VOLTAR a uma fase do SOP. É
+    # instrução de roteiro, não fato — um lead lendo "volte à Fase 6" vê o
+    # processo interno da EleveC.
+    "volte à Fase",
+)
+
+
+def _saidas_de_agenda() -> list[tuple[str, str]]:
+    """`(origem, texto)` de toda string de saída fixa do módulo."""
+    saidas = [("FALHA_AGENDA", agenda.FALHA_AGENDA)]
+    saidas += [
+        (f"SEM_EVENTO_GRAVADO[{k}]", v) for k, v in agenda.SEM_EVENTO_GRAVADO.items()
+    ]
+    return saidas
+
+
+@pytest.mark.parametrize("origem, texto", _saidas_de_agenda())
+def test_saida_fixa_com_vocabulario_interno_vem_marcada(origem, texto):
+    """A regra do prompt é sobre o prefixo, não sobre uma lista de frases.
+
+    Quem escrever uma frase nova citando `human_handover` sem marcá-la
+    reabre o vazamento em silêncio — este teste é o que faz isso doer.
+    """
+    if any(termo in texto for termo in VOCABULARIO_INTERNO):
+        assert texto.startswith(PREFIXO_INTERNO), origem
+
+
+async def test_nenhum_desfecho_de_agendar_vaza_vocabulario_interno(turno, ambiente):
+    """Varre os desfechos de `calendar_agendar` que produzem texto interno."""
+    momento = datetime(2026, 2, 12, 13, 0, tzinfo=FUSO)
+    colidido = agenda.event_id_deterministico(TELEFONE, momento)
+
+    cenarios: dict[str, Any] = {}
+
+    # Órfão pós-409.
+    ambiente.cliente.conflitos[colidido] = _conflito(
+        colidido, "2026-02-20T10:00:00-03:00", "2026-02-20T11:00:00-03:00"
+    )
+    cenarios["orfao"] = await calendar_agendar.ainvoke({"inicio": "2026-02-12T13:00"})
+    ambiente.cliente.conflitos.clear()
+    ambiente.lead = lead()
+
+    # Vínculo não gravado.
+    ambiente.gravacao_ok = False
+    cenarios["sem_vinculo"] = await calendar_agendar.ainvoke(
+        {"inicio": "2026-02-12T13:00"}
+    )
+    ambiente.gravacao_ok = True
+
+    # Agenda fora do ar.
+    ambiente.cliente.erro = GoogleCalendarError(500, "boom")
+    cenarios["agenda_fora"] = await calendar_agendar.ainvoke(
+        {"inicio": "2026-02-12T13:00"}
+    )
+    ambiente.cliente.erro = None
+
+    # Portões de e-mail e faturamento.
+    ambiente.lead = lead(email=None)
+    cenarios["sem_email"] = await calendar_agendar.ainvoke(
+        {"inicio": "2026-02-12T13:00"}
+    )
+    ambiente.lead = lead(faturamento_mensal="")
+    cenarios["sem_faturamento"] = await calendar_agendar.ainvoke(
+        {"inicio": "2026-02-12T13:00"}
+    )
+
+    for nome, saida in cenarios.items():
+        if any(termo in saida for termo in VOCABULARIO_INTERNO):
+            assert saida.startswith(PREFIXO_INTERNO), nome

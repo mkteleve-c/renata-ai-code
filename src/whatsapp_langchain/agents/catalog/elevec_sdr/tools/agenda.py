@@ -48,9 +48,25 @@ confirma o agendamento (ele existe) e manda acionar `human_handover`, com o
 id no log para reconciliação. O id do evento é derivado de `(lead, slot)`
 justamente para sobreviver a isso — ver `event_id_deterministico`.
 
+**"Convite enviado" é conferido, não deduzido.** O convite sai do
+`events.insert` com `sendUpdates=all` e `attendees` — e o caminho do `409`
+não insere nada: o cliente resolve o conflito lendo o evento existente,
+criado em outro turno, com os participantes que ELE tinha. Por isso a
+confirmação consulta `attendees` antes de prometer o e-mail (`convite_para`).
+
+**Órfão pós-409 sai na resposta, não só no log.** Quando a conferência
+reprova por horário divergente, o evento colidido está **vivo** na agenda
+do Silvio; recriar com id novo resolve a mentira do horário e deixa o
+antigo lá, agora fora do alcance do `calendar_delete` (o cadastro passa a
+apontar para o novo). Sem aviso, isso é reunião fantasma na agenda de uma
+pessoa real e "Agendado" liso para o lead.
+
 Toda tool devolve **string** em qualquer desfecho, inclusive erro. Exceção
 que sobe de uma tool derruba o turno do agente; uma frase deixa a Renata
-seguir o SOP ("tente 3x, depois human_handover").
+seguir o SOP ("tente 3x, depois human_handover"). As strings que carregam
+vocabulário interno — nome de tool, cadastro, `event_id`, "volte à Fase N"
+— vão marcadas com `[sistema]` (ver `interno.py`); as que são fato para o
+lead, não.
 """
 
 from __future__ import annotations
@@ -58,7 +74,7 @@ from __future__ import annotations
 import hashlib
 import re
 from datetime import date, datetime, timedelta
-from typing import Any
+from typing import Any, NamedTuple
 
 import structlog
 from langchain_core.tools import tool
@@ -72,6 +88,7 @@ from whatsapp_langchain.shared.google_calendar import (
 from whatsapp_langchain.shared.phone import canonico_do_lead
 
 from ..contexto import sanitizar_nome, telefone_do_turno
+from .interno import interno
 
 logger = structlog.get_logger()
 
@@ -107,7 +124,7 @@ DIAS_CURTOS = ("segunda", "terça", "quarta", "quinta", "sexta", "sábado", "dom
 # criaria falso negativo. O que importa é o convite não ir para o vazio.
 _EMAIL = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]{2,}$")
 
-FALHA_AGENDA = (
+FALHA_AGENDA = interno(
     "Não consegui falar com a agenda agora. Tente de novo em instantes; "
     "se persistir, acione o human_handover."
 )
@@ -547,9 +564,34 @@ async def gravar_agendamento(
     return True
 
 
+class Conferencia(NamedTuple):
+    """Desfecho de `evento_confere`.
+
+    `motivo` distingue os dois modos de reprovar, e a diferença tem
+    consequência concreta na agenda do Silvio:
+
+    - `"cancelado"`: o id colidiu com um evento na Lixeira. Recriar não
+      deixa nada para trás — o colidido já não existe.
+    - `"outro_horario"`: o id colidiu com um evento **vivo** em horário
+      diferente do pedido. Recriar deixa esse evento na agenda **sem
+      vínculo nenhum** com o lead (o cadastro guarda um `google_event_id`
+      só, e ele passa a ser o do evento novo). É o órfão, e alguém precisa
+      apagá-lo à mão. Horário ilegível cai aqui de propósito: não saber
+      onde o colidido está é o caso em que mais vale avisar.
+
+    `evento` é o melhor corpo conhecido do evento — o que veio de
+    `criar_evento` ou, quando ele não trazia horário, o que a releitura na
+    fonte devolveu. Quem chama usa para conferir `attendees`.
+    """
+
+    confere: bool
+    motivo: str
+    evento: dict[str, Any]
+
+
 async def evento_confere(
     cliente: Any, criado: Any, event_id: str, momento: datetime
-) -> bool:
+) -> Conferencia:
     """O que voltou de `criar_evento` é mesmo o evento que pedimos?
 
     **Existe por causa do id determinístico.** O `events.insert` responde
@@ -577,19 +619,21 @@ async def evento_confere(
     """
     inicio = None
     status = None
-    if isinstance(criado, dict):
-        inicio = _instante(criado.get("start"))
-        status = criado.get("status")
+    corpo: dict[str, Any] = criado if isinstance(criado, dict) else {}
+    if corpo:
+        inicio = _instante(corpo.get("start"))
+        status = corpo.get("status")
 
     if inicio is None:
         evento = await cliente.obter_evento(event_id)
         if isinstance(evento, dict):
+            corpo = evento
             inicio = _instante(evento.get("start"))
             status = evento.get("status")
 
     if status == "cancelled":
         logger.warning("agenda_id_colidiu_com_evento_cancelado", event_id=event_id)
-        return False
+        return Conferencia(False, "cancelado", corpo)
 
     if inicio != momento:
         logger.warning(
@@ -598,9 +642,46 @@ async def evento_confere(
             pedido=momento.isoformat(),
             encontrado=inicio.isoformat() if inicio else None,
         )
+        return Conferencia(False, "outro_horario", corpo)
+
+    return Conferencia(True, "", corpo)
+
+
+def convite_para(evento: Any, email: str) -> bool:
+    """O evento que voltou lista este e-mail em `attendees`?
+
+    **O convite não é consequência de ter agendado.** Quem manda o e-mail é
+    o `events.insert` com `sendUpdates=all` *e* `attendees` — e existe um
+    caminho, o `409`, em que nenhum dos dois acontece: o id determinístico
+    já existia, o cliente resolve o conflito **lendo** o evento e nada é
+    inserido naquele turno. O evento lido é de uma criação anterior e pode
+    ter outros participantes, ou nenhum. Dizer "convite enviado para
+    fulano@x" ali é uma frase que o lead confere na caixa de entrada e não
+    encontra.
+
+    Conferir `attendees` é o que separa os dois casos sem precisar que o
+    cliente conte qual caminho tomou. Corpo sem `attendees` — o fallback
+    `{"id": ...}` de um 2xx irreconhecível — devolve `False`: falso negativo
+    num caminho raro custa uma frase mais cuidadosa; o falso positivo custa
+    a confiança do lead.
+    """
+    if not isinstance(evento, dict):
         return False
 
-    return True
+    participantes = evento.get("attendees")
+    if not isinstance(participantes, list):
+        return False
+
+    alvo = (email or "").strip().lower()
+    if not alvo:
+        return False
+
+    return any(
+        isinstance(item, dict)
+        and isinstance(item.get("email"), str)
+        and item["email"].strip().lower() == alvo
+        for item in participantes
+    )
 
 
 def event_id_deterministico(telefone: str, inicio: datetime) -> str:
@@ -669,18 +750,18 @@ def _preferir_coluna(gravado: Any, argumento: str, campo: str) -> str:
 # Silvio sem vínculo no cadastro (a gravação falhou, ou alguém marcou à
 # mão), e agendar de novo deixa o órfão lá E cria um segundo.
 SEM_EVENTO_GRAVADO = {
-    "cancelar": (
+    "cancelar": interno(
         "Não encontrei agendamento registrado para este lead, então não tenho "
         "o que cancelar. Se ele diz que tem reunião marcada, pode haver evento "
         "na agenda sem vínculo no cadastro — acione o human_handover em vez de "
         "agendar de novo."
     ),
-    "remarcar": (
+    "remarcar": interno(
         "Não encontrei agendamento registrado para este lead. Se ele confirma "
         "que já tem reunião marcada, acione o human_handover; se não, colete o "
         "horário e agende do zero com calendar_agendar."
     ),
-    "consultar": (
+    "consultar": interno(
         "Não encontrei agendamento registrado para este lead. Se ele afirma "
         "que tem reunião marcada, acione o human_handover."
     ),
@@ -719,7 +800,7 @@ def resolver_event_id(
             informado=informado,
             gravado=gravado,
         )
-        return None, (
+        return None, interno(
             "O event_id informado não é o do agendamento deste lead — não vou "
             "mexer em evento de outra pessoa. Chame de novo sem event_id."
         )
@@ -808,7 +889,7 @@ async def calendar_agendar(
     """
     contexto = await _lead_do_turno()
     if contexto is None:
-        return (
+        return interno(
             "Não consegui identificar o lead nesta conversa e não vou "
             "agendar às cegas. Acione o human_handover."
         )
@@ -817,7 +898,7 @@ async def calendar_agendar(
 
     email_final = _preferir_coluna(lead.get("email"), email, "email")
     if not _EMAIL.match(email_final):
-        return (
+        return interno(
             "Ainda não tenho um e-mail válido deste lead — volte à Fase 6 e "
             "peça o melhor e-mail dele antes de agendar."
         )
@@ -826,7 +907,7 @@ async def calendar_agendar(
         lead.get("faturamento_mensal"), faturamento_mensal, "faturamento_mensal"
     )
     if not faturamento_final:
-        return (
+        return interno(
             "Ainda não tenho o faturamento médio mensal deste lead — volte à "
             "Fase 7 e pergunte antes de agendar."
         )
@@ -858,6 +939,7 @@ async def calendar_agendar(
     # Derivado de (lead, slot): retry não duplica e o id sobrevive à falha
     # de gravação. Ver `event_id_deterministico`.
     id_pretendido = event_id_deterministico(telefone, momento)
+    orfao: str | None = None
 
     try:
         cliente = obter_cliente()
@@ -880,11 +962,27 @@ async def calendar_agendar(
             criado.get("id") if isinstance(criado, dict) else None
         ) or id_pretendido
 
-        if not await evento_confere(cliente, criado, event_id, momento):
+        conferencia = await evento_confere(cliente, criado, event_id, momento)
+        if not conferencia.confere:
             # O id determinístico colidiu com um evento que NÃO é o que
             # acabamos de pedir (lixeira ou slot já reagendado). Recriar com
             # id aleatório é o único caminho que não mente: o id novo é
             # necessariamente livre. Ver `evento_confere`.
+            #
+            # O colidido VIVO não some por recriarmos: ele fica na agenda do
+            # Silvio e o cadastro passa a apontar para o evento novo, então
+            # nem a Renata nem o `calendar_delete` conseguem alcançá-lo
+            # depois. Sai como aviso na confirmação, não só no log — órfão
+            # que ninguém lê vira reunião fantasma na agenda de uma pessoa.
+            if conferencia.motivo != "cancelado":
+                orfao = event_id
+                logger.error(
+                    "agenda_evento_orfao_apos_conflito",
+                    telefone=telefone,
+                    event_id=event_id,
+                    inicio=momento.isoformat(),
+                )
+
             criado = await cliente.criar_evento(
                 summary=TITULO.format(nome=nome),
                 inicio=momento,
@@ -892,16 +990,19 @@ async def calendar_agendar(
                 participantes=[email_final],
             )
             event_id = (criado.get("id") if isinstance(criado, dict) else "") or ""
-            if not event_id or not await evento_confere(
-                cliente, criado, event_id, momento
-            ):
+            conferencia = (
+                await evento_confere(cliente, criado, event_id, momento)
+                if event_id
+                else Conferencia(False, "sem_id", {})
+            )
+            if not conferencia.confere:
                 logger.error(
                     "agenda_nao_confirmou_evento",
                     telefone=telefone,
                     inicio=momento.isoformat(),
                     event_id=event_id or None,
                 )
-                return (
+                return interno(
                     "Não consegui confirmar a criação do evento na agenda — "
                     "NÃO diga ao lead que está agendado. Tente de novo; se "
                     "persistir, acione o human_handover."
@@ -917,9 +1018,33 @@ async def calendar_agendar(
         faturamento_mensal=faturamento_final,
     )
 
-    confirmacao = (
-        f"Agendado: {formatar_slot(momento)}. Convite enviado para {email_final}."
-    )
+    # O convite só sai do `events.insert`; no caminho 409 nada é inserido.
+    # Ver `convite_para`.
+    convite = convite_para(conferencia.evento, email_final)
+
+    confirmacao = f"Agendado: {formatar_slot(momento)}."
+    avisos: list[str] = []
+
+    if convite:
+        confirmacao += f" Convite enviado para {email_final}."
+    else:
+        logger.warning(
+            "agenda_convite_nao_confirmado",
+            telefone=telefone,
+            google_event_id=event_id,
+        )
+        avisos.append(
+            "não confirmei que o convite saiu para o e-mail do lead — "
+            "confirme o horário com ele, mas NÃO afirme que o convite já "
+            "foi enviado; peça que avise se não receber."
+        )
+
+    if orfao:
+        avisos.append(
+            "sobrou na agenda um evento antigo deste horário, agora sem "
+            "vínculo com o lead e fora do alcance do calendar_delete — "
+            "acione o human_handover para que alguém apague o duplicado."
+        )
 
     if not gravou:
         # O evento EXISTE na agenda — negar isso ao lead seria mentira na
@@ -931,10 +1056,16 @@ async def calendar_agendar(
             google_event_id=event_id,
             inicio=momento.isoformat(),
         )
-        return (
-            f"{confirmacao} ATENÇÃO: não consegui registrar o agendamento no "
-            "cadastro do lead — acione o human_handover para registro manual."
+        avisos.append(
+            "não consegui registrar o agendamento no cadastro do lead — "
+            "acione o human_handover para registro manual."
         )
+
+    if avisos:
+        # Marcado: o desfecho continua sendo "agendado", mas o texto passou a
+        # carregar instrução de processo. Sem o marcador, "acione o
+        # human_handover" chega ao lead junto da confirmação.
+        return interno(f"{confirmacao} ATENÇÃO: {' '.join(avisos)}")
 
     logger.info(
         "agenda_evento_agendado",
@@ -958,7 +1089,7 @@ async def calendar_update(novo_inicio: str, event_id: str = "") -> str:
     """
     contexto = await _lead_do_turno()
     if contexto is None:
-        return "Não consegui identificar o lead nesta conversa."
+        return interno("Não consegui identificar o lead nesta conversa.")
     telefone, lead = contexto
     lead = lead or {}
 
@@ -1004,7 +1135,7 @@ async def calendar_delete(event_id: str = "") -> str:
     """
     contexto = await _lead_do_turno()
     if contexto is None:
-        return "Não consegui identificar o lead nesta conversa."
+        return interno("Não consegui identificar o lead nesta conversa.")
     telefone, lead = contexto
     lead = lead or {}
 
@@ -1024,7 +1155,7 @@ async def calendar_delete(event_id: str = "") -> str:
         logger.error(
             "agenda_vinculo_nao_apagado", telefone=telefone, google_event_id=alvo
         )
-        return (
+        return interno(
             "Cancelado na agenda. ATENÇÃO: não consegui limpar o registro no "
             "cadastro do lead — acione o human_handover."
         )
@@ -1041,7 +1172,7 @@ async def calendar_get_event(event_id: str = "") -> str:
     """
     contexto = await _lead_do_turno()
     if contexto is None:
-        return "Não consegui identificar o lead nesta conversa."
+        return interno("Não consegui identificar o lead nesta conversa.")
     _telefone, lead = contexto
     lead = lead or {}
 

@@ -710,12 +710,15 @@ async def test_email_gravado_pelo_update_crm_vence_o_argumento_do_agendar(
             # Corpo realista: o cliente devolve o evento com `start` e
             # `status`, e `calendar_agendar` confere os dois antes de
             # confirmar (o insert pode ter batido em 409 e devolvido um
-            # evento cancelado ou de outro horário).
+            # evento cancelado ou de outro horário). `attendees` volta
+            # porque o Event criado os traz — é o que prova que o convite
+            # saiu de verdade neste turno (ver `agenda.convite_para`).
             return {
                 "id": event_id,
                 "status": "confirmed",
                 "start": {"dateTime": inicio.isoformat()},
                 "end": {"dateTime": fim.isoformat()},
+                "attendees": [{"email": email} for email in self.participantes],
             }
 
     falsa = AgendaFalsa()
