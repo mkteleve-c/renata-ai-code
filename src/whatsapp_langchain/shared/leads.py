@@ -359,6 +359,14 @@ async def aplicar_gate(
             return ResultadoGate(False, "from_me", canonico)
 
         if lead_view and lead_view["agent_active"] is False:
+            # last_inbound_at é fato sobre a Meta, não sobre o nosso funil: o
+            # lead falou, mesmo que o gate recuse por handover humano. Sem
+            # isto, o relógio não anda durante a pausa e o lead pode voltar
+            # inalcançável pela régua com a janela real aberta.
+            await cur.execute(
+                "update leads_crm set last_inbound_at = now() where phone in (%s, %s)",
+                (com_9, sem_9),
+            )
             logger.info("gate_descartado", motivo="agente_desligado", telefone=canonico)
             return ResultadoGate(False, "agente_desligado", canonico, lead_view)
 
@@ -374,6 +382,7 @@ async def aplicar_gate(
                 "update leads_crm set "
                 "  phone = %s,"
                 "  last_interaction_at = now(),"
+                "  last_inbound_at = now(),"
                 "  followup_count = 0,"
                 "  followup_active = true,"
                 "  name = coalesce(nullif(%s, ''), name),"
@@ -385,8 +394,10 @@ async def aplicar_gate(
             )
         else:
             await cur.execute(
-                "insert into leads_crm (phone, name, source, phase) "
-                "values (%s, nullif(%s, ''), 'whatsapp_direct', 'iniciou_conversa') "
+                "insert into leads_crm"
+                "  (phone, name, source, phase, last_inbound_at) "
+                "values (%s, nullif(%s, ''), 'whatsapp_direct',"
+                "        'iniciou_conversa', now()) "
                 "returning *",
                 (sem_9, push_name or ""),
             )

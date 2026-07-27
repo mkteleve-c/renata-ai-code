@@ -548,3 +548,61 @@ async def test_concorrencia_lead_legado_nao_perde_atualizacao(limpar):
 
     assert total == 1
     assert canonica is not None, "a linha sobrevivente precisa estar na forma canônica"
+
+
+async def _minutos_desde_inbound(phone: str) -> float:
+    pool = await get_pool()
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            "select extract(epoch from now() - last_inbound_at) / 60 "
+            "from leads_crm where phone = %s",
+            (phone,),
+        )
+        (minutos,) = await cur.fetchone()
+    return minutos
+
+
+async def test_gate_grava_last_inbound_at(lead_factory):
+    await lead_factory("5511987654321", minutos_desde_inbound=180)
+
+    resultado = await aplicar_gate(
+        await get_pool(),
+        key={"remoteJid": "5511987654321@s.whatsapp.net", "fromMe": False},
+        push_name="Fulano",
+    )
+    assert resultado.aceito
+    assert resultado.canonico is not None
+    # O UPDATE do caminho aceito canonicaliza phone para a forma sem o 9º
+    # dígito — a linha criada por lead_factory com o telefone "cheio" deixa
+    # de existir sob essa chave, por isso a checagem usa r.canonico.
+    assert await _minutos_desde_inbound(resultado.canonico) < 1
+
+
+async def test_inbound_de_lead_pausado_ainda_move_a_janela(lead_factory):
+    """A janela é fato sobre a Meta, não sobre o nosso funil.
+
+    Sem isto, tudo que o lead escreve durante o handover humano não conta, e na
+    retomada ele pode estar inalcançável pela régua com a janela real aberta.
+    """
+    await lead_factory("5511987654322", agent_active=False, minutos_desde_inbound=180)
+
+    resultado = await aplicar_gate(
+        await get_pool(),
+        key={"remoteJid": "5511987654322@s.whatsapp.net", "fromMe": False},
+        push_name="Fulano",
+    )
+    assert not resultado.aceito
+    assert resultado.motivo == "agente_desligado"
+    assert await _minutos_desde_inbound("5511987654322") < 1
+
+
+async def test_mensagem_nossa_nao_move_a_janela(lead_factory):
+    """fromMe somos nós — não abre janela nenhuma."""
+    await lead_factory("5511987654323", minutos_desde_inbound=180)
+
+    await aplicar_gate(
+        await get_pool(),
+        key={"remoteJid": "5511987654323@s.whatsapp.net", "fromMe": True},
+        push_name="Fulano",
+    )
+    assert await _minutos_desde_inbound("5511987654323") > 170
