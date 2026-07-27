@@ -638,6 +638,80 @@ registrados para não serem reinvestigados:
   casam exatamente com uma linha de `leads_crm`, e 735 já estão no formato
   canônico de 12 dígitos.
 
+## A porta de entrada: template e segmentação
+
+Levantado em 26/07/2026, depois do desenho original. **Muda o papel da Renata no
+sistema** e o escopo das Fases 3 e 4.
+
+### A janela de 24h condiciona tudo
+
+A integração é a Cloud API oficial. Sem uma mensagem de entrada recente do lead,
+**texto livre é rejeitado pela Meta** — só template aprovado alcança quem não
+escreveu primeiro. Duas consequências:
+
+- **O degrau de 23 horas do follow-up encosta no limite.** Se o relógio virar
+  antes do envio (retry, fila lenta, worker ocupado), a mensagem é rejeitada,
+  não atrasada.
+- **Lead de formulário nunca abriu janela.** É o template que puxa a conversa.
+
+### O template
+
+Endpoint `POST /message/sendTemplate/{instance}` — **não** o `sendText` que a
+Fase 1 implementou. Um parâmetro só, o primeiro nome, no header:
+
+```json
+{ "number": "<telefone>", "language": "pt_BR",
+  "name": "boas_vindas_renata_respondiapp_03",
+  "components": [{"type": "header",
+                  "parameters": [{"type": "text", "text": "<primeiro nome>"}]}] }
+```
+
+Dois templates ativos, um por origem — o que casa com o enum `lead_source`:
+
+| Template | Workflow | Origem |
+|---|---|---|
+| `boas_vindas_renata_linkedin_02` | `#00 ZAPIER \| Formulário Linkedin` | `linkedin_form` |
+| `boas_vindas_renata_respondiapp_03` | `YAY FORMS`, `#00 ZAPIER` | `respondiapp_form` |
+
+Quando o lead responde ao template, ele entra pelo webhook normal e cai na
+Renata — não há roteamento especial (confirmado com o cliente).
+
+### A Renata atende um segmento, não todos os leads
+
+O `YAY FORMS` classifica por faturamento declarado no formulário e roteia:
+
+| Faixa | Destino |
+|---|---|
+| Menos de R$ 3 mil | desqualificado |
+| R$ 3 a 5 mil | desqualificado |
+| **R$ 5 a 8 mil, que NÃO agendou** | **template → Renata** |
+| R$ 8 a 25 mil | closer humano (Silvio ou Ivana), com rodízio |
+| Acima de R$ 25 mil | Silvio direto |
+
+Ainda com um `if` antes: só se o telefone do formulário não estiver vazio.
+
+**A Renata é o caminho de recuperação de uma faixa específica, não a porta de
+entrada.** Faturamento alto vai direto para humano; baixo é descartado. Ela pega
+quem está no meio e não agendou sozinho — o que explica o portão de faturamento
+do SOP: o lead **já declarou** a faixa no formulário, e ela confirma na conversa.
+
+### Impacto nas fases
+
+- **Fase 3** precisa de `sendTemplate` no `EvolutionClient`, não só `sendText`.
+  E o follow-up precisa saber se a janela ainda está aberta antes de mandar
+  texto livre.
+- **Fase 4** pode ter escopo menor que o previsto: se a IA só atende a faixa de
+  5-8k sem agendamento, os 2.559 leads em `formulario_preenchido` não são todos
+  dela. Conferir a distribuição antes de migrar.
+
+### Registro de segurança
+
+A `apikey` está **hardcoded em texto claro** no nó `WA Template` do `YAY FORMS`,
+no campo de header — não vem de credencial do n8n. Ela viaja em qualquer export
+ou backup do workflow, e é o mesmo token da Meta que envia mensagem e baixa
+mídia. Não afeta a migração (no harness vira variável de ambiente), mas segue
+exposta enquanto o n8n existir.
+
 ## Fora de escopo
 
 - `#00 ZAPIER | Formulário Linkedin` (71 nós) e `#0 Form` — entrada de leads por
