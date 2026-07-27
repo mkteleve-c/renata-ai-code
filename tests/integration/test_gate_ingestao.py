@@ -563,6 +563,7 @@ async def _minutos_desde_inbound(phone: str) -> float:
 
 
 async def test_gate_grava_last_inbound_at(lead_factory):
+    """Cobre o ramo UPDATE do upsert: lead já existe (pré-criado pela fixture)."""
     await lead_factory("5511987654321", minutos_desde_inbound=180)
 
     resultado = await aplicar_gate(
@@ -571,11 +572,37 @@ async def test_gate_grava_last_inbound_at(lead_factory):
         push_name="Fulano",
     )
     assert resultado.aceito
-    assert resultado.canonico is not None
-    # O UPDATE do caminho aceito canonicaliza phone para a forma sem o 9º
-    # dígito — a linha criada por lead_factory com o telefone "cheio" deixa
-    # de existir sob essa chave, por isso a checagem usa r.canonico.
-    assert await _minutos_desde_inbound(resultado.canonico) < 1
+    # Literal, não resultado.canonico: se a canonicalização quebrar e o gate
+    # criar uma linha nova em vez de atualizar a existente, o teste tem que
+    # acusar isso — não seguir o valor que o próprio código sob teste produziu.
+    assert await _minutos_desde_inbound("551187654321") < 1
+
+
+async def test_gate_grava_last_inbound_at_em_lead_novo():
+    """Cobre o ramo INSERT do upsert — nenhum teste anterior o exercitava.
+
+    lead_factory sempre pré-cria a linha, então test_gate_grava_last_inbound_at
+    só provava o UPDATE. Sem isto, tirar last_inbound_at do INSERT (leads.py)
+    passa 100% da suíte: todo lead novo nasceria com a coluna NULL e a régua
+    da Task 3, que filtra `last_inbound_at is not null`, nunca o reivindicaria.
+    """
+    telefone, canonico = "5511987650001", "551187650001"
+    pool = await get_pool()
+    async with pool.connection() as conn:
+        await conn.execute("delete from leads_crm where phone = %s", (canonico,))
+
+    try:
+        resultado = await aplicar_gate(
+            pool,
+            key={"remoteJid": f"{telefone}@s.whatsapp.net", "fromMe": False},
+            push_name="Fulano",
+        )
+        assert resultado.aceito
+        assert resultado.canonico == canonico
+        assert await _minutos_desde_inbound(canonico) < 1
+    finally:
+        async with pool.connection() as conn:
+            await conn.execute("delete from leads_crm where phone = %s", (canonico,))
 
 
 async def test_inbound_de_lead_pausado_ainda_move_a_janela(lead_factory):
