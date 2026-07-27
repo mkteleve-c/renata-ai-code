@@ -33,6 +33,7 @@ from psycopg_pool import AsyncConnectionPool
 
 from whatsapp_langchain.shared.phone import (
     _digitos_do_jid,
+    _e_endereco_sem_telefone,
     _sem_zero_de_tronco,
     canonicalizar,
 )
@@ -99,6 +100,15 @@ def normalizar_telefone(bruto: str | None) -> Normalizado:
     `leads_descartados`:
 
     - `telefone_ausente`: nulo, vazio, ou a string "null".
+    - `endereco_sem_telefone`: `@g.us` (grupo) ou `@lid` (LinkedID do
+      WhatsApp) -- não é telefone malformado, é um endereçamento que nunca
+      teve telefone por trás. Checado ANTES de `canonicalizar` (que também
+      recusa os dois, mas devolve só `None` -- sem essa checagem dedicada
+      aqui, o motivo cairia no ramo genérico de dígito curto/implausível
+      pelo comprimento do que sobra depois de cortar o `@...`, escondendo
+      que a causa real não tem nada a ver com contagem de dígitos. Achado
+      no fix round 1: um `@lid`/`@g.us` saía rotulado `sequencia_implausivel`,
+      que sugere lixo de digitação, não "isto nunca foi um telefone").
     - `colide_com_forma_local_br`: `canonicalizar` aceitou um valor de 10
       ou 11 dígitos -- só acontece no ramo estrangeiro (formas brasileiras
       sempre saem com 12 dígitos, prefixadas "55"). Nesse comprimento não
@@ -120,6 +130,9 @@ def normalizar_telefone(bruto: str | None) -> Normalizado:
         return Normalizado(None, "telefone_ausente")
 
     assert bruto is not None  # _esta_ausente já cobriu o caso None
+
+    if _e_endereco_sem_telefone(bruto):
+        return Normalizado(None, "endereco_sem_telefone")
 
     canonico = canonicalizar(bruto)
 
@@ -560,8 +573,33 @@ def fundir_todos(grupos: dict[str, list[LinhaOrigem]]) -> dict[str, LinhaFundida
     }
 
 
+def _grupos_com_pipedriveid_conflitante(
+    grupos: dict[str, list[LinhaOrigem]],
+) -> list[str]:
+    """Canônicos cujo grupo bruto carrega mais de um `pipedriveid` distinto.
+
+    `fundir_grupo` escolhe o `pipedriveid` por RECÊNCIA (ver a divergência
+    documentada no cabeçalho de `fundir_grupo`), independentemente de qual
+    linha ganhou `phase`. Isso pode desacoplar os dois: um grupo com a
+    linha ANTIGA em `agendou_sessao`/`DEAL-13` e a linha RECENTE em
+    `formulario_preenchido`/`DEAL-NOVO` funde para `agendou_sessao` (fase,
+    por rank) + `DEAL-NOVO` (pipedriveid, por recência) -- e uma
+    `update_crm` subsequente moveria o card ERRADO no Pipedrive. Achado no
+    fix round 1 -- não corrigido automaticamente (não há regra óbvia de
+    qual DEAL é o certo), só destacado para decisão humana.
+    """
+    conflitantes = []
+    for canonico, linhas in grupos.items():
+        distintos = {linha.pipedriveid for linha in linhas if linha.pipedriveid}
+        if len(distintos) > 1:
+            conflitantes.append(canonico)
+    return sorted(conflitantes)
+
+
 def _montar_destaques(
-    fundidas: dict[str, LinhaFundida], descartes: Sequence[Descarte]
+    grupos: dict[str, list[LinhaOrigem]],
+    fundidas: dict[str, LinhaFundida],
+    descartes: Sequence[Descarte],
 ) -> list[str]:
     """Reúne os achados que exigem decisão humana antes do cutover.
 
@@ -569,17 +607,23 @@ def _montar_destaques(
     contagem já mudou entre duas consultas na mesma sessão de medição, ver
     o plano da Fase 4), então fixar os dígitos exatos de Moçambique, EUA e
     Portugal quebraria numa reexecução contra dados que mudaram. Em vez
-    disso, três regras genéricas que continuam cobrindo os três casos
-    medidos em 27/07/2026:
+    disso, cinco regras genéricas:
 
     1. Todo lead migrado cujo canônico NÃO começa com "55" é estrangeiro --
        cobre o caso de Moçambique (`qualificado`, ativo) e o de Portugal
        (follow-up ativo).
     2. Todo descarte com motivo `colide_com_forma_local_br` é um possível
        estrangeiro perdido -- cobre o caso dos EUA.
-    3. Todo grupo cuja fusão mudou `phase` ou `agent_active` em relação à
+    3. Todo descarte com motivo `digitos_insuficientes` -- pode ser DDD +
+       telefone real com um dígito faltando (ex.: `519985344`), não
+       necessariamente lixo. Achado no fix round 1: só `colide_com_forma_
+       local_br` aparecia aqui antes, e esse motivo também perde gente
+       real.
+    4. Todo grupo cuja fusão mudou `phase` ou `agent_active` em relação à
        linha mais recente do grupo -- fusão que muda estado de lead ativo é
        o que mais pode dar errado em silêncio.
+    5. Todo grupo com mais de um `pipedriveid` distinto entre as linhas
+       físicas -- ver `_grupos_com_pipedriveid_conflitante`.
     """
     linhas: list[str] = []
 
@@ -603,6 +647,18 @@ def _montar_destaques(
             "não relaxamos o CHECK de propósito."
         )
 
+    descartes_curtos = sorted(
+        (d for d in descartes if d.motivo == "digitos_insuficientes"),
+        key=lambda d: d.phone_origem or "",
+    )
+    for descarte in descartes_curtos:
+        linhas.append(
+            f"- **Descartado por dígitos insuficientes** "
+            f"`{descarte.phone_origem}` -- pode ser telefone real com um "
+            "dígito faltando (DDD + assinante incompleto), não "
+            "necessariamente lixo."
+        )
+
     for f in sorted(
         (f for f in fundidas.values() if f.mudou_phase or f.mudou_agent_active),
         key=lambda f: f.canonico,
@@ -619,6 +675,15 @@ def _montar_destaques(
             f"- **Fusão mudou estado do lead** `{f.canonico}` -- "
             f"campo(s) afetado(s): {', '.join(campos)} "
             "(comparado com a linha fisicamente mais recente do grupo)."
+        )
+
+    for canonico in _grupos_com_pipedriveid_conflitante(grupos):
+        f = fundidas.get(canonico)
+        deal_escolhido = f.pipedriveid if f is not None else "?"
+        linhas.append(
+            f"- **`pipedriveid` conflitante no grupo** `{canonico}` -- "
+            f"deal escolhido por recência: `{deal_escolhido}` -- confirmar "
+            "que é o deal certo antes de qualquer `update_crm` mover card."
         )
 
     return linhas
@@ -673,7 +738,7 @@ def gerar_relatorio(
         "",
     ]
 
-    destaques = _montar_destaques(fundidas, descartes)
+    destaques = _montar_destaques(grupos, fundidas, descartes)
     md.extend(destaques if destaques else ["(nenhum item encontrado nesta execução)"])
     md.append("")
 
@@ -876,60 +941,127 @@ def _contagem_cumulativa_por_rank(fases: Iterable[str | None]) -> dict[int, int]
 
 
 def validar_fases_nao_retrocederam(
-    esperado: dict[int, int], persistido: dict[int, int]
+    antes: dict[int, int], depois: dict[int, int]
 ) -> None:
-    """A fusão só promove, nunca rebaixa -- e a gravação não pode perder isso.
+    """A gravação não pode fazer a contagem de fases avançadas CAIR.
 
-    `esperado` vem do resultado em memória de `fundir_grupo`: por
-    construção (`_fase_vencedora`), o rank final de um grupo é o MAIOR rank
-    entre seus membros -- nunca cai. `persistido` vem de uma leitura real
-    do banco DEPOIS do `INSERT`/`UPDATE`, para o mesmo conjunto de
-    canônicos. Comparar contra o banco, e não só contra a própria memória,
-    é o que pega um bug na escrita em si (coluna trocada, upsert que
-    silenciosamente não atualiza `phase`) -- comparar só em memória nunca
-    falharia, porque seria comparar o resultado contra ele mesmo.
+    `antes` e `depois` são a mesma leitura real do banco -- `_contagem_
+    cumulativa_por_rank` sobre `leads_crm.phase`, para o mesmo conjunto de
+    canônicos -- tirada respectivamente ANTES e DEPOIS do `INSERT`/`UPDATE`
+    desta chamada, dentro da MESMA transação.
 
-    `>=`, não `==`, de propósito: a base de origem está viva (ver "O que
-    foi medido" no plano da Fase 4) -- um lead migrado pode ter avançado de
-    fase por uma conversa real acontecendo durante a janela da migração, e
-    isso não é regressão. O que não pode acontecer é o banco mostrar MENOS
-    leads em fase avançada do que a fusão calculou.
+    Fix round 1 -- reinterpretação corrigida: a primeira versão comparava o
+    banco (`persistido`) contra o resultado EM MEMÓRIA que a própria
+    escrita ia gravar (`esperado`, derivado de `marcadas`). Isso é
+    tautológico -- `persistido` sempre bate com `esperado` porque é
+    exatamente o que a escrita gravou, mesmo quando o `UPDATE` sobrescreve
+    (de forma incorreta) um lead que já estava mais avançado em produção
+    do que a linha reimportada do Supabase diz. Provado contra o banco
+    real: um lead em `agendou_sessao` (produção) caía para
+    `formulario_preenchido` (Supabase desatualizado) numa reexecução, e a
+    validação antiga não via nada de errado, porque comparava a gravação
+    contra ela mesma.
+
+    Comparar o banco ANTES contra o banco DEPOIS, na mesma transação, é o
+    que de fato pega isso -- com o `ON CONFLICT DO UPDATE` de
+    `_SQL_UPSERT_LEAD` já escolhendo `phase` pelo rank (nunca a linha
+    reimportada sozinha), esta validação nunca deveria disparar em operação
+    normal; ela é a segunda camada de defesa, para um bug FUTURO na
+    própria cláusula SQL -- e é assim que os testes de mutação a
+    exercitam (mutando o `case` do `phase` de volta para sobrescrita cega).
+
+    `>=`, não `==`, de propósito: a base de origem está viva -- um lead
+    pode ter avançado de fase por uma conversa real acontecendo durante a
+    própria chamada (outra conexão, fora desta transação, antes do
+    commit). O que não pode acontecer é a contagem CAIR.
     """
     for rank in _RANKS_AVANCADOS:
-        minimo = esperado.get(rank, 0)
-        real = persistido.get(rank, 0)
+        minimo = antes.get(rank, 0)
+        real = depois.get(rank, 0)
         if real < minimo:
             raise MigracaoAbortada(
                 f"contagem de leads com fase rank>={rank} caiu na gravação: "
-                f"esperado >= {minimo}, achado {real} -- abortando"
+                f"antes={minimo}, depois={real} -- abortando"
             )
 
 
-async def _validar_nenhum_last_inbound_at(conn: Any, canonicos: Iterable[str]) -> None:
-    """`last_inbound_at` nasce `NULL` -- o contrato que a Fase 3 deixou escrito.
+async def _capturar_fases(conn: Any, canonicos: Iterable[str]) -> dict[int, int]:
+    """Lê `leads_crm.phase` do banco real para os canônicos dados, agregado
+    por `_contagem_cumulativa_por_rank`. Usado antes e depois da escrita
+    por `validar_fases_nao_retrocederam` -- ver seu docstring."""
+    lista = list(canonicos)
+    if not lista:
+        return dict.fromkeys(_RANKS_AVANCADOS, 0)
+    cur = await conn.execute(
+        "select phase from leads_crm where phone = any(%s)", (lista,)
+    )
+    linhas = await cur.fetchall()
+    return _contagem_cumulativa_por_rank(linha[0] for linha in linhas)
 
-    Copiar `last_interaction_at` pareceria óbvio e é errado: para quem já
-    recebeu follow-up aquele valor é o NOSSO envio, não o inbound do lead
-    -- superestimar a janela de 24h da Cloud API manda mensagem que a Meta
-    rejeita, em escala (ver `013_last_inbound_at.sql`). O importador nunca
-    inclui esta coluna em `_SQL_UPSERT_LEAD`; esta validação confirma
-    contra o banco real, dentro da mesma transação da escrita -- não só
-    contra a leitura do código-fonte.
+
+async def _capturar_last_inbound_at(
+    conn: Any, canonicos: Iterable[str]
+) -> dict[str, Any]:
+    """`{canonico: last_inbound_at}` do banco real, para os canônicos dados.
+
+    Canônico sem linha ainda (primeira importação) simplesmente não entra
+    no dict -- `_validar_last_inbound_at_intocado` trata ausência como
+    `None` via `.get()`, o mesmo valor que um `INSERT` fresco produz para
+    uma coluna sem `DEFAULT`.
     """
     lista = list(canonicos)
     if not lista:
-        return
+        return {}
     cur = await conn.execute(
-        "select phone from leads_crm"
-        " where phone = any(%s) and last_inbound_at is not null",
+        "select phone, last_inbound_at from leads_crm where phone = any(%s)",
         (lista,),
     )
     linhas = await cur.fetchall()
-    if linhas:
-        vazados = sorted(linha[0] for linha in linhas)
+    return {linha[0]: linha[1] for linha in linhas}
+
+
+async def _validar_last_inbound_at_intocado(conn: Any, antes: dict[str, Any]) -> None:
+    """`last_inbound_at` nasce `NULL` e o importador nunca escreve nela --
+    esta validação confirma que a coluna, para cada canônico importado,
+    tem EXATAMENTE o mesmo valor depois da escrita que tinha antes.
+
+    Fix round 1 -- corrige um bug real do desenho anterior. A versão
+    original abortava se QUALQUER lead importado tivesse `last_inbound_at`
+    preenchido, ponto -- o que soa como o contrato certo ("a coluna nasce
+    NULL"), mas quebra a premissa da task ("o cutover pode precisar rodar
+    isto duas vezes") contra uma base viva: um lead que já recebeu
+    mensagem real de um humano ANTES da reexecução tem a coluna preenchida
+    de propósito, e uma reexecução legítima abortava por isso -- tudo ou
+    nada, sem meio-termo possível. Pior: a suposta rede de proteção contra
+    "religar em silêncio" um lead pausado não cobria o caminho `fromMe`
+    (`shared/leads.py`), que pausa sem nunca tocar `last_inbound_at` --
+    então o cenário mais perigoso (handover humano via WhatsApp, lead
+    ainda não respondeu) passava batido pela validação de qualquer jeito.
+
+    A proteção correta contra "religar em silêncio" é a doutrina de merge
+    do `ON CONFLICT DO UPDATE` (`agent_active`/`followup_active` com
+    `AND`, ver `_SQL_UPSERT_LEAD`) -- não esta validação. O papel real
+    desta função é mais estreito e mais honesto: confirmar que O
+    IMPORTADOR EM SI nunca grava nesta coluna, comparando o valor antes e
+    depois da MESMA escrita -- o que funciona tanto na primeira importação
+    (antes: ausente/`None`, depois: `NULL` de um `INSERT` que não lista a
+    coluna -- iguais) quanto numa reexecução contra um lead com inbound
+    real (antes: `<timestamp>`, depois: o MESMO `<timestamp>`, porque o
+    `UPDATE` nunca lista essa coluna -- iguais).
+    """
+    if not antes:
+        return
+    cur = await conn.execute(
+        "select phone, last_inbound_at from leads_crm where phone = any(%s)",
+        (list(antes.keys()),),
+    )
+    linhas = await cur.fetchall()
+    mudaram = sorted(phone for phone, depois in linhas if antes.get(phone) != depois)
+    if mudaram:
         raise MigracaoAbortada(
-            f"{len(vazados)} lead(s) importado(s) já têm last_inbound_at "
-            f"preenchido: {vazados[:10]} -- contrato da Fase 3 violado, "
+            f"{len(mudaram)} lead(s) tiveram last_inbound_at ALTERADO pela "
+            f"própria importação: {mudaram[:10]} -- contrato da Fase 3 "
+            "violado (o importador nunca deveria tocar esta coluna), "
             "abortando"
         )
 
@@ -973,7 +1105,81 @@ class ResultadoImportacao:
     reunioes_legadas_marcadas: int
 
 
-_SQL_UPSERT_LEAD = """
+# Rank de `phase` em SQL puro -- a MESMA tabela de `_FASE_RANK`, embutida
+# duas vezes na cláusula `on conflict` abaixo (uma para `leads_crm.phase`,
+# a linha que JÁ está no banco; outra para `excluded.phase`, o que a
+# reimportação está tentando escrever). `{campo}` é substituído por
+# `str.format` antes de virar SQL -- nunca por dado do usuário, então não
+# há risco de injeção aqui (os únicos dois valores possíveis são literais
+# de coluna fixados neste módulo).
+_SQL_RANK_FASE = (
+    "case"
+    " when {campo} is null then -1"
+    " when {campo} = 'agendou_sessao' then 5"
+    " when {campo} in ('desqualificado', 'perdido') then 4"
+    " when {campo} = 'qualificado' then 3"
+    " when {campo} = 'iniciou_conversa' then 2"
+    " when {campo} = 'formulario_preenchido' then 1"
+    " else 0"
+    " end"
+)
+_RANK_FASE_ATUAL = _SQL_RANK_FASE.format(campo="leads_crm.phase")
+_RANK_FASE_NOVA = _SQL_RANK_FASE.format(campo="excluded.phase")
+
+# `on conflict do update set`: a QUARTA cópia da doutrina de merge (as
+# outras três são `shared/leads.py::_fundir`, a etapa 2 de
+# `014_uma_linha_por_pessoa.sql` e `fundir_grupo` acima -- ver o cabeçalho
+# da seção "Fusão de duplicatas e relatório"). Existe porque o `INSERT`
+# sozinho não basta: numa reexecução, `phone` já existe em `leads_crm` com
+# valores que podem ter mudado em PRODUÇÃO desde a importação anterior
+# (handover, follow-up, avanço de fase, injeção de histórico) -- e
+# `excluded` carrega só o que a reimportação do Supabase recalculou, que
+# não sabe nada sobre essas mudanças.
+#
+# Achado no fix round 1, contra o banco real: a versão anterior deste
+# UPSERT fazia `campo = excluded.campo` incondicional para TODO campo --
+# uma reexecução revertia `phase` para trás, religava `agent_active`/
+# `followup_active` de um lead pausado, zerava `followup_count` e apagava
+# `metadata->>'historico_injetado'` que a Task 5 tinha marcado. Nenhuma
+# das cinco validações bloqueantes pegava isso, porque nenhuma lia o
+# ESTADO ANTERIOR do banco -- só comparavam o que foi escrito contra o que
+# se pretendia escrever, e as duas coisas sempre batiam.
+#
+# A correção aplica a MESMA regra das outras três cópias, com
+# `leads_crm.<campo>` (o que já está gravado) no lugar de "a linha mais
+# antiga do grupo" e `excluded.<campo>` (o que a reimportação calculou) no
+# lugar de "a linha mais recente":
+#
+# - `agent_active`/`followup_active`: **`false` vence.** `AND` booleano
+#   implementa isso direto -- se qualquer lado é `false`, o resultado é
+#   `false`.
+# - `agent_reactivate_at`: acompanha SEMPRE o lado que está pausado (nunca
+#   os dois `true` ao mesmo tempo tendo um `agent_reactivate_at`
+#   sobrevivente) -- se os dois estão pausados, o `CASE` cai para o lado
+#   com `last_interaction_at` mais recente, mesmo desempate de
+#   `_vencedor_pausa`.
+# - `phase`: o MAIOR rank vence -- nunca a reimportação sozinha.
+# - `followup_count`: o maior dos dois.
+# - `created_at`: o mais antigo (`least`). `last_interaction_at`: o mais
+#   recente (`greatest`).
+# - `metadata`: `||` do Postgres faz `{**leads_crm.metadata, **excluded.
+#   metadata}` -- chaves só em `leads_crm.metadata` (como
+#   `historico_injetado`, que só a Task 5 grava, nunca a origem) SOBREVIVEM
+#   à reimportação; chaves em comum (como `reuniao_legada`, `linhas_
+#   fundidas`) são atualizadas pelo valor recém-calculado.
+# - `pipedriveid`/`email`/`name`/`username`/`source`: `coalesce(leads_crm.
+#   <campo>, excluded.<campo>)` -- o valor JÁ gravado em produção vence
+#   quando existe (protege um e-mail real capturado por `update_crm`, ou
+#   um `name` real vindo do `pushName` do WhatsApp, de ser revertido por
+#   um snapshot do Supabase mais velho); só cai para o valor reimportado
+#   quando a coluna em produção está vazia.
+#
+# `last_inbound_at`, `google_event_id`, `faturamento_mensal` e
+# `qualificacao_notas` NUNCA aparecem aqui -- nem no `INSERT`, nem no `do
+# update set`. As primeiras três colunas continuam nascendo/permanecendo
+# como estavam (NULL ou o que o gate/CRM já tenha escrito); a origem não
+# tem as últimas três (ver "Erro 2" no plano).
+_SQL_UPSERT_LEAD = f"""
 insert into leads_crm (
     phone, pipedriveid, name, username, email, source,
     phase, followup_count, followup_active, agent_active,
@@ -984,30 +1190,35 @@ insert into leads_crm (
     %s, %s, %s, %s
 )
 on conflict (phone) do update set
-    pipedriveid = excluded.pipedriveid,
-    name = excluded.name,
-    username = excluded.username,
-    email = excluded.email,
-    source = excluded.source,
-    phase = excluded.phase,
-    followup_count = excluded.followup_count,
-    followup_active = excluded.followup_active,
-    agent_active = excluded.agent_active,
-    agent_reactivate_at = excluded.agent_reactivate_at,
-    created_at = excluded.created_at,
-    last_interaction_at = excluded.last_interaction_at,
-    metadata = excluded.metadata
+    pipedriveid = coalesce(leads_crm.pipedriveid, excluded.pipedriveid),
+    name = coalesce(leads_crm.name, excluded.name),
+    username = coalesce(leads_crm.username, excluded.username),
+    email = coalesce(leads_crm.email, excluded.email),
+    source = coalesce(leads_crm.source, excluded.source),
+    phase = case
+        when {_RANK_FASE_NOVA} >= {_RANK_FASE_ATUAL} then excluded.phase
+        else leads_crm.phase
+    end,
+    followup_count = greatest(leads_crm.followup_count, excluded.followup_count),
+    followup_active = leads_crm.followup_active and excluded.followup_active,
+    agent_active = leads_crm.agent_active and excluded.agent_active,
+    agent_reactivate_at = case
+        when leads_crm.agent_active is false and excluded.agent_active is false
+            then case
+                when leads_crm.last_interaction_at >= excluded.last_interaction_at
+                    then leads_crm.agent_reactivate_at
+                else excluded.agent_reactivate_at
+            end
+        when leads_crm.agent_active is false then leads_crm.agent_reactivate_at
+        when excluded.agent_active is false then excluded.agent_reactivate_at
+        else null
+    end,
+    created_at = least(leads_crm.created_at, excluded.created_at),
+    last_interaction_at = greatest(
+        leads_crm.last_interaction_at, excluded.last_interaction_at
+    ),
+    metadata = leads_crm.metadata || excluded.metadata
 """
-
-# NUNCA lista `last_inbound_at` -- nem no INSERT nem no `do update set`. Um
-# upsert que a incluísse (mesmo com `excluded.last_inbound_at`, que seria
-# sempre NULL vindo do INSERT) reabriria o mesmo furo que 013 fechou: a
-# coluna tem que nascer e permanecer NULL até o gate de ingestão real
-# escrever nela. `google_event_id`, `faturamento_mensal` e
-# `qualificacao_notas` também ficam de fora -- a origem não tem essas três
-# colunas (ver "Erro 2" no plano), e omiti-las do `do update set` protege
-# qualquer valor real que `update_crm`/`calendar_agendar` já tenham escrito
-# numa reexecução contra um lead que passou a existir em produção.
 
 _SQL_INSERT_DESCARTE = """
 insert into leads_descartados (phone_original, motivo, payload)
@@ -1034,25 +1245,43 @@ async def importar_leads(
        `session_id`s do histórico -- rodam ANTES de qualquer escrita e
        abortam sem que uma única linha entre no Postgres.
     2. `marcar_reunioes_legadas` computa o `metadata` final em memória.
-    3. Todo `INSERT`/`UPDATE` acontece dentro do MESMO bloco de conexão.
+    3. Dentro do bloco de conexão, captura o ESTADO ANTERIOR do banco
+       (`_capturar_fases`, `_capturar_last_inbound_at`) para os canônicos
+       que estão prestes a ser tocados -- é a base de comparação das duas
+       validações pós-escrita (fix round 1: comparar contra o próprio
+       resultado da escrita, como a versão anterior fazia, nunca pega uma
+       reversão real -- ver os docstrings de `validar_fases_nao_
+       retrocederam` e `_validar_last_inbound_at_intocado`).
+    4. Todo `INSERT`/`UPDATE` acontece dentro do MESMO bloco de conexão.
        `async with pool.connection() as conn:` já aplica o comportamento
        normal de conexão do psycopg -- commit no fim sem exceção, rollback
        se qualquer coisa levantar dentro do bloco (documentado em
        `AsyncConnectionPool.connection`) -- então não há necessidade de uma
-       transação aninhada explícita.
-    4. As validações que DEPENDEM do banco -- `last_inbound_at`, fases não
-       retrocederam -- rodam por último, ainda dentro do bloco. Se
-       qualquer uma falhar, a exceção propaga e desfaz TUDO que este `run`
-       gravou.
+       transação aninhada explícita. O `ON CONFLICT DO UPDATE` de
+       `_SQL_UPSERT_LEAD` já aplica a doutrina de merge (nunca sobrescreve
+       cegamente um lead que avançou em produção) -- ver o comentário
+       acima dele.
+    5. As validações que DEPENDEM do banco -- fases não caíram,
+       `last_inbound_at` intocado -- comparam o estado capturado no passo
+       3 contra uma nova leitura pós-escrita. Se qualquer uma falhar, a
+       exceção propaga e desfaz TUDO que este `run` gravou.
 
-    Idempotente: `leads_crm` usa `ON CONFLICT (phone) DO UPDATE` com os
-    MESMOS valores computados -- rodar duas vezes com a mesma fusão produz
-    a mesma linha, nunca duplica. `leads_descartados` não tem chave única
-    (é depósito de qualquer coisa, ver a migração 015), então a
-    idempotência aqui é um `DELETE` restrito ao marcador
-    `_FONTE_MIGRACAO_DESCARTE` seguido de reinserção -- nunca toca em
-    descartes do gate de ingestão em produção, que não carregam essa
-    chave.
+    Idempotente NO SENTIDO que a task pede -- "rodar o MESMO cálculo de
+    fusão duas vezes dá o mesmo resultado, sem duplicar" -- e também
+    SEGURO contra uma reexecução depois de tráfego real ter acontecido:
+    o `ON CONFLICT DO UPDATE` nunca rebaixa `phase`, nunca religa
+    `agent_active`/`followup_active` de um lead pausado, nunca zera
+    `followup_count`, e preserva chaves de `metadata` que só existem em
+    produção (como `historico_injetado`, gravado pela Task 5). Continua
+    havendo uma pendência real, e ela é da Fase 5, não desta task: se DOIS
+    processos escrevem no MESMO canônico ao mesmo tempo (esta migração e o
+    gate de ingestão real), não há lock coordenando os dois -- só a
+    convenção de que a migração roda com os workflows do n8n desligados.
+    `leads_descartados` não tem chave única (é depósito de qualquer coisa,
+    ver a migração 015), então a idempotência aqui é um `DELETE` restrito
+    ao marcador `_FONTE_MIGRACAO_DESCARTE` seguido de reinserção -- nunca
+    toca em descartes do gate de ingestão em produção, que não carregam
+    essa chave.
     """
     validar_soma_fecha(total_origem, grupos, descartes)
     validar_canonicos_no_check(fundidas)
@@ -1063,10 +1292,12 @@ async def importar_leads(
     reunioes_legadas = sum(
         1 for f in marcadas.values() if f.metadata.get("reuniao_legada") is True
     )
-    esperado = _contagem_cumulativa_por_rank(f.phase for f in marcadas.values())
     momento = agora or datetime.now(UTC)
 
     async with pool.connection() as conn:
+        fases_antes = await _capturar_fases(conn, marcadas.keys())
+        inbound_antes = await _capturar_last_inbound_at(conn, marcadas.keys())
+
         for canonico, fundida in marcadas.items():
             await conn.execute(
                 _SQL_UPSERT_LEAD,
@@ -1100,17 +1331,10 @@ async def importar_leads(
                 (descarte.phone_origem, descarte.motivo, Jsonb(payload)),
             )
 
-        await _validar_nenhum_last_inbound_at(conn, marcadas.keys())
+        await _validar_last_inbound_at_intocado(conn, inbound_antes)
 
-        cur = await conn.execute(
-            "select phase from leads_crm where phone = any(%s)",
-            (list(marcadas.keys()),),
-        )
-        linhas_persistidas = await cur.fetchall()
-        persistido = _contagem_cumulativa_por_rank(
-            linha[0] for linha in linhas_persistidas
-        )
-        validar_fases_nao_retrocederam(esperado, persistido)
+        fases_depois = await _capturar_fases(conn, marcadas.keys())
+        validar_fases_nao_retrocederam(fases_antes, fases_depois)
 
     return ResultadoImportacao(
         total_origem=total_origem,

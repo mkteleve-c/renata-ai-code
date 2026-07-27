@@ -122,6 +122,8 @@ def test_formas_brasileiras_convergem(bruto, esperado):
         ("+14242123771", "colide_com_forma_local_br"),  # EUA, 11 dígitos
         ("519985344", "digitos_insuficientes"),
         ("5511666666665", "sequencia_implausivel"),
+        ("5511988887777@lid", "endereco_sem_telefone"),  # LinkedID do WhatsApp
+        ("120363012345678901@g.us", "endereco_sem_telefone"),  # grupo
     ],
 )
 def test_descartes_tem_motivo_nomeado(bruto, motivo):
@@ -134,6 +136,22 @@ def test_estrangeiro_de_12_digitos_passa_intacto():
     """Moçambique e Portugal cabem no CHECK; EUA não, por colisão de tamanho."""
     assert normalizar_telefone("258864038352").canonico == "258864038352"
     assert normalizar_telefone("351914355881").canonico == "351914355881"
+
+
+def test_lid_e_grupo_nao_caem_no_rotulo_de_digito_implausivel():
+    """Fix round 1: antes desta correção, `@lid`/`@g.us` saíam rotulados
+    `sequencia_implausivel` -- que sugere lixo de digitação, não "isto
+    nunca foi um telefone". O motivo importa porque `leads_descartados`
+    guarda o rótulo para revisão humana, e os dois convites a ações
+    diferentes: `sequencia_implausivel` pede olhar o dígito; `endereco_sem_
+    telefone` diz "não perca tempo, não tem telefone nenhum aqui".
+    """
+    lid = normalizar_telefone("5511988887777@lid")
+    grupo = normalizar_telefone("120363012345678901@g.us")
+
+    assert lid.motivo == "endereco_sem_telefone"
+    assert lid.motivo != "sequencia_implausivel"
+    assert grupo.motivo == "endereco_sem_telefone"
 
 
 def test_forma_local_br_de_10_e_11_digitos_e_descartada():
@@ -327,6 +345,37 @@ def test_par_campo_coalescivel_vence_por_recencia_nao_por_fase():
     assert fundida.origem_por_campo["pipedriveid"] == "5511987654321"
     # phase continua sendo a mais avançada -- essa regra não muda.
     assert fundida.phase == "qualificado"
+
+
+def test_campo_coalescivel_cai_para_a_linha_mais_antiga_quando_a_recente_e_nula():
+    """Importante 2 do fix round 1: nenhum teste cobria o caso em que a
+    linha MAIS RECENTE traz o campo nulo -- que é justamente o cenário em
+    que o fallback "cai pra trás até achar um não-nulo" precisa entrar em
+    ação. Uma mutação que trocasse `if valor is not None` por atribuição
+    incondicional (`valores[campo] = valor` sempre) faria a linha recente
+    nula APAGAR o `email` da linha antiga -- e nenhum teste existente até
+    aqui derrubava isso, porque todos tinham valor não-nulo dos dois
+    lados.
+    """
+    antiga = _linha(
+        "551187654321",
+        last_interaction_at=_t(0),
+        email="ana@exemplo.com",
+        pipedriveid="DEAL-1",
+    )
+    recente = _linha(
+        "5511987654321",
+        last_interaction_at=_t(10),
+        email=None,
+        pipedriveid=None,
+    )
+
+    fundida = fundir_grupo("551187654321", [antiga, recente])
+
+    assert fundida.email == "ana@exemplo.com"
+    assert fundida.origem_por_campo["email"] == "551187654321"
+    assert fundida.pipedriveid == "DEAL-1"
+    assert fundida.origem_por_campo["pipedriveid"] == "551187654321"
 
 
 def test_trio_followup_count_pega_o_maior_nao_o_menor():
@@ -683,6 +732,77 @@ def test_relatorio_lista_todos_os_descartes_com_motivo():
     assert "telefone_ausente" in secao_descartes
     assert "colide_com_forma_local_br" in secao_descartes
     assert "+14242123771" in secao_descartes
+
+
+# --- Achados do fix round 1 --------------------------------------------------
+
+
+def test_relatorio_destaca_descarte_por_digitos_insuficientes():
+    """Fix round 1: `519985344` (DDD 51 com um dígito faltando) é um lead
+    real provável, não lixo -- e antes desta correção só o motivo `colide_
+    com_forma_local_br` aparecia na seção de decisão humana.
+    """
+    linhas = [
+        _linha("551187654321", last_interaction_at=_t(0)),
+        _linha("519985344"),  # digitos_insuficientes
+    ]
+    grupos, descartes = agrupar_por_canonico(linhas)
+    fundidas = fundir_todos(grupos)
+
+    texto = gerar_relatorio(len(linhas), grupos, fundidas, descartes)
+    secao_destaques = _secao(texto, "Decisão humana necessária")
+
+    assert "519985344" in secao_destaques
+    assert "dígitos insuficientes" in secao_destaques.lower()
+
+
+def test_relatorio_destaca_grupo_com_pipedriveid_conflitante():
+    """Fix round 1: `pipedriveid` vence por recência (mesma regra dos
+    outros campos coalescíveis) e pode desacoplar de `phase`, que vence
+    por rank -- um grupo com a linha ANTIGA em `agendou_sessao`/`DEAL-13` e
+    a RECENTE em `formulario_preenchido`/`DEAL-NOVO` funde para
+    `agendou_sessao` + `DEAL-NOVO`, e uma `update_crm` subsequente moveria
+    o card ERRADO no Pipedrive.
+    """
+    linhas = [
+        _linha(
+            "551187654321",
+            last_interaction_at=_t(0),
+            phase="agendou_sessao",
+            pipedriveid="DEAL-13",
+        ),
+        _linha(
+            "5511987654321",
+            last_interaction_at=_t(10),
+            phase="formulario_preenchido",
+            pipedriveid="DEAL-NOVO",
+        ),
+    ]
+    grupos, descartes = agrupar_por_canonico(linhas)
+    fundidas = fundir_todos(grupos)
+
+    texto = gerar_relatorio(len(linhas), grupos, fundidas, descartes)
+    secao_destaques = _secao(texto, "Decisão humana necessária")
+
+    assert "551187654321" in secao_destaques
+    assert "pipedriveid" in secao_destaques.lower()
+    assert "DEAL-NOVO" in secao_destaques
+
+
+def test_relatorio_nao_destaca_grupo_com_pipedriveid_unanime():
+    """Guarda contra falso positivo: as duas linhas concordam no
+    `pipedriveid`, então não há conflito a destacar."""
+    linhas = [
+        _linha("551187654321", last_interaction_at=_t(0), pipedriveid="DEAL-1"),
+        _linha("5511987654321", last_interaction_at=_t(10), pipedriveid="DEAL-1"),
+    ]
+    grupos, descartes = agrupar_por_canonico(linhas)
+    fundidas = fundir_todos(grupos)
+
+    texto = gerar_relatorio(len(linhas), grupos, fundidas, descartes)
+    secao_destaques = _secao(texto, "Decisão humana necessária")
+
+    assert "pipedriveid" not in secao_destaques.lower()
 
 
 # =============================================================================
