@@ -185,6 +185,88 @@ class EvolutionClient:
 
         return last_id
 
+    async def send_template(
+        self,
+        to: str,
+        template: str,
+        parametro_header: str | None = None,
+        language: str = "pt_BR",
+    ) -> str | None:
+        """Envia template aprovado via /message/sendTemplate. Retorna o id, se houver.
+
+        Texto livre (`send_message`) só alcança quem escreveu nas últimas 24h
+        — fora dessa janela a Meta rejeita o envio, não atrasa. Um lead vindo
+        de formulário nunca abriu essa janela, e é o template que a abre.
+
+        **Sem chamador nesta fase, de propósito.** O cutover que troca o
+        follow-up de texto livre por template depende de o cliente aprovar
+        na Meta um template de retomada — hoje só existem dois de boas-vindas.
+        Quem vai chamar é o fluxo de follow-up da Fase 5, quando esse
+        template existir.
+
+        `parametro_header` vira o parâmetro de texto do componente `header`
+        do template. Quando `None`, `components` sai como lista vazia — não
+        se inventa um placeholder para um template que não pediu variável.
+
+        Mesma precedência de `send_message`: 2xx sem id reconhecível devolve
+        `None`; não-2xx levanta `EvolutionSendError`.
+        """
+        if self.delivery_mode == "mock":
+            logger.info("evolution_mock_send_template", to=to, template=template)
+            return None
+
+        normalized_to = to.lstrip("+")
+        components: list[dict[str, Any]] = []
+        if parametro_header is not None:
+            components.append(
+                {
+                    "type": "header",
+                    "parameters": [{"type": "text", "text": parametro_header}],
+                }
+            )
+
+        payload = {
+            "number": normalized_to,
+            "language": language,
+            "name": template,
+            "components": components,
+        }
+
+        async with httpx.AsyncClient(
+            transport=self._transport, timeout=TIMEOUT
+        ) as client:
+            response = await client.post(
+                f"{self.base_url}/message/sendTemplate/{self.instance}",
+                headers=self._headers(),
+                json=payload,
+            )
+
+        if response.status_code >= 400:
+            detail = response.text[:500]
+            logger.error(
+                "evolution_send_template_failed",
+                to=normalized_to,
+                template=template,
+                status_code=response.status_code,
+                detail=detail,
+            )
+            raise EvolutionSendError(response.status_code, detail)
+
+        msg_id = _extract_message_id(_safe_json(response))
+        if msg_id is None:
+            logger.warning(
+                "evolution_send_template_sem_id",
+                to=normalized_to,
+                template=template,
+                status_code=response.status_code,
+                body=response.text[:500],
+            )
+
+        logger.info(
+            "evolution_template_sent", to=normalized_to, template=template, id=msg_id
+        )
+        return msg_id
+
     async def send_typing(
         self,
         to: str,
