@@ -1,0 +1,71 @@
+"""Agente elevec_sdr - Renata, assistente de pré-vendas da EleveC.
+
+Agente simples usando create_agent do LangChain 1.0. Portado do workflow n8n
+`#1 Agente SDR | 10/02/26 | V2.2` (ver docs/evidencias/prompt-renata-n8n.md).
+
+Este arquivo contém a factory `build_graph()`. Para langgraph dev,
+veja graph.py que exporta a variável `graph`.
+
+Diferenças em relação ao illumi_assistant/rhawk_assistant nesta fase:
+- Sem tools (calendário, CRM e handover entram nas tasks 4-6).
+- Sem memória semântica (save_memory/read_memory) — paridade com o n8n,
+  que não tem memória cross-thread. MEMORY_ENABLED deve ficar false.
+
+Configuração via .env:
+    OPENROUTER_API_KEY=sk-or-...       # API key do OpenRouter
+    OPENROUTER_MODEL=anthropic/...     # Modelo principal
+    CONTEXT_STRATEGY=trim              # trim | summarize | none
+    TRIM_KEEP_TURNS=5                  # Turnos a manter (trim)
+    SUMMARIZE_TRIGGER_TOKENS=4000      # Tokens antes de sumarizar
+    SUMMARIZE_KEEP_MESSAGES=10         # Mensagens após sumarização
+    SUMMARIZE_MODEL=anthropic/...      # Modelo para sumarização
+"""
+
+from langchain.agents import create_agent
+from langgraph.checkpoint.base import BaseCheckpointSaver
+from langgraph.store.base import BaseStore
+
+from whatsapp_langchain.agents.middleware import get_context_middleware
+from whatsapp_langchain.shared.llm import create_chat_model
+
+from .prompts import SYSTEM_PROMPT
+
+
+def build_graph(
+    checkpointer: BaseCheckpointSaver | None = None,
+    store: BaseStore | None = None,
+):
+    """Constrói o agente elevec_sdr (Renata).
+
+    O agente usa middleware de contexto configurável via CONTEXT_STRATEGY:
+    - trim: Remove mensagens antigas (custo zero, perde contexto)
+    - summarize: Sumariza mensagens antigas (custo extra, preserva contexto)
+    - none: Sem gerenciamento de contexto
+
+    Não usa memória semântica nem tools nesta fase — paridade com o n8n
+    (sem memória) e escopo desta task (tools entram nas tasks 4-6).
+
+    Args:
+        checkpointer: Checkpointer para persistência de estado.
+                      None em dev (in-memory), PostgresSaver em prod.
+        store: Store para memória semântica cross-thread. Recebido por
+               compatibilidade com o loader, mas não usado — a Renata
+               não tem tools de memória.
+
+    Returns:
+        CompiledStateGraph: Agente compilado pronto para uso.
+    """
+    # Modelo principal com rate limiter centralizado (shared/llm.py)
+    model = create_chat_model()
+
+    # Middleware de contexto baseado em CONTEXT_STRATEGY
+    middleware = get_context_middleware()
+
+    return create_agent(
+        model=model,
+        tools=[],
+        system_prompt=SYSTEM_PROMPT,
+        middleware=middleware,
+        checkpointer=checkpointer,
+        store=store,
+    )
