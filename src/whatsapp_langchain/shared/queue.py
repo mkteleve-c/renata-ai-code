@@ -41,11 +41,11 @@ ALVO_DE_CONFLITO = (
     "WHERE message_id IS NOT NULL DO NOTHING"
 )
 
-# Texto para efeito de debounce é a linha sem NENHUMA via de download de
-# mídia — espelha o `has_media` de `enqueue_or_buffer`. `media_url IS NULL`
-# sozinho não serve: linha de mídia da Evolution tem exatamente isso, com a
-# `provider_message_key` preenchida, e quando volta para `queued` num retry
-# viraria alvo de debounce (legenda corrompida com texto alheio, e a
+# Texto para efeito de debounce é a linha sem NENHUM sinal de mídia —
+# espelha o `has_media` de `enqueue_or_buffer`. `media_url IS NULL` sozinho
+# não serve: uma linha de mídia da Evolution sem URL tem exatamente isso,
+# com a `provider_message_key` preenchida, e quando volta para `queued` num
+# retry viraria alvo de debounce (legenda corrompida com texto alheio, e a
 # mensagem nova herdando as tentativas e o pré-processamento da mídia).
 PREDICADO_DE_TEXTO = "media_url IS NULL AND provider_message_key IS NULL"
 
@@ -131,8 +131,7 @@ async def enqueue_or_buffer(
     Regras de debounce (Fase 3):
     - Debounce somente para texto (sem via de download de mídia).
     - Mensagem com mídia não faz debounce (entrada imediata). Conta como
-      mídia quem tem `media_url` OU `media_type` + `provider_message_key` —
-      a Evolution baixa pela key e não depende da URL.
+      mídia quem tem `media_url` OU `media_type` + `provider_message_key`.
     - Linha de mídia nunca é ALVO de debounce nem de flush, mesmo depois de
       voltar para `queued` num retry: ver PREDICADO_DE_TEXTO.
     - Antes de inserir mídia, flush de texto pendente do mesmo phone+agent
@@ -163,20 +162,21 @@ async def enqueue_or_buffer(
         message_id: ID externo da mensagem, ex: Twilio MessageSid (opcional).
         buffer_seconds: Segundos de debounce. Default: 2.0.
         provider_message_key: Key completa da mensagem no provedor (ex: data.key
-            da Evolution), necessária quando o download de mídia exige mais que
-            o id. Vazia para os demais canais.
+            da Evolution). Identificador de diagnóstico — não é a via de
+            download na integração WHATSAPP-BUSINESS, que baixa por GET na
+            URL. Vazia para os demais canais.
 
     Returns:
         EnqueueResult com message_id, se foi buffered e se era duplicata.
     """
     thread_id = f"{phone_number}:{agent_id}"
-    # É mídia quando existe ALGUMA via de buscar os bytes: uma URL, ou uma
-    # `provider_message_key` (a Evolution baixa por ela e a URL do payload
-    # aponta para conteúdo cifrado, inútil para GET). Sem nenhuma das duas,
-    # `media_type` sozinho é sucata — a uazapi manda isso no "payload
+    # É mídia quando o payload identifica uma mídia de verdade: uma URL, ou
+    # `media_type` + a `provider_message_key` da Evolution. Sem nenhuma das
+    # duas, `media_type` sozinho é sucata — a uazapi manda isso no "payload
     # reduzido" e essas mensagens seguem no branch de texto, como sempre
-    # seguiram. Mídia sem via de download que caísse no branch de mídia
-    # gravaria uma linha que o worker nunca conseguiria resolver.
+    # seguiram. Uma linha de mídia sem URL não baixa (o worker responde ao
+    # lead que não deu), mas concatená-la por debounce no texto de outra
+    # mensagem seria pior: o registro do que o lead mandou some.
     has_media = media_url is not None or (
         media_type is not None and provider_message_key is not None
     )

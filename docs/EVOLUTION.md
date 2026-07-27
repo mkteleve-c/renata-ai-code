@@ -209,27 +209,58 @@ mesma limitação.
 
 ## Mídia
 
-A URL que chega em `message.audioMessage.url` aponta para **mídia criptografada
-do Baileys**. Um `GET` nela devolve bytes inúteis. O conteúdo decifrado sai de:
+**A mídia desta integração não é criptografada.** A `url` do nó de mídia aponta
+para `lookaside.fbsbx.com` (CDN da Cloud API) e responde a um `GET` com a apikey
+da instância em `Authorization: Bearer`. É assim que `worker/media.py` baixa —
+praticamente o mesmo caminho do Twilio, trocando BasicAuth por Bearer.
 
-```
-POST /chat/getBase64FromMediaMessage/{instance}
-```
+A Fase 1 assumiu o formato Baileys e construiu o download errado. O payload real
+de um áudio e de uma imagem enviados do celular para a instância está em
+`docs/evidencias/payload-midia-cloud-api.json` (redigido) e desmente a premissa:
 
-Esse endpoint **exige a key completa** — testado contra a API real, uma key
-contendo só o `id` devolve `400 TypeError`. Por isso a key inteira é gravada em
-`message_queue.provider_message_key` (JSONB) no momento da ingestão, e o worker
-a propaga até o download.
+| Assumido (Baileys) | Real (`WHATSAPP-BUSINESS`) |
+|---|---|
+| campo `mimetype` | **`mime_type`**, com underscore |
+| `mediaKey`, `directPath`, `fileEncSha256` presentes | **ausentes** |
+| url em `mmg.whatsapp.net`, cifrada | `lookaside.fbsbx.com`, aberta |
+| download por `POST /chat/getBase64FromMediaMessage` | **`GET` na url com `Authorization: Bearer <apikey>`** |
 
-O download respeita `OUTBOUND_MODE`: em `mock` ele levanta em vez de sair pela
-rede — devolver bytes falsos levaria a uma chamada multimodal ao LLM.
+O `GET` foi exercitado contra a instância real:
+
+| Nó | Resultado |
+|---|---|
+| `audioMessage` | HTTP 200, 2264 bytes, `content-type: audio/ogg`, magic bytes `OggS` |
+| `imageMessage` | HTTP 200, 9776 bytes, `content-type: image/jpeg`, magic bytes `JFIF` |
+
+O download **não depende de `OUTBOUND_MODE`** — é um `GET` numa CDN, leitura
+pura, igual ao que os demais canais já fazem em `mock`. Nada é enviado ao lead
+por causa dele.
+
+`EvolutionClient.baixar_midia` (o `getBase64FromMediaMessage`) continua no
+cliente **sem chamador**, documentado como caminho de instância **Baileys** —
+lá a URL é cifrada e esse endpoint é a única via. Este repositório é um
+template: para um cliente que rode Baileys, o conserto é trocar o ramo da
+Evolution em `download_media` por uma chamada ao método, usando a
+`provider_message_key` que a fila já persiste.
+
+`message_queue.provider_message_key` (JSONB, migração `008`) continua sendo
+gravada, mas **não é mais via de download**. Ela existia só para carregar a key
+até o `getBase64FromMediaMessage`. Ficou por dois motivos: correlacionar a linha
+da fila com a mensagem do lado da Evolution/Meta em investigação, e servir o
+caminho Baileys acima. A migração não é revertida — migração aplicada é
+imutável e o ganho seria nulo.
 
 ### O `media_type` vem do payload, não de inferência
 
-Todo nó de mídia Baileys carrega `mimetype` (`imageMessage.mimetype:
-"image/jpeg"`, `audioMessage.mimetype: "audio/ogg; codecs=opus"`), e é ele que
-vira `message_queue.media_type`. O mapa por campo (`imageMessage` →
-`image/jpeg`, etc.) só entra quando o `mimetype` não vem.
+O MIME é lido de **`mime_type` ou `mimetype`**, nessa ordem: a Cloud API manda o
+primeiro (`"audio/ogg; codecs=opus"`), o Baileys manda o segundo, e o template
+atende as duas. É esse valor que vira `message_queue.media_type`.
+
+O mapa por campo (`imageMessage` → `image/jpeg`, `audioMessage` → `audio/ogg`,
+etc.) é o **último recurso**, só quando nenhuma das duas formas vem. Ler apenas
+`mimetype` fazia todo payload da Cloud API cair nesse default — funcionava por
+acidente no caso comum e erraria em qualquer outro: um `audio/mp4` virava
+`audio/ogg`, e a transcrição saía com o formato errado.
 
 Inferir pelo `messageType` foi removido: em mensagem embrulhada o tipo declarado
 é o do **envelope**, então um `documentMessage` com `imageMessage` dentro virava
@@ -249,8 +280,8 @@ seria aceito pelo modelo. Como marcador de texto, o agente sabe o que chegou,
 responde no fluxo, e o gate roda normalmente (diferente de uma reação, a
 figurinha é uma mensagem no chat e merece resposta).
 
-Áudio de voz (PTT) não tem campo próprio: no Baileys é `audioMessage` com
-`ptt: true`. Não existe `pttMessage`.
+Áudio de voz (PTT) não tem campo próprio: é `audioMessage` com `ptt: true` (e
+`voice: true` na Cloud API). Não existe `pttMessage`.
 
 ## Verificado contra a instância real
 
@@ -278,16 +309,6 @@ resíduo legado — é o que justifica a canonicalização.
 > 23 horas encosta no limite) e a primeira abordagem a leads de formulário, que
 > nunca abriram janela nenhuma.
 
-## Limitação conhecida
-
-**A forma da key de mídia.** A instância não tinha nenhuma mensagem de mídia
-armazenada quando o canal foi construído (`findMessages` filtrando por
-`audioMessage` e `imageMessage` devolvia 0), então o envelope que
-`getBase64FromMediaMessage` espera é **inferido** da documentação do Baileys. O
-primeiro áudio real que chegar é o teste de verdade.
-
-O `media_type` deixou de ser inferência: vem do `mimetype` do próprio payload.
-
 ### Rede de segurança no envio
 
 Mesmo com o shape da resposta agora verificado, o cliente extrai o id de
@@ -308,8 +329,8 @@ não de que a entrega falhou.
 | Webhook devolve 401 | `EVOLUTION_WEBHOOK_SECRET` preenchida e header ausente ou errado |
 | Lead parou de receber respostas | `agent_active=false` — humano respondeu pelo aparelho, ou etiqueta de pausa |
 | Resposta duplicada | reentrega fora da janela de dedupe; conferir `message_id` na fila |
-| Áudio vira "mídia não suportada" | sem `provider_message_key` e sem URL utilizável |
+| Áudio vira "mídia não suportada" | payload sem `url` no nó de mídia — sem ela não há download |
 | Boot em produção falha citando `EVOLUTION_WEBHOOK_SECRET` | canal configurado com secret vazia ou com menos de 32 caracteres |
 | Webhook devolve 200 com `motivo: agente_desconhecido` | typo no `?agent=` da URL configurada na instância |
 | `evolution_send_sem_id` no log | envio funcionou; o corpo da resposta traz um shape que o parser não conhece |
-| Mídia falha em dev com "delivery_mode=mock" | esperado — download real exige `OUTBOUND_MODE=real` |
+| Download de mídia devolve 401 | `EVOLUTION_API_KEY` errada — é ela que vai no `Authorization: Bearer` do GET |
