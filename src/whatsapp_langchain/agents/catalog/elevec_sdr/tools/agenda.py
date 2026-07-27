@@ -150,8 +150,22 @@ def agora_sp() -> datetime:
 # --- Disponibilidade (puro) ------------------------------------------------
 
 
+def normalizar_periodo(periodo: str) -> str | None:
+    """Nome canônico do período, ou `None` se não existir.
+
+    **Quem normaliza é esta função, e o valor normalizado é o que circula.**
+    A versão anterior normalizava só na consulta às horas e repassava o
+    valor cru; `escolher_horarios` compara com `"qualquer"`, então um
+    `"Qualquer"` do modelo — que casa aqui e não lá — desligava em silêncio
+    a regra de viés de horário e devolvia `8, 9`.
+    """
+    nome = (periodo or "").strip().lower()
+    return nome if nome in PERIODOS else None
+
+
 def horas_do_periodo(periodo: str) -> tuple[int, ...] | None:
-    return PERIODOS.get((periodo or "").strip().lower())
+    nome = normalizar_periodo(periodo)
+    return PERIODOS[nome] if nome else None
 
 
 def _instante(bloco: Any) -> datetime | None:
@@ -313,7 +327,10 @@ def escolher_horarios(horas: list[int], periodo: str) -> list[int]:
 
     A saída sai em ordem crescente: `13, 18` lê melhor que `18, 13`.
     """
-    if periodo != "qualquer":
+    # Normaliza de novo por conta própria: esta função é pública e chamada
+    # direto pelos testes, e comparar com o literal `"qualquer"` sobre um
+    # valor cru foi exatamente o bug que desligou a regra.
+    if normalizar_periodo(periodo) != "qualquer":
         return horas[:MAX_HORARIOS_POR_DIA]
 
     ordenadas = sorted(
@@ -530,6 +547,62 @@ async def gravar_agendamento(
     return True
 
 
+async def evento_confere(
+    cliente: Any, criado: Any, event_id: str, momento: datetime
+) -> bool:
+    """O que voltou de `criar_evento` é mesmo o evento que pedimos?
+
+    **Existe por causa do id determinístico.** O `events.insert` responde
+    `409` para id que já existe — inclusive de evento **deletado**, porque a
+    Lixeira do Google segura o id —, e `criar_evento` resolve o 409 lendo o
+    evento existente. Sem conferir o que voltou, dois casos reais viram
+    mentira ao lead:
+
+    - **id na lixeira**: o 409 devolve um evento `status="cancelled"`, e a
+      tool confirmaria a consultoria gravando um vínculo para um evento
+      cancelado. Convite nenhum sai.
+    - **slot já reagendado**: o lead marcou às 13h de 12/02 (id derivado
+      desse slot), remarcou para 20/02 e o modelo chama `agendar` no slot
+      original. O 409 devolve o evento **vivo de 20/02**, e a tool diria
+      "Agendado: 12/02 às 13h" para uma agenda que tem 20/02 às 10h.
+
+    É o mesmo dano que a rodada anterior fechou no `calendar_delete`, e com
+    o id aleatório de antes ele não existia — é o preço da idempotência, e
+    o preço se paga aqui.
+
+    Corpo de escrita irreconhecível cai no fallback `{"id": ...}` do cliente
+    e chega aqui sem `start`. Nesse caso a conferência vai à fonte com um
+    `obter_evento`: é uma leitura a mais num caminho raro, e a alternativa
+    seria confirmar no escuro.
+    """
+    inicio = None
+    status = None
+    if isinstance(criado, dict):
+        inicio = _instante(criado.get("start"))
+        status = criado.get("status")
+
+    if inicio is None:
+        evento = await cliente.obter_evento(event_id)
+        if isinstance(evento, dict):
+            inicio = _instante(evento.get("start"))
+            status = evento.get("status")
+
+    if status == "cancelled":
+        logger.warning("agenda_id_colidiu_com_evento_cancelado", event_id=event_id)
+        return False
+
+    if inicio != momento:
+        logger.warning(
+            "agenda_id_colidiu_com_outro_horario",
+            event_id=event_id,
+            pedido=momento.isoformat(),
+            encontrado=inicio.isoformat() if inicio else None,
+        )
+        return False
+
+    return True
+
+
 def event_id_deterministico(telefone: str, inicio: datetime) -> str:
     """Id do evento derivado de telefone + horário, estável entre turnos.
 
@@ -542,9 +615,13 @@ def event_id_deterministico(telefone: str, inicio: datetime) -> str:
       criado o evento, ou o processor reentregando a mensagem, cai no mesmo
       id e colide — em vez de marcar duas consultorias no mesmo horário na
       agenda de trabalho de uma pessoa real.
-    - **reconciliação trivial.** Se o `UPDATE` no banco falhar, o id não se
-      perde: recomputá-lo a partir do telefone e do horário confirmado ao
-      lead devolve exatamente o evento que ficou órfão.
+    - **reconciliação sem varredura.** Se o `UPDATE` no banco falhar, o id
+      não se perde: recomputá-lo a partir do telefone e do horário
+      confirmado devolve o evento órfão — **desde que ele nunca tenha sido
+      reagendado**. `calendar_update` move o horário e mantém o id, então
+      depois de um reagendamento o id deixa de derivar do slot atual. Para
+      esse caso o caminho é o `google_event_id` no log de
+      `agenda_vinculo_nao_gravado`, que continua exato.
 
     SHA-256 truncado em 32 caracteres hex — `0-9a-f` é subconjunto próprio
     do base32hex que `validar_event_id` exige, e 128 bits deixam a colisão
@@ -586,7 +663,33 @@ def _preferir_coluna(gravado: Any, argumento: str, campo: str) -> str:
     return coluna or informado
 
 
-def resolver_event_id(lead: dict[str, Any], event_id: str) -> tuple[str | None, str]:
+# O que dizer quando o lead não tem evento gravado. A ação muda o conselho:
+# mandar "agende do zero" para um CANCELAMENTO é errado — se o lead afirma
+# que tem reunião marcada, o cenário provável é evento vivo na agenda do
+# Silvio sem vínculo no cadastro (a gravação falhou, ou alguém marcou à
+# mão), e agendar de novo deixa o órfão lá E cria um segundo.
+SEM_EVENTO_GRAVADO = {
+    "cancelar": (
+        "Não encontrei agendamento registrado para este lead, então não tenho "
+        "o que cancelar. Se ele diz que tem reunião marcada, pode haver evento "
+        "na agenda sem vínculo no cadastro — acione o human_handover em vez de "
+        "agendar de novo."
+    ),
+    "remarcar": (
+        "Não encontrei agendamento registrado para este lead. Se ele confirma "
+        "que já tem reunião marcada, acione o human_handover; se não, colete o "
+        "horário e agende do zero com calendar_agendar."
+    ),
+    "consultar": (
+        "Não encontrei agendamento registrado para este lead. Se ele afirma "
+        "que tem reunião marcada, acione o human_handover."
+    ),
+}
+
+
+def resolver_event_id(
+    lead: dict[str, Any], event_id: str, acao: str = "consultar"
+) -> tuple[str | None, str]:
     """`(id, mensagem_de_recusa)` para as tools que operam sobre um evento.
 
     **O único id legítimo é o gravado no lead.** Nada no prompt dá ao modelo
@@ -608,10 +711,7 @@ def resolver_event_id(lead: dict[str, Any], event_id: str) -> tuple[str | None, 
     informado = (event_id or "").strip()
 
     if not gravado:
-        return None, (
-            "Não encontrei nenhum agendamento registrado para este lead. "
-            "Confirme com ele e agende do zero."
-        )
+        return None, SEM_EVENTO_GRAVADO.get(acao, SEM_EVENTO_GRAVADO["consultar"])
 
     if informado and informado != gravado:
         logger.warning(
@@ -731,6 +831,16 @@ async def calendar_agendar(
             "Fase 7 e pergunte antes de agendar."
         )
 
+    # Lead com evento vivo no cadastro não agenda de novo: marcar um segundo
+    # deixaria o primeiro órfão na agenda do Silvio (o cadastro só guarda um
+    # id) e o lead com duas consultorias. Remarcar é `calendar_update`.
+    ja_agendado = (lead.get("google_event_id") or "").strip()
+    if ja_agendado:
+        return (
+            "Este lead já tem uma consultoria agendada. Para mudar o horário "
+            "use calendar_update; para desmarcar, calendar_delete."
+        )
+
     momento = parse_inicio(inicio)
     if momento is None:
         return (
@@ -766,11 +876,39 @@ async def calendar_agendar(
             participantes=[email_final],
             event_id=id_pretendido,
         )
+        event_id = (
+            criado.get("id") if isinstance(criado, dict) else None
+        ) or id_pretendido
+
+        if not await evento_confere(cliente, criado, event_id, momento):
+            # O id determinístico colidiu com um evento que NÃO é o que
+            # acabamos de pedir (lixeira ou slot já reagendado). Recriar com
+            # id aleatório é o único caminho que não mente: o id novo é
+            # necessariamente livre. Ver `evento_confere`.
+            criado = await cliente.criar_evento(
+                summary=TITULO.format(nome=nome),
+                inicio=momento,
+                fim=fim,
+                participantes=[email_final],
+            )
+            event_id = (criado.get("id") if isinstance(criado, dict) else "") or ""
+            if not event_id or not await evento_confere(
+                cliente, criado, event_id, momento
+            ):
+                logger.error(
+                    "agenda_nao_confirmou_evento",
+                    telefone=telefone,
+                    inicio=momento.isoformat(),
+                    event_id=event_id or None,
+                )
+                return (
+                    "Não consegui confirmar a criação do evento na agenda — "
+                    "NÃO diga ao lead que está agendado. Tente de novo; se "
+                    "persistir, acione o human_handover."
+                )
     except Exception as erro:
         logger.warning("agenda_agendamento_falhou", inicio=inicio, erro=str(erro))
         return FALHA_AGENDA
-
-    event_id = (criado.get("id") if isinstance(criado, dict) else None) or id_pretendido
 
     gravou = await gravar_agendamento(
         telefone,
@@ -824,7 +962,7 @@ async def calendar_update(novo_inicio: str, event_id: str = "") -> str:
     telefone, lead = contexto
     lead = lead or {}
 
-    alvo, recusa_id = resolver_event_id(lead, event_id)
+    alvo, recusa_id = resolver_event_id(lead, event_id, "remarcar")
     if alvo is None:
         return recusa_id
 
@@ -870,7 +1008,7 @@ async def calendar_delete(event_id: str = "") -> str:
     telefone, lead = contexto
     lead = lead or {}
 
-    alvo, recusa_id = resolver_event_id(lead, event_id)
+    alvo, recusa_id = resolver_event_id(lead, event_id, "cancelar")
     if alvo is None:
         return recusa_id
 
@@ -907,7 +1045,7 @@ async def calendar_get_event(event_id: str = "") -> str:
     _telefone, lead = contexto
     lead = lead or {}
 
-    alvo, recusa_id = resolver_event_id(lead, event_id)
+    alvo, recusa_id = resolver_event_id(lead, event_id, "consultar")
     if alvo is None:
         return recusa_id
 

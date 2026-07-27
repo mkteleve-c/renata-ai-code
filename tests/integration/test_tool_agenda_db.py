@@ -110,7 +110,17 @@ class ClienteFalso:
         self, summary, inicio, fim, participantes=None, event_id=None, **kwargs
     ):
         self.criados.append({"summary": summary, "event_id": event_id})
-        return {"id": event_id or "evento-novo"}
+        # Corpo realista: o cliente devolve o evento, com `start` e
+        # `status`, e é isso que `evento_confere` lê antes de confirmar.
+        return {
+            "id": event_id or "evento-novo",
+            "status": "confirmed",
+            "start": {"dateTime": inicio.isoformat()},
+            "end": {"dateTime": fim.isoformat()},
+        }
+
+    async def obter_evento(self, event_id):
+        return {"id": event_id, "status": "confirmed"}
 
     async def deletar_evento(self, event_id, notificar=True):
         self.deletados.append(event_id)

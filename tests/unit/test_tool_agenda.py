@@ -82,6 +82,12 @@ class ClienteFalso:
         self.atualizados: list[dict[str, Any]] = []
         self.deletados: list[str] = []
         self.listagens: list[tuple[datetime, datetime]] = []
+        # `{event_id: corpo}` — ids que respondem 409 no insert. O cliente
+        # real devolve o evento pré-existente nesse caso.
+        self.conflitos: dict[str, dict[str, Any]] = {}
+        # O que `obter_evento` devolve. Configurável para que a leitura não
+        # seja sempre um `confirmed` no horário certo.
+        self.detalhe: dict[str, Any] | None = None
 
     async def listar_eventos(self, inicio, fim, max_results=250):
         if self.erro:
@@ -94,6 +100,14 @@ class ClienteFalso:
     ):
         if self.erro:
             raise self.erro
+
+        # 409: o id já existe. O cliente real resolve lendo o evento
+        # existente e devolvendo ELE — que pode estar cancelado (lixeira) ou
+        # em outro horário (slot já reagendado). Nada é criado.
+        novo = event_id or "evento-novo"
+        if novo in self.conflitos:
+            return dict(self.conflitos[novo])
+
         self.criados.append(
             {
                 "summary": summary,
@@ -103,9 +117,16 @@ class ClienteFalso:
                 "event_id": event_id,
             }
         )
-        # O cliente real garante que o `id` sempre volta, e que é o que foi
-        # pedido quando quem chama escolheu um.
-        return {"id": event_id or "evento-novo", "htmlLink": "https://cal/x"}
+        # O cliente real garante que o `id` sempre volta, e devolve o corpo
+        # do evento — com `start` e `status`, que é o que a conferência lê.
+        return {
+            "id": novo,
+            "status": "confirmed",
+            "summary": summary,
+            "start": {"dateTime": inicio.isoformat()},
+            "end": {"dateTime": fim.isoformat()},
+            "htmlLink": "https://cal/x",
+        }
 
     async def atualizar_evento(self, event_id, **campos):
         if self.erro:
@@ -121,6 +142,12 @@ class ClienteFalso:
     async def obter_evento(self, event_id):
         if self.erro:
             raise self.erro
+        # `detalhe` é o override explícito da LEITURA e vence `conflitos`,
+        # que descreve o que o insert devolve no 409.
+        if self.detalhe is not None:
+            return {**self.detalhe, "id": event_id}
+        if event_id in self.conflitos:
+            return dict(self.conflitos[event_id])
         return {
             "id": event_id,
             "summary": "Consultoria de Alavancagem de Carreira - Ana",
@@ -426,6 +453,22 @@ async def test_get_many_nao_oferece_hoje_nem_fim_de_semana(turno, ambiente):
     assert "13/02" in saida
 
 
+@pytest.mark.parametrize("bruto", ["qualquer", "Qualquer", " QUALQUER ", "QuAlQuEr"])
+async def test_get_many_normaliza_o_periodo_antes_de_repassar(turno, ambiente, bruto):
+    # O período cru circulava adiante: `escolher_horarios` compara com
+    # "qualquer" e qualquer maiúscula do modelo desligava o viés de horário,
+    # devolvendo `8, 9` em vez de `13, 18`.
+    saida = await calendar_get_many.ainvoke({"periodo": bruto})
+    assert saida.splitlines()[0].endswith(": 13, 18")
+
+
+def test_normalizar_periodo():
+    assert agenda.normalizar_periodo(" TARDE ") == "tarde"
+    assert agenda.normalizar_periodo("Noite") == "noite"
+    assert agenda.normalizar_periodo("madrugada") is None
+    assert agenda.normalizar_periodo("") is None
+
+
 async def test_get_many_com_periodo_invalido_devolve_mensagem(turno, ambiente):
     saida = await calendar_get_many.ainvoke({"periodo": "madrugada"})
     assert "madrugada" in saida
@@ -543,6 +586,130 @@ async def test_agendar_avisa_quando_o_vinculo_nao_grava(turno, ambiente):
     assert len(ambiente.cliente.criados) == 1
     assert "12/02" in saida
     assert "human_handover" in saida
+
+
+def _conflito(event_id: str, inicio: str, fim: str, status: str = "confirmed"):
+    """Corpo que o cliente devolve quando o insert bate em 409."""
+    return {
+        "id": event_id,
+        "status": status,
+        "summary": "Consultoria de Alavancagem de Carreira - Ana",
+        "start": {"dateTime": inicio},
+        "end": {"dateTime": fim},
+    }
+
+
+async def test_agendar_nao_confirma_id_que_colidiu_com_evento_cancelado(
+    turno, ambiente
+):
+    # CASO A: o id determinístico já existe na Lixeira do Google (o lead
+    # marcou e cancelou este mesmo slot). O insert responde 409 e o cliente
+    # devolve o evento CANCELADO. Sem conferir, a tool diria "Agendado" e
+    # gravaria vínculo para um evento que não existe mais — convite nenhum.
+    momento = datetime(2026, 2, 12, 13, 0, tzinfo=FUSO)
+    colidido = agenda.event_id_deterministico(TELEFONE, momento)
+    ambiente.cliente.conflitos[colidido] = _conflito(
+        colidido,
+        "2026-02-12T13:00:00-03:00",
+        "2026-02-12T14:00:00-03:00",
+        status="cancelled",
+    )
+
+    saida = await calendar_agendar.ainvoke({"inicio": "2026-02-12T13:00"})
+
+    # Recriou com id aleatório — e o que foi gravado é o id novo, vivo.
+    assert len(ambiente.cliente.criados) == 1
+    assert ambiente.cliente.criados[0]["event_id"] is None
+    assert ambiente.gravacoes[0]["google_event_id"] != colidido
+    assert "12/02" in saida
+
+
+async def test_agendar_nao_confirma_id_que_colidiu_com_outro_horario(turno, ambiente):
+    # CASO B: o lead marcou às 13h de 12/02 (id derivado desse slot),
+    # remarcou para 20/02 às 10h — o evento manteve o id — e o modelo chama
+    # agendar no slot original. O 409 devolve o evento VIVO de 20/02. Sem
+    # conferir, a tool diria "Agendado: quinta 12/02 às 13h" para uma agenda
+    # que tem 20/02 às 10h.
+    momento = datetime(2026, 2, 12, 13, 0, tzinfo=FUSO)
+    colidido = agenda.event_id_deterministico(TELEFONE, momento)
+    ambiente.cliente.conflitos[colidido] = _conflito(
+        colidido, "2026-02-20T10:00:00-03:00", "2026-02-20T11:00:00-03:00"
+    )
+
+    saida = await calendar_agendar.ainvoke({"inicio": "2026-02-12T13:00"})
+
+    assert len(ambiente.cliente.criados) == 1
+    assert ambiente.cliente.criados[0]["event_id"] is None
+    assert ambiente.cliente.criados[0]["inicio"] == momento
+    assert ambiente.gravacoes[0]["google_event_id"] != colidido
+    assert "12/02" in saida
+
+
+async def test_agendar_nao_mente_quando_nem_a_recriacao_confere(turno, ambiente):
+    # Patológico: a colisão persiste e a recriação também devolve algo que
+    # não é o que foi pedido. O único desfecho honesto é NÃO confirmar.
+    momento = datetime(2026, 2, 12, 13, 0, tzinfo=FUSO)
+    colidido = agenda.event_id_deterministico(TELEFONE, momento)
+    ambiente.cliente.conflitos[colidido] = _conflito(
+        colidido, "2026-02-12T13:00:00-03:00", "2026-02-12T14:00:00-03:00", "cancelled"
+    )
+    ambiente.cliente.conflitos["evento-novo"] = _conflito(
+        "evento-novo", "2026-02-20T10:00:00-03:00", "2026-02-20T11:00:00-03:00"
+    )
+
+    saida = await calendar_agendar.ainvoke({"inicio": "2026-02-12T13:00"})
+
+    assert ambiente.gravacoes == []
+    assert "agendado:" not in saida.lower()
+    assert "human_handover" in saida
+
+
+async def test_agendar_confere_na_fonte_quando_o_corpo_vem_sem_horario(turno, ambiente):
+    # 2xx com corpo irreconhecível: o cliente cai no fallback `{"id": ...}`,
+    # sem `start`. O evento na agenda está CERTO — confirmado, no horário
+    # pedido. Sem ir à fonte, a conferência leria `inicio=None`, concluiria
+    # divergência e criaria um SEGUNDO evento no mesmo horário.
+    momento = datetime(2026, 2, 12, 13, 0, tzinfo=FUSO)
+    colidido = agenda.event_id_deterministico(TELEFONE, momento)
+    ambiente.cliente.conflitos[colidido] = {"id": colidido}
+    ambiente.cliente.detalhe = {
+        "status": "confirmed",
+        "start": {"dateTime": "2026-02-12T13:00:00-03:00"},
+    }
+
+    saida = await calendar_agendar.ainvoke({"inicio": "2026-02-12T13:00"})
+
+    assert ambiente.cliente.criados == [], "não pode criar um segundo evento"
+    assert ambiente.gravacoes[0]["google_event_id"] == colidido
+    assert "12/02" in saida
+
+
+async def test_agendar_recria_quando_a_fonte_diz_que_o_evento_esta_cancelado(
+    turno, ambiente
+):
+    # Mesmo fallback sem `start`, mas a fonte diz `cancelled`: aí sim recria.
+    momento = datetime(2026, 2, 12, 13, 0, tzinfo=FUSO)
+    colidido = agenda.event_id_deterministico(TELEFONE, momento)
+    ambiente.cliente.conflitos[colidido] = {"id": colidido}
+    ambiente.cliente.detalhe = {
+        "status": "cancelled",
+        "start": {"dateTime": "2026-02-12T13:00:00-03:00"},
+    }
+
+    await calendar_agendar.ainvoke({"inicio": "2026-02-12T13:00"})
+
+    assert ambiente.cliente.criados[0]["event_id"] is None
+
+
+async def test_agendar_recusa_lead_que_ja_tem_consultoria_marcada(turno, ambiente):
+    # Marcar um segundo evento deixaria o primeiro órfão — o cadastro só
+    # guarda um id — e o lead com duas consultorias.
+    ambiente.lead = lead(google_event_id="ev-existente")
+    saida = await calendar_agendar.ainvoke({"inicio": "2026-02-12T13:00"})
+
+    assert not ambiente.cliente.criados
+    assert not ambiente.gravacoes
+    assert "calendar_update" in saida
 
 
 async def test_agendar_ignora_o_proprio_evento_na_reconsulta(turno, ambiente):
@@ -753,11 +920,16 @@ async def test_delete_usa_o_google_event_id_do_lead(turno, ambiente):
     assert "cancel" in saida.lower()
 
 
-async def test_delete_sem_evento_conhecido_avisa(turno, ambiente):
+async def test_delete_sem_evento_conhecido_manda_human_handover(turno, ambiente):
+    # Não pode mandar "agende do zero": se o lead diz que tem reunião
+    # marcada, o cenário provável é evento vivo na agenda sem vínculo no
+    # cadastro, e agendar de novo deixa o órfão lá E cria um segundo.
     ambiente.lead = lead(google_event_id=None)
     saida = await calendar_delete.ainvoke({})
     assert not ambiente.cliente.deletados
     assert "não encontrei" in saida.lower()
+    assert "human_handover" in saida
+    assert "agende do zero" not in saida.lower()
 
 
 async def test_get_event_descreve_o_evento_do_lead(turno, ambiente):

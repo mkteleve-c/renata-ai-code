@@ -515,7 +515,16 @@ async def test_email_gravado_pelo_update_crm_vence_o_argumento_do_agendar(
             self, summary, inicio, fim, participantes=None, event_id=None, **kwargs
         ):
             self.participantes = list(participantes or [])
-            return {"id": event_id}
+            # Corpo realista: o cliente devolve o evento com `start` e
+            # `status`, e `calendar_agendar` confere os dois antes de
+            # confirmar (o insert pode ter batido em 409 e devolvido um
+            # evento cancelado ou de outro horário).
+            return {
+                "id": event_id,
+                "status": "confirmed",
+                "start": {"dateTime": inicio.isoformat()},
+                "end": {"dateTime": fim.isoformat()},
+            }
 
     falsa = AgendaFalsa()
     monkeypatch.setattr(agenda, "obter_cliente", lambda: falsa)
