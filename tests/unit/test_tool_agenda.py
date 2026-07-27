@@ -29,7 +29,11 @@ from whatsapp_langchain.agents.catalog.elevec_sdr.tools.agenda import (
     calendar_update,
     formatar_disponibilidade,
 )
-from whatsapp_langchain.shared.google_calendar import FUSO, GoogleCalendarError
+from whatsapp_langchain.shared.google_calendar import (
+    FUSO,
+    GoogleCalendarError,
+    validar_event_id,
+)
 
 TELEFONE = "+5511955554444"
 
@@ -83,9 +87,11 @@ class ClienteFalso:
         if self.erro:
             raise self.erro
         self.listagens.append((inicio, fim))
-        return [item for item in self.eventos if _cruza(item, inicio, fim)]
+        return [item for item in self.eventos if _na_janela(item, inicio, fim)]
 
-    async def criar_evento(self, summary, inicio, fim, participantes=None, **kwargs):
+    async def criar_evento(
+        self, summary, inicio, fim, participantes=None, event_id=None, **kwargs
+    ):
         if self.erro:
             raise self.erro
         self.criados.append(
@@ -94,9 +100,12 @@ class ClienteFalso:
                 "inicio": inicio,
                 "fim": fim,
                 "participantes": participantes,
+                "event_id": event_id,
             }
         )
-        return {"id": "evento-novo", "htmlLink": "https://cal/evento-novo"}
+        # O cliente real garante que o `id` sempre volta, e que é o que foi
+        # pedido quando quem chama escolheu um.
+        return {"id": event_id or "evento-novo", "htmlLink": "https://cal/x"}
 
     async def atualizar_evento(self, event_id, **campos):
         if self.erro:
@@ -121,11 +130,29 @@ class ClienteFalso:
         }
 
 
-def _cruza(item: dict[str, Any], inicio: datetime, fim: datetime) -> bool:
-    intervalo = agenda.intervalo_do_evento(item)
-    if intervalo is None:
-        return True
-    return intervalo[0] < fim and intervalo[1] > inicio
+def _dia(bloco: dict[str, Any]) -> str:
+    """`AAAA-MM-DD` do bloco, por fatia de texto."""
+    bruto = bloco.get("dateTime") or bloco.get("date") or ""
+    return bruto[:10]
+
+
+def _na_janela(item: dict[str, Any], inicio: datetime, fim: datetime) -> bool:
+    """Filtro do dublê: interseção por DIA, em comparação de strings ISO.
+
+    Deliberadamente mais grosso que a regra real e sem chamar nada de
+    `agenda`. Uma versão anterior reusava `agenda.intervalo_do_evento` e
+    replicava a fórmula de sobreposição — uma regressão em `_instante`
+    regrediria o dublê junto e os testes de tool continuariam verdes. Como
+    devolve um superconjunto do que a janela pede, quem filtra de verdade é
+    sempre o código sob teste.
+    """
+    dia_inicio = _dia(item.get("start", {}))
+    dia_fim = _dia(item.get("end", {})) or dia_inicio
+    if not dia_inicio:
+        return False
+    return dia_inicio <= fim.strftime("%Y-%m-%d") and dia_fim >= inicio.strftime(
+        "%Y-%m-%d"
+    )
 
 
 def lead(**campos: Any) -> dict[str, Any]:
@@ -164,6 +191,9 @@ def ambiente(monkeypatch):
             self.lead: dict[str, Any] | None = lead()
             self.gravacoes: list[dict[str, Any]] = []
             self.agora = TERCA
+            # A gravação pode falhar (lead ausente, banco fora) — os testes
+            # que exercitam esse desfecho viram isto para False.
+            self.gravacao_ok = True
 
     amb = Ambiente()
 
@@ -175,6 +205,7 @@ def ambiente(monkeypatch):
 
     async def gravar(telefone, **campos):
         amb.gravacoes.append({"telefone": telefone, **campos})
+        return amb.gravacao_ok
 
     monkeypatch.setattr(agenda, "carregar_lead", carregar)
     monkeypatch.setattr(agenda, "gravar_agendamento", gravar)
@@ -324,9 +355,55 @@ def test_replay_da_agenda_real_nao_oferece_horario_ocupado():
 def test_replay_da_agenda_real_com_escassez():
     segunda = datetime(2026, 7, 27, 9, 0, tzinfo=FUSO)
     disponibilidade = calcular_disponibilidade(eventos_reais(), segunda, "qualquer")
-    assert formatar_disponibilidade(aplicar_escassez(disponibilidade)) == (
-        "terça 28/07: 17, 18\nquarta 29/07: 13, 14"
+    # 29/07 tem 13,14,15,16,17,18,20,21 livres: sai `13, 18` — tarde + noite,
+    # não `13, 14`. Ver `escolher_horarios`.
+    assert formatar_disponibilidade(aplicar_escassez(disponibilidade, "qualquer")) == (
+        "terça 28/07: 17, 18\nquarta 29/07: 13, 18"
     )
+
+
+# --- Viés de horário --------------------------------------------------------
+
+
+def test_dia_livre_sem_periodo_pedido_nao_comeca_as_8():
+    # Sem esta regra, `[:2]` sobre a lista ordenada daria `8, 9` para toda
+    # agenda com a manhã livre, e as consultorias se concentrariam às 8h.
+    livres = calcular_disponibilidade([], TERCA, "qualquer")
+    escolhidas = aplicar_escassez(livres, "qualquer")[0][1]
+    assert escolhidas == [13, 18]
+
+
+def test_periodo_pedido_pelo_lead_e_respeitado():
+    livres = calcular_disponibilidade([], TERCA, "manha")
+    assert aplicar_escassez(livres, "manha")[0][1] == [8, 9]
+
+
+def test_sem_periodo_pedido_os_dois_horarios_vem_de_faixas_diferentes():
+    # Só a tarde livre naquele dia → cai para dois da mesma faixa, sem
+    # inventar horário indisponível.
+    assert agenda.escolher_horarios([13, 14, 15], "qualquer") == [13, 14]
+    # Manhã e noite livres → um de cada.
+    assert agenda.escolher_horarios([8, 9, 20, 21], "qualquer") == [8, 20]
+    assert agenda.escolher_horarios([9], "qualquer") == [9]
+    assert agenda.escolher_horarios([], "qualquer") == []
+
+
+# --- Normalização defensiva -------------------------------------------------
+
+
+def test_evento_invertido_ainda_bloqueia():
+    # Extremos trocados: sem a normalização, `ev_i < fim and ev_f > inicio`
+    # é falso para todo slot e o evento some da agenda. Depois de trocar,
+    # ele é o intervalo [13:00, 14:00) e bloqueia só as 13h.
+    eventos = [evento("2026-02-11T14:00:00-03:00", "2026-02-11T13:00:00-03:00")]
+    livres = calcular_disponibilidade(eventos, TERCA, "tarde")
+    assert livres[0][1] == [14, 15, 16, 17]
+
+
+def test_evento_de_duracao_zero_bloqueia_o_slot_que_o_contem():
+    eventos = [evento("2026-02-11T13:00:00-03:00", "2026-02-11T13:00:00-03:00")]
+    livres = calcular_disponibilidade(eventos, TERCA, "tarde")
+    assert 13 not in livres[0][1]
 
 
 # --- calendar_get_many ------------------------------------------------------
@@ -401,22 +478,87 @@ async def test_agendar_recusa_email_que_nao_e_email(turno, ambiente):
 async def test_agendar_cria_evento_e_grava_google_event_id(turno, ambiente):
     saida = await calendar_agendar.ainvoke({"inicio": "2026-02-12T13:00"})
 
+    esperado = agenda.event_id_deterministico(
+        TELEFONE, datetime(2026, 2, 12, 13, 0, tzinfo=FUSO)
+    )
+
     assert len(ambiente.cliente.criados) == 1
     criado = ambiente.cliente.criados[0]
     assert criado["summary"] == "Consultoria de Alavancagem de Carreira - Ana"
     assert criado["participantes"] == ["ana@exemplo.com"]
     assert criado["inicio"] == datetime(2026, 2, 12, 13, 0, tzinfo=FUSO)
     assert criado["fim"] == datetime(2026, 2, 12, 14, 0, tzinfo=FUSO)
+    assert criado["event_id"] == esperado
 
     assert ambiente.gravacoes == [
         {
             "telefone": TELEFONE,
-            "google_event_id": "evento-novo",
+            "google_event_id": esperado,
             "email": "ana@exemplo.com",
             "faturamento_mensal": "uns 30 mil",
         }
     ]
     assert "12/02" in saida
+    assert "human_handover" not in saida
+
+
+async def test_event_id_e_deterministico_por_lead_e_slot():
+    slot = datetime(2026, 2, 12, 13, 0, tzinfo=FUSO)
+    outro = datetime(2026, 2, 12, 14, 0, tzinfo=FUSO)
+
+    # Mesmo lead, mesmo slot, mesmo id — é o que faz o retry colidir em 409
+    # em vez de marcar duas consultorias.
+    assert agenda.event_id_deterministico(
+        TELEFONE, slot
+    ) == agenda.event_id_deterministico(TELEFONE, slot)
+    # E o telefone entra canonicalizado: as duas formas do 9º dígito são a
+    # mesma pessoa e precisam gerar o mesmo id.
+    assert agenda.event_id_deterministico(
+        "+5511955554444", slot
+    ) == agenda.event_id_deterministico("5511955554444", slot)
+
+    assert agenda.event_id_deterministico(
+        TELEFONE, slot
+    ) != agenda.event_id_deterministico(TELEFONE, outro)
+    assert agenda.event_id_deterministico(
+        TELEFONE, slot
+    ) != agenda.event_id_deterministico("+5511933332222", slot)
+
+    # base32hex: o Google recusaria qualquer coisa fora de `a-v` e `0-9`.
+    validar_event_id(agenda.event_id_deterministico(TELEFONE, slot))
+
+
+async def test_agendar_avisa_quando_o_vinculo_nao_grava(turno, ambiente):
+    # Lead ausente de leads_crm com e-mail e faturamento vindos por
+    # argumento: o evento nasce na agenda e o UPDATE casa zero linhas.
+    ambiente.gravacao_ok = False
+    saida = await calendar_agendar.ainvoke(
+        {
+            "inicio": "2026-02-12T13:00",
+            "email": "ana@exemplo.com",
+            "faturamento_mensal": "30 mil",
+        }
+    )
+    # O evento EXISTE — negar isso ao lead seria mentira na direção oposta.
+    assert len(ambiente.cliente.criados) == 1
+    assert "12/02" in saida
+    assert "human_handover" in saida
+
+
+async def test_agendar_ignora_o_proprio_evento_na_reconsulta(turno, ambiente):
+    # Retry do mesmo agendamento: o evento já criado tem o id determinístico
+    # e não pode bloquear a si mesmo, senão a segunda tentativa diria
+    # "ocupado" para um horário que é do próprio lead.
+    momento = datetime(2026, 2, 12, 13, 0, tzinfo=FUSO)
+    ambiente.cliente.eventos = [
+        evento(
+            "2026-02-12T13:00:00-03:00",
+            "2026-02-12T14:00:00-03:00",
+            event_id=agenda.event_id_deterministico(TELEFONE, momento),
+        )
+    ]
+    await calendar_agendar.ainvoke({"inicio": "2026-02-12T13:00"})
+    assert ambiente.cliente.criados
 
 
 async def test_agendar_persiste_email_e_faturamento_novos(turno, ambiente):
@@ -466,6 +608,26 @@ async def test_agendar_recusa_hora_quebrada(turno, ambiente):
     assert "hora cheia" in saida.lower()
 
 
+async def test_agendar_recusa_microssegundo(turno, ambiente):
+    # `minute` e `second` zerados, `microsecond` não: passaria e criaria um
+    # evento às 13:00:00.5.
+    saida = await calendar_agendar.ainvoke({"inicio": "2026-02-12T13:00:00.500000"})
+    assert not ambiente.cliente.criados
+    assert "hora cheia" in saida.lower()
+
+
+async def test_agendar_prefere_o_email_do_cadastro_ao_argumento(turno, ambiente):
+    # A coluna é o que o lead realmente disse; o argumento é fallback. A
+    # partir da Task 6 (que persiste esses campos) isto passa a ser o
+    # caminho normal, e um valor inventado no turno não sobrepõe o cadastro.
+    ambiente.lead = lead(email="cadastro@exemplo.com")
+    await calendar_agendar.ainvoke(
+        {"inicio": "2026-02-12T13:00", "email": "inventado@exemplo.com"}
+    )
+    assert ambiente.cliente.criados[0]["participantes"] == ["cadastro@exemplo.com"]
+    assert ambiente.gravacoes[0]["email"] == "cadastro@exemplo.com"
+
+
 async def test_agendar_com_data_ilegivel_devolve_mensagem(turno, ambiente):
     saida = await calendar_agendar.ainvoke({"inicio": "quinta que vem"})
     assert not ambiente.cliente.criados
@@ -504,6 +666,51 @@ async def test_update_usa_o_google_event_id_do_lead(turno, ambiente):
         2026, 2, 13, 14, 0, tzinfo=FUSO
     )
     assert "13/02" in saida
+
+
+async def test_delete_recusa_event_id_que_nao_e_do_lead(turno, ambiente):
+    # O modelo alucina um id. Sem a checagem: 404 tolerado pelo cliente
+    # idempotente → "Cancelado" para o lead → evento intacto na agenda do
+    # Silvio → vínculo apagado → nunca mais dá para cancelar.
+    ambiente.lead = lead(google_event_id="ev-do-lead")
+    saida = await calendar_delete.ainvoke({"event_id": "ev-de-outra-pessoa"})
+
+    assert ambiente.cliente.deletados == []
+    assert ambiente.gravacoes == []
+    assert "cancelado" not in saida.lower()
+    assert "event_id" in saida.lower()
+
+
+async def test_delete_aceita_event_id_redundante(turno, ambiente):
+    ambiente.lead = lead(google_event_id="ev-do-lead")
+    await calendar_delete.ainvoke({"event_id": "ev-do-lead"})
+    assert ambiente.cliente.deletados == ["ev-do-lead"]
+
+
+async def test_update_recusa_event_id_que_nao_e_do_lead(turno, ambiente):
+    ambiente.lead = lead(google_event_id="ev-do-lead")
+    saida = await calendar_update.ainvoke(
+        {"novo_inicio": "2026-02-13T14:00", "event_id": "ev-de-outra-pessoa"}
+    )
+    assert ambiente.cliente.atualizados == []
+    assert "event_id" in saida.lower()
+
+
+async def test_get_event_recusa_event_id_que_nao_e_do_lead(turno, ambiente):
+    # Com id de terceiro, a tool devolveria o `summary` cru de um
+    # compromisso alheio para dentro da conversa com o lead.
+    ambiente.lead = lead(google_event_id="ev-do-lead")
+    saida = await calendar_get_event.ainvoke({"event_id": "ev-de-outra-pessoa"})
+    assert "Consultoria de Alavancagem" not in saida
+    assert "event_id" in saida.lower()
+
+
+async def test_delete_avisa_quando_nao_consegue_limpar_o_vinculo(turno, ambiente):
+    ambiente.lead = lead(google_event_id="ev-do-lead")
+    ambiente.gravacao_ok = False
+    saida = await calendar_delete.ainvoke({})
+    assert ambiente.cliente.deletados == ["ev-do-lead"]
+    assert "human_handover" in saida
 
 
 async def test_update_sem_evento_conhecido_avisa(turno, ambiente):

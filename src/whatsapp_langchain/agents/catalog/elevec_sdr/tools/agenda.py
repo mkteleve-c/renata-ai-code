@@ -30,7 +30,23 @@ a fase para onde voltar (6 ou 7). O prompt chama a sequência de "INVIOLÁVEL"
 e "TERMINANTEMENTE PROIBIDO" — três parágrafos pedem, um `if` garante. Como
 nenhuma outra tool grava esses dois campos (o n8n coletava e nunca
 persistia: 0 leads com e-mail no banco de origem), `calendar_agendar` aceita
-os dois como argumento e os persiste junto do agendamento.
+os dois como argumento e os persiste junto do agendamento — mas a coluna,
+quando preenchida, sempre vence o argumento (ver `_preferir_coluna`).
+
+**O único `event_id` legítimo é o gravado no lead.** `calendar_update`,
+`calendar_delete` e `calendar_get_event` recusam id divergente em vez de
+obedecer: aceitar um id alucinado faria `calendar_delete` responder
+"Cancelado" ao lead com o evento intacto na agenda do Silvio, e
+`calendar_get_event` despejar na conversa o compromisso de um terceiro. Ver
+`resolver_event_id`.
+
+**A gravação no banco é um desfecho, não um efeito colateral.**
+`gravar_agendamento` confere `rowcount` e devolve `False` quando nada casou
+— lead ausente de `leads_crm` com evento já criado na agenda é o caminho
+concreto de um `google_event_id` se perder para sempre. Nesse caso a tool
+confirma o agendamento (ele existe) e manda acionar `human_handover`, com o
+id no log para reconciliação. O id do evento é derivado de `(lead, slot)`
+justamente para sobreviver a isso — ver `event_id_deterministico`.
 
 Toda tool devolve **string** em qualquer desfecho, inclusive erro. Exceção
 que sobe de uma tool derruba o turno do agente; uma frase deixa a Renata
@@ -39,6 +55,7 @@ seguir o SOP ("tente 3x, depois human_handover").
 
 from __future__ import annotations
 
+import hashlib
 import re
 from datetime import date, datetime, timedelta
 from typing import Any
@@ -69,6 +86,13 @@ PERIODOS: dict[str, tuple[int, ...]] = {
 PERIODOS["qualquer"] = tuple(
     sorted(PERIODOS["manha"] + PERIODOS["tarde"] + PERIODOS["noite"])
 )
+
+PERIODO_DA_HORA = {
+    hora: nome for nome in ("manha", "tarde", "noite") for hora in PERIODOS[nome]
+}
+
+# Ordem de preferência quando o lead NÃO pede período — ver `escolher_horarios`.
+PREFERENCIA_PERIODO = ("tarde", "noite", "manha")
 
 # Escassez do prompt: no máximo 2 dias e 2 horários por dia (4 slots).
 MAX_DIAS_SUGERIDOS = 2
@@ -164,12 +188,37 @@ def intervalo_do_evento(evento: dict[str, Any]) -> tuple[datetime, datetime] | N
     Google sempre manda `start`/`end`, então esse shape é anomalia, e
     apagar um dia inteiro da lista por causa dela custaria mais do que
     corrige.
+
+    Duas normalizações defensivas. O Google não produz nenhum dos dois
+    shapes, mas a checagem de sobreposição os leria como **livre**, que é o
+    lado errado do erro:
+
+    - `fim < inicio` (invertido) tem os extremos trocados. Sem isso,
+      `ev_i < fim and ev_f > inicio` é falso para qualquer slot e o evento
+      simplesmente some da agenda.
+    - `fim == inicio` (duração zero) é um ponto no tempo. Ele passa a
+      ocupar um minuto, o suficiente para bloquear o slot que o contém —
+      compromisso marcado sem duração ainda é compromisso.
     """
     inicio = _instante(evento.get("start"))
     fim = _instante(evento.get("end"))
     if inicio is None or fim is None:
         logger.warning("agenda_evento_sem_horario", event_id=evento.get("id"))
         return None
+
+    if fim < inicio:
+        logger.warning(
+            "agenda_evento_invertido",
+            event_id=evento.get("id"),
+            inicio=inicio.isoformat(),
+            fim=fim.isoformat(),
+        )
+        inicio, fim = fim, inicio
+
+    if fim == inicio:
+        logger.warning("agenda_evento_sem_duracao", event_id=evento.get("id"))
+        fim = inicio + timedelta(minutes=1)
+
     return inicio, fim
 
 
@@ -243,17 +292,64 @@ def calcular_disponibilidade(
     return disponibilidade
 
 
+def escolher_horarios(horas: list[int], periodo: str) -> list[int]:
+    """Os 2 horários que a Renata vai oferecer naquele dia.
+
+    Quando o lead **pediu** um período, os dois primeiros dele: ele já
+    escolheu a faixa, e a tool não tem por que discordar.
+
+    Quando o lead **não** pediu (`qualquer`, o default), pegar os dois
+    primeiros da lista ordenada daria `8, 9` para toda agenda com a manhã
+    livre — o horário menos provável para um profissional em cargo de
+    liderança, que é o público do SOP, e concentraria as consultorias às 8h
+    da manhã. Por isso duas correções:
+
+    1. **Começa pela tarde**, depois noite, depois manhã. É a preferência
+       que o próprio exemplo do n8n carrega (`quinta 12/02: 13, 14`).
+    2. **O segundo horário vem de outro período**, quando existir. `13, 14`
+       são a mesma resposta para o lead — quem não pode às 13h raramente
+       pode às 14h. `13, 18` é escolha de verdade e dobra a chance de uma
+       das duas servir.
+
+    A saída sai em ordem crescente: `13, 18` lê melhor que `18, 13`.
+    """
+    if periodo != "qualquer":
+        return horas[:MAX_HORARIOS_POR_DIA]
+
+    ordenadas = sorted(
+        horas,
+        key=lambda hora: (PREFERENCIA_PERIODO.index(PERIODO_DA_HORA[hora]), hora),
+    )
+    if not ordenadas:
+        return []
+
+    escolhidas = [ordenadas[0]]
+    for hora in ordenadas[1:]:
+        if PERIODO_DA_HORA[hora] != PERIODO_DA_HORA[escolhidas[0]]:
+            escolhidas.append(hora)
+            break
+
+    if len(escolhidas) < MAX_HORARIOS_POR_DIA:
+        escolhidas += [hora for hora in ordenadas if hora not in escolhidas][
+            : MAX_HORARIOS_POR_DIA - len(escolhidas)
+        ]
+
+    return sorted(escolhidas)
+
+
 def aplicar_escassez(
     disponibilidade: list[tuple[date, list[int]]],
+    periodo: str = "qualquer",
 ) -> list[tuple[date, list[int]]]:
-    """Corta em 2 dias × 2 horários, sempre os mais próximos.
+    """Corta em 2 dias × 2 horários.
 
-    Escolher os primeiros é o que fecha reunião mais cedo, e é
+    Os **dias** são sempre os mais próximos: fecha reunião mais cedo e é
     determinístico — sortear daria respostas diferentes para o mesmo lead
     perguntando duas vezes, e o SOP manda reconsultar antes de confirmar.
+    Os **horários** dentro do dia seguem `escolher_horarios`.
     """
     return [
-        (dia, horas[:MAX_HORARIOS_POR_DIA])
+        (dia, escolher_horarios(horas, periodo))
         for dia, horas in disponibilidade[:MAX_DIAS_SUGERIDOS]
     ]
 
@@ -321,7 +417,9 @@ def parse_inicio(bruto: str) -> datetime | None:
 
 def validar_slot(momento: datetime, agora: datetime) -> str | None:
     """Mensagem de recusa quando o horário viola a política, ou `None`."""
-    if momento.minute or momento.second:
+    # `microsecond` junto: `2026-02-12 13:00:00.5` passaria pelos dois
+    # primeiros e criaria um evento às 13:00:00.5 — que o Google aceita.
+    if momento.minute or momento.second or momento.microsecond:
         return (
             "A consultoria só encaixa em hora cheia (13:00, 14:00...). "
             "Confirme com o lead uma hora cheia e tente de novo."
@@ -382,18 +480,28 @@ async def gravar_agendamento(
     google_event_id: str | None,
     email: str | None = None,
     faturamento_mensal: str | None = None,
-) -> None:
+) -> bool:
     """Persiste o id do evento e, quando vierem, e-mail e faturamento.
 
     `google_event_id` é escrito sempre — inclusive `NULL`, que é como o
     cancelamento apaga o vínculo. `email` e `faturamento_mensal` só quando
     não-vazios: um argumento em branco não pode apagar o que já estava lá.
+
+    **Devolve `False` quando o UPDATE não casou nenhuma linha.** Sem checar
+    `rowcount`, um lead ausente de `leads_crm` — que é possível: o portão
+    aceita e-mail e faturamento vindos por argumento — faria o evento nascer
+    na agenda e o `UPDATE` casar zero linhas em silêncio absoluto, perdendo
+    o `google_event_id` para sempre. Zero linhas é falha, não sucesso.
+
+    Continua sem levantar: o evento já está na agenda e uma exceção aqui
+    desfaria uma confirmação verdadeira. Quem chama decide o que dizer ao
+    lead, e o log carrega `google_event_id` para reconciliação manual.
     """
     canonico = _canonico(telefone)
     try:
         pool = await get_pool()
         async with pool.connection() as conn:
-            await conn.execute(
+            cur = await conn.execute(
                 "update leads_crm set"
                 "  google_event_id = %s,"
                 "  email = coalesce(nullif(%s, ''), email),"
@@ -401,15 +509,49 @@ async def gravar_agendamento(
                 " where phone = %s",
                 (google_event_id, email or "", faturamento_mensal or "", canonico),
             )
+            afetadas = cur.rowcount
     except Exception as erro:
-        # O evento já está na agenda; falhar aqui não pode desfazer a
-        # confirmação que o lead vai receber. Vira aviso, não exceção.
-        logger.warning(
+        logger.error(
             "agenda_lead_nao_atualizado",
             phone=canonico,
             google_event_id=google_event_id,
             erro=str(erro),
         )
+        return False
+
+    if afetadas == 0:
+        logger.error(
+            "agenda_lead_inexistente_na_gravacao",
+            phone=canonico,
+            google_event_id=google_event_id,
+        )
+        return False
+
+    return True
+
+
+def event_id_deterministico(telefone: str, inicio: datetime) -> str:
+    """Id do evento derivado de telefone + horário, estável entre turnos.
+
+    O `events.insert` do Google aceita id escolhido pelo cliente e responde
+    `409 Conflict` quando ele já existe — que `criar_evento` resolve lendo o
+    evento existente. Derivar o id de `(lead, slot)` em vez de sortear
+    compra duas coisas:
+
+    - **retry deixa de duplicar.** Um timeout depois de o Google já ter
+      criado o evento, ou o processor reentregando a mensagem, cai no mesmo
+      id e colide — em vez de marcar duas consultorias no mesmo horário na
+      agenda de trabalho de uma pessoa real.
+    - **reconciliação trivial.** Se o `UPDATE` no banco falhar, o id não se
+      perde: recomputá-lo a partir do telefone e do horário confirmado ao
+      lead devolve exatamente o evento que ficou órfão.
+
+    SHA-256 truncado em 32 caracteres hex — `0-9a-f` é subconjunto próprio
+    do base32hex que `validar_event_id` exige, e 128 bits deixam a colisão
+    fora de qualquer escala que este sistema alcance.
+    """
+    semente = f"{_canonico(telefone)}:{inicio.astimezone(FUSO).isoformat()}"
+    return hashlib.sha256(semente.encode()).hexdigest()[:32]
 
 
 async def _lead_do_turno() -> tuple[str, dict[str, Any] | None] | None:
@@ -418,6 +560,71 @@ async def _lead_do_turno() -> tuple[str, dict[str, Any] | None] | None:
         logger.warning("agenda_sem_telefone_no_config")
         return None
     return telefone, await carregar_lead(telefone)
+
+
+def _preferir_coluna(gravado: Any, argumento: str, campo: str) -> str:
+    """Valor do portão: a coluna vence o argumento quando existe.
+
+    O argumento do modelo é o fallback, não a fonte. Hoje ele é o único
+    caminho — nenhuma tool grava `email`/`faturamento_mensal`, e ler só a
+    coluna deixaria o agendamento inalcançável —, mas a partir do momento em
+    que a Task 6 persistir esses campos, o que o lead **realmente disse**
+    passa a estar no banco, e um argumento inventado no meio do turno não
+    pode sobrepô-lo. Escrito assim desde já para que a virada seja
+    automática.
+
+    Divergência entre os dois vira log: é o sintoma de coluna velha (o lead
+    corrigiu o e-mail e ninguém atualizou) e de alucinação, e os dois casos
+    precisam ser diagnosticáveis sem reproduzir a conversa.
+    """
+    coluna = (gravado or "").strip() if isinstance(gravado, str) else ""
+    informado = (argumento or "").strip()
+
+    if coluna and informado and coluna != informado:
+        logger.warning("agenda_valor_divergente_do_cadastro", campo=campo)
+
+    return coluna or informado
+
+
+def resolver_event_id(lead: dict[str, Any], event_id: str) -> tuple[str | None, str]:
+    """`(id, mensagem_de_recusa)` para as tools que operam sobre um evento.
+
+    **O único id legítimo é o gravado no lead.** Nada no prompt dá ao modelo
+    uma fonte de ids de evento, então um `event_id` que chega por argumento
+    e não bate com o do lead é alucinação ou vazamento de outra conversa —
+    e o estrago de aceitá-lo é concreto:
+
+    - `calendar_delete` com id inventado bate num 404 que o cliente tolera
+      por ser idempotente; a tool responderia *"Cancelado"* ao lead com o
+      evento intacto na agenda do Silvio **e** o vínculo apagado, deixando
+      o agente sem como cancelar de verdade depois.
+    - `calendar_get_event` com id de terceiro devolveria o `summary` de um
+      compromisso alheio para dentro da conversa.
+
+    Por isso o argumento não tem precedência: ele é aceito só quando é
+    redundante (igual ao gravado) e recusado quando diverge.
+    """
+    gravado = (lead.get("google_event_id") or "").strip()
+    informado = (event_id or "").strip()
+
+    if not gravado:
+        return None, (
+            "Não encontrei nenhum agendamento registrado para este lead. "
+            "Confirme com ele e agende do zero."
+        )
+
+    if informado and informado != gravado:
+        logger.warning(
+            "agenda_event_id_divergente",
+            informado=informado,
+            gravado=gravado,
+        )
+        return None, (
+            "O event_id informado não é o do agendamento deste lead — não vou "
+            "mexer em evento de outra pessoa. Chame de novo sem event_id."
+        )
+
+    return gravado, ""
 
 
 # --- Tools -----------------------------------------------------------------
@@ -474,7 +681,7 @@ async def calendar_get_many(periodo: str = "qualquer", a_partir_de: str = "") ->
             "Ofereça outro período ou consulte uma semana adiante."
         )
 
-    return formatar_disponibilidade(aplicar_escassez(disponibilidade))
+    return formatar_disponibilidade(aplicar_escassez(disponibilidade, periodo))
 
 
 @tool
@@ -508,16 +715,16 @@ async def calendar_agendar(
     telefone, lead = contexto
     lead = lead or {}
 
-    email_final = (email or lead.get("email") or "").strip()
+    email_final = _preferir_coluna(lead.get("email"), email, "email")
     if not _EMAIL.match(email_final):
         return (
             "Ainda não tenho um e-mail válido deste lead — volte à Fase 6 e "
             "peça o melhor e-mail dele antes de agendar."
         )
 
-    faturamento_final = (
-        faturamento_mensal or lead.get("faturamento_mensal") or ""
-    ).strip()
+    faturamento_final = _preferir_coluna(
+        lead.get("faturamento_mensal"), faturamento_mensal, "faturamento_mensal"
+    )
     if not faturamento_final:
         return (
             "Ainda não tenho o faturamento médio mensal deste lead — volte à "
@@ -538,11 +745,15 @@ async def calendar_agendar(
 
     fim = momento + timedelta(minutes=DURACAO_MINUTOS)
     nome = sanitizar_nome(lead.get("name"))
+    # Derivado de (lead, slot): retry não duplica e o id sobrevive à falha
+    # de gravação. Ver `event_id_deterministico`.
+    id_pretendido = event_id_deterministico(telefone, momento)
 
     try:
         cliente = obter_cliente()
         eventos = await cliente.listar_eventos(momento, fim)
-        if not slot_livre(momento.date(), momento.hour, intervalos_ocupados(eventos)):
+        ocupados = intervalos_ocupados(eventos, ignorar_event_id=id_pretendido)
+        if not slot_livre(momento.date(), momento.hour, ocupados):
             return (
                 f"{formatar_slot(momento)} está ocupado na agenda. "
                 "Consulte a disponibilidade e ofereça outro horário."
@@ -553,21 +764,39 @@ async def calendar_agendar(
             inicio=momento,
             fim=fim,
             participantes=[email_final],
+            event_id=id_pretendido,
         )
     except Exception as erro:
         logger.warning("agenda_agendamento_falhou", inicio=inicio, erro=str(erro))
         return FALHA_AGENDA
 
-    event_id = criado.get("id") if isinstance(criado, dict) else None
-    if not event_id:
-        logger.warning("agenda_evento_criado_sem_id", telefone=telefone)
+    event_id = (criado.get("id") if isinstance(criado, dict) else None) or id_pretendido
 
-    await gravar_agendamento(
+    gravou = await gravar_agendamento(
         telefone,
         google_event_id=event_id,
         email=email_final,
         faturamento_mensal=faturamento_final,
     )
+
+    confirmacao = (
+        f"Agendado: {formatar_slot(momento)}. Convite enviado para {email_final}."
+    )
+
+    if not gravou:
+        # O evento EXISTE na agenda — negar isso ao lead seria mentira na
+        # direção oposta. O que falhou foi o vínculo no CRM, e o log carrega
+        # tudo que a reconciliação manual precisa.
+        logger.error(
+            "agenda_vinculo_nao_gravado",
+            telefone=telefone,
+            google_event_id=event_id,
+            inicio=momento.isoformat(),
+        )
+        return (
+            f"{confirmacao} ATENÇÃO: não consegui registrar o agendamento no "
+            "cadastro do lead — acione o human_handover para registro manual."
+        )
 
     logger.info(
         "agenda_evento_agendado",
@@ -575,7 +804,7 @@ async def calendar_agendar(
         google_event_id=event_id,
         inicio=momento.isoformat(),
     )
-    return f"Agendado: {formatar_slot(momento)}. Convite enviado para {email_final}."
+    return confirmacao
 
 
 @tool
@@ -584,7 +813,8 @@ async def calendar_update(novo_inicio: str, event_id: str = "") -> str:
 
     Args:
         novo_inicio: nova data e hora, em `AAAA-MM-DDTHH:MM`.
-        event_id: opcional. Vazio usa o evento gravado no lead.
+        event_id: normalmente não precisa — a tool usa o evento gravado no
+            lead. Um id diferente do gravado é recusado.
 
     Reconsulta a disponibilidade do novo horário antes de mover.
     """
@@ -594,12 +824,9 @@ async def calendar_update(novo_inicio: str, event_id: str = "") -> str:
     telefone, lead = contexto
     lead = lead or {}
 
-    alvo = (event_id or lead.get("google_event_id") or "").strip()
-    if not alvo:
-        return (
-            "Não encontrei nenhum agendamento deste lead para remarcar. "
-            "Confirme com ele e agende do zero."
-        )
+    alvo, recusa_id = resolver_event_id(lead, event_id)
+    if alvo is None:
+        return recusa_id
 
     momento = parse_inicio(novo_inicio)
     if momento is None:
@@ -625,9 +852,6 @@ async def calendar_update(novo_inicio: str, event_id: str = "") -> str:
         logger.warning("agenda_reagendamento_falhou", event_id=alvo, erro=str(erro))
         return FALHA_AGENDA
 
-    if alvo != lead.get("google_event_id"):
-        await gravar_agendamento(telefone, google_event_id=alvo)
-
     logger.info("agenda_evento_reagendado", telefone=telefone, event_id=alvo)
     return f"Reagendado para {formatar_slot(momento)}."
 
@@ -637,7 +861,8 @@ async def calendar_delete(event_id: str = "") -> str:
     """Cancela a consultoria agendada.
 
     Args:
-        event_id: opcional. Vazio usa o evento gravado no lead.
+        event_id: normalmente não precisa — a tool usa o evento gravado no
+            lead. Um id diferente do gravado é recusado.
     """
     contexto = await _lead_do_turno()
     if contexto is None:
@@ -645,9 +870,9 @@ async def calendar_delete(event_id: str = "") -> str:
     telefone, lead = contexto
     lead = lead or {}
 
-    alvo = (event_id or lead.get("google_event_id") or "").strip()
-    if not alvo:
-        return "Não encontrei nenhum agendamento deste lead para cancelar."
+    alvo, recusa_id = resolver_event_id(lead, event_id)
+    if alvo is None:
+        return recusa_id
 
     try:
         await obter_cliente().deletar_evento(alvo)
@@ -655,8 +880,16 @@ async def calendar_delete(event_id: str = "") -> str:
         logger.warning("agenda_cancelamento_falhou", event_id=alvo, erro=str(erro))
         return FALHA_AGENDA
 
-    await gravar_agendamento(telefone, google_event_id=None)
+    gravou = await gravar_agendamento(telefone, google_event_id=None)
     logger.info("agenda_evento_cancelado", telefone=telefone, event_id=alvo)
+    if not gravou:
+        logger.error(
+            "agenda_vinculo_nao_apagado", telefone=telefone, google_event_id=alvo
+        )
+        return (
+            "Cancelado na agenda. ATENÇÃO: não consegui limpar o registro no "
+            "cadastro do lead — acione o human_handover."
+        )
     return "Cancelado. A consultoria foi removida da agenda."
 
 
@@ -665,7 +898,8 @@ async def calendar_get_event(event_id: str = "") -> str:
     """Consulta os detalhes da consultoria já agendada.
 
     Args:
-        event_id: opcional. Vazio usa o evento gravado no lead.
+        event_id: normalmente não precisa — a tool usa o evento gravado no
+            lead. Um id diferente do gravado é recusado.
     """
     contexto = await _lead_do_turno()
     if contexto is None:
@@ -673,9 +907,9 @@ async def calendar_get_event(event_id: str = "") -> str:
     _telefone, lead = contexto
     lead = lead or {}
 
-    alvo = (event_id or lead.get("google_event_id") or "").strip()
-    if not alvo:
-        return "Não encontrei nenhum agendamento deste lead."
+    alvo, recusa_id = resolver_event_id(lead, event_id)
+    if alvo is None:
+        return recusa_id
 
     try:
         evento = await obter_cliente().obter_evento(alvo)
