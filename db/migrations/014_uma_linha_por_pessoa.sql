@@ -20,13 +20,35 @@
 -- `leads_crm.phone` é SEMPRE a forma canônica -- garantida pelo banco, não
 -- por convenção de quem escreve.
 --
--- ORDEM OBRIGATÓRIA, e é isso que faz este arquivo funcionar em produção:
---   1) consolida cada grupo de linhas que compartilha identidade canônica
---      numa única linha, com as MESMAS regras que shared/leads.py já
---      implementa para o par (com/sem 9);
---   2) só DEPOIS o CHECK entra, proibindo as duas formas físicas que a
---      canonicalização recusa. Um CHECK antes do passo 1 rejeitaria a
+-- ORDEM OBRIGATÓRIA, e é isso que faz este arquivo funcionar em produção --
+-- as quatro etapas rodam AQUI, num arquivo só, porque cada uma depende da
+-- anterior já ter rodado nesta mesma transação:
+--   1) linhas que não canonicalizam para NADA (BR malformado sem conserto
+--      possível) saem para `leads_descartados` -- não podem entrar no
+--      agrupamento da etapa 2 (duas linhas malformadas DIFERENTES não são a
+--      mesma identidade só por `_migracao_014_canonico` devolver NULL para
+--      as duas -- `GROUP BY NULL` as juntaria como se fossem);
+--   2) consolida cada GRUPO de linhas que compartilha identidade canônica
+--      (duas ou mais linhas físicas) numa única linha, com as MESMAS regras
+--      que shared/leads.py já implementa para o par (com/sem 9);
+--   3) renomeia cada SINGLETON remanescente (uma linha só, sem irmã física)
+--      para a forma canônica -- seguro por construção: se a renomeação
+--      colidisse com outra linha, as duas já compartilhariam identidade
+--      canônica e já teriam sido capturadas como GRUPO na etapa 2;
+--   4) só DEPOIS o CHECK entra, proibindo as três formas físicas que a
+--      canonicalização recusa. Um CHECK antes das etapas 1-3 rejeitaria a
 --      própria migração de consolidação.
+--
+-- Por que as quatro etapas foram fundidas num arquivo só (histórico: a
+-- primeira versão desta migração só fazia 2 e 4, sem 1 e 3 -- uma linha sem
+-- irmã física nunca era tocada pelo `HAVING count(*) > 1` e o `ADD
+-- CONSTRAINT` estourava em cima dela; uma segunda migração tentou consertar
+-- só a etapa 3, mas usava uma função de canonicalização que não replicava
+-- `canonicalizar()` nos ramos SEM DDI, produzindo valor errado em vez de
+-- rejeitar -- e o `ADD CONSTRAINT` estourava de novo, só que numa forma
+-- DIFERENTE): as quatro etapas precisam do MESMO conceito de "canônico"
+-- para não divergirem entre si, e um arquivo só deixa isso impossível de
+-- esquecer.
 --
 -- A fusão abaixo REIMPLEMENTA em PL/pgSQL as regras de
 -- `shared/leads.py::_fundir` / `_vencedor_pausa` / `_FASE_RANK` porque a
@@ -50,19 +72,32 @@
 -- Por que migração nova em vez de editar uma das anteriores: o runner
 -- (`shared/db.py` e `db/migrate.py`) pula migração pelo NOME do arquivo
 -- registrado em `_migrations` e não guarda checksum -- editar uma já
--- aplicada não reexecuta nada em banco algum já migrado.
+-- aplicada não reexecuta nada em banco algum já migrado. Esta 014 em si só
+-- chegou a rodar em bancos de desenvolvimento descartáveis (nunca em
+-- produção) até a versão atual -- por isso pôde ser reescrita no lugar em
+-- vez de remendada por uma 015/016; produção vai rodar só esta versão,
+-- direto.
 
 -- Canonicaliza um `leads_crm.phone` já existente (formato já validado pelo
 -- CHECK original, `^[0-9]{8,15}$`) para a mesma forma que
--- `shared/phone.py::canonicalizar` produziria. Cobre os dois desvios
--- conhecidos desta tabela: zero de tronco colado no DDI (`550...`) e o 9º
--- dígito do celular. Números não-BR (não começam com 55) passam
--- inalterados, mesma regra do fallback de `canonicalizar`.
+-- `shared/phone.py::canonicalizar` produziria -- os QUATRO padrões
+-- (`LOCAL_COM_9`, `LOCAL_SEM_9`, `BR_COM_9`, `BR_SEM_9`), não só os dois
+-- que já chegam com o DDI. Devolve NULL quando a entrada se declara
+-- brasileira (DDI 55, ou zero de tronco que revela DDI 55) e não fecha com
+-- nenhuma forma válida -- mesmo caso em que `canonicalizar()` devolve
+-- `None` em vez dos dígitos crus, porque um valor errado viraria chave
+-- primária ruim silenciosamente. Número não-BR (não declara Brasil de
+-- nenhuma forma) passa pelos dígitos, mesma regra do fallback de
+-- `canonicalizar`.
 --
--- *** ESPELHA `shared/phone.py::canonicalizar`/`_sem_zero_de_tronco`. As
--- DUAS PRECISAM ANDAR JUNTAS. ***
+-- *** ESPELHA `shared/phone.py::canonicalizar`. AS DUAS PRECISAM ANDAR
+-- JUNTAS -- nos QUATRO ramos, não só nos dois que já tinham DDI. Foi
+-- exatamente a lacuna nos ramos LOCAL (sem DDI) que fez a primeira tentativa
+-- de consertar o singleton (abaixo) produzir um valor de 11 dígitos que a
+-- própria migração ia rejeitar no passo 4. ***
 CREATE OR REPLACE FUNCTION _migracao_014_canonico(bruto TEXT) RETURNS TEXT AS $$
 DECLARE
+    crus    TEXT := bruto;
     digitos TEXT := bruto;
 BEGIN
     IF digitos LIKE '550%' THEN
@@ -71,18 +106,75 @@ BEGIN
         digitos := regexp_replace(digitos, '^0+', '');
     END IF;
 
-    IF digitos ~ '^55[0-9]{2}9[0-9]{8}$' THEN
+    IF length(digitos) < 8 OR length(digitos) > 15 THEN
+        RETURN NULL;
+    END IF;
+
+    -- LOCAL_COM_9: DDD + 9 + 8 dígitos (11 no total), sem DDI -- prefixa
+    -- "55". O "9" tem que estar exatamente na 3ª posição; sem essa
+    -- checagem um valor de 11 dígitos qualquer (ex.: `12345678901`, sem
+    -- forma brasileira nenhuma) seria tratado como se fosse.
+    IF length(digitos) = 11 AND substring(digitos FROM 3 FOR 1) = '9' THEN
+        RETURN '55' || substring(digitos FROM 1 FOR 2) || substring(digitos FROM 4);
+    END IF;
+
+    -- LOCAL_SEM_9: DDD + 8 dígitos (10 no total), sem DDI -- prefixa "55".
+    -- SEMPRE casa (mesma ambiguidade aceita em `canonicalizar()`/
+    -- `LOCAL_SEM_9`: não há como distinguir de um número estrangeiro de 10
+    -- dígitos sem DDI explícito -- ver o comentário de `canonicalizar`).
+    IF length(digitos) = 10 THEN
+        RETURN '55' || digitos;
+    END IF;
+
+    -- BR_COM_9: 55 + DDD + 9 + 8 dígitos (13 no total) -- já com DDI.
+    IF length(digitos) = 13
+       AND substring(digitos FROM 1 FOR 2) = '55'
+       AND substring(digitos FROM 5 FOR 1) = '9'
+    THEN
         RETURN '55' || substring(digitos FROM 3 FOR 2) || substring(digitos FROM 6 FOR 8);
+    END IF;
+
+    -- BR_SEM_9: 55 + DDD + 8 dígitos (12 no total) -- já canônica.
+    IF length(digitos) = 12 AND substring(digitos FROM 1 FOR 2) = '55' THEN
+        RETURN digitos;
+    END IF;
+
+    -- Nenhum padrão bateu. Se declarou Brasil (começa com "55" OU o zero de
+    -- tronco foi removido no início desta função -- `digitos <> crus`) e
+    -- ainda assim não fechou com nenhuma forma válida, é malformado sem
+    -- conserto possível -- NULL, nunca os dígitos crus como identidade
+    -- (isso é o que a etapa 1 da migração usa para excisar a linha).
+    -- Estrangeiro de verdade (não declarou Brasil) passa pelos dígitos.
+    IF substring(digitos FROM 1 FOR 2) = '55' OR digitos <> crus THEN
+        RETURN NULL;
     END IF;
 
     RETURN digitos;
 END;
 $$ LANGUAGE plpgsql IMMUTABLE;
 
--- Consolidação: um DO block, não uma única query gigante, para que a lógica
--- fique auditável linha a linha contra `_fundir`/`_vencedor_pausa` em
--- Python -- é mais fácil provar que as duas cópias concordam quando as duas
--- estão escritas na mesma forma imperativa passo a passo.
+-- Etapa 1: excisa o que não canonicaliza para nada. Registrado em
+-- `leads_descartados` primeiro (mesma tabela que `shared/leads.py::
+-- _reter_descarte` já usa para telefone irresolvível no gate) -- é a única
+-- cópia do que existia antes do DELETE. Tem que rodar ANTES do
+-- agrupamento da etapa 2: `GROUP BY _migracao_014_canonico(phone)` trata
+-- múltiplos NULL como o MESMO grupo (regra padrão do SQL), então duas
+-- linhas malformadas DIFERENTES (identidades reais distintas, cada uma
+-- irresolvível por motivo próprio) fundiriam entre si por acidente se
+-- não fossem removidas antes.
+INSERT INTO leads_descartados (phone_original, motivo, payload)
+SELECT phone, 'telefone_nao_canonicalizavel_migracao_014',
+       jsonb_build_object('phone', phone, 'name', name, 'phase', phase)
+FROM leads_crm
+WHERE _migracao_014_canonico(phone) IS NULL;
+
+DELETE FROM leads_crm WHERE _migracao_014_canonico(phone) IS NULL;
+
+-- Etapa 2: consolidação de grupos. Um DO block, não uma única query
+-- gigante, para que a lógica fique auditável linha a linha contra
+-- `_fundir`/`_vencedor_pausa` em Python -- é mais fácil provar que as duas
+-- cópias concordam quando as duas estão escritas na mesma forma
+-- imperativa passo a passo.
 DO $$
 DECLARE
     canonico              TEXT;
@@ -280,16 +372,35 @@ BEGIN
     END LOOP;
 END $$;
 
+-- Etapa 3: singleton remanescente -- uma linha só, sem irmã física, cujo
+-- `phone` ainda não é a forma canônica. Renomeação pura, sem fusão: se
+-- colidisse com outra linha ao ser renomeada, as duas já compartilhariam
+-- identidade canônica e já teriam sido um GRUPO consolidado na etapa 2 --
+-- sobrar como singleton aqui PROVA que não há conflito, porque a etapa 2
+-- usa a MESMA função de canonicalização para agrupar. Uma violação de PK
+-- nesta UPDATE (só alcançável se essa garantia estiver errada) falha alto,
+-- não corrompe silenciosamente.
+UPDATE leads_crm
+SET phone = _migracao_014_canonico(phone)
+WHERE phone <> _migracao_014_canonico(phone);
+
 DROP FUNCTION _migracao_014_canonico(TEXT);
 
--- Passo 2, só agora que toda linha obedece: tranca a forma. O CHECK
--- original (`^[0-9]{8,15}$`, da 007) já barra `+` e máscara -- este
--- proíbe as duas formas físicas que `canonicalizar()` recusa como
--- identidade própria: o 9º dígito do celular e o zero de tronco. Uma
--- violação depois disto falha alto (ex.: o importador da Fase 4), que é o
+-- Etapa 4, só agora que toda linha obedece: tranca a forma. O CHECK
+-- original (`^[0-9]{8,15}$`, da 007) já barra `+` e máscara -- este proíbe
+-- as três formas físicas que `canonicalizar()` recusa como identidade
+-- própria: o 9º dígito do celular, o zero de tronco, e a forma local sem
+-- DDI (10 ou 11 dígitos -- `canonicalizar()` nunca produz essa forma para
+-- número brasileiro, sempre prefixa "55", mas um importador que não
+-- canonicalizasse antes de escrever poderia gravá-la direto). Uma violação
+-- depois disto falha alto (ex.: o importador da Fase 4), que é o
 -- comportamento desejado -- não silenciosamente cria duplicata de novo.
 DO $$ BEGIN
     ALTER TABLE leads_crm
         ADD CONSTRAINT leads_crm_phone_canonico_check
-        CHECK (phone !~ '^55[0-9]{2}9[0-9]{8}$' AND phone !~ '^550');
+        CHECK (
+            phone !~ '^55[0-9]{2}9[0-9]{8}$'
+            AND phone !~ '^550'
+            AND phone !~ '^[0-9]{10,11}$'
+        );
 EXCEPTION WHEN duplicate_object THEN NULL; END $$;

@@ -310,14 +310,14 @@ teardown. Nenhuma escrita chega a serviço externo.
 
 ## Invariante de telefone (contrato para o importador da Fase 4)
 
-Desde as migrações `db/migrations/014_uma_linha_por_pessoa.sql` e
-`015_singleton_e_local_sem_ddi.sql`, `leads_crm.phone` é **sempre** a forma
-canônica (só dígitos, brasileiro sem o 9º dígito) — garantido pelo banco,
-não por convenção de quem escreve. `CHECK leads_crm_phone_canonico_check`
-proíbe três formas físicas: o 9º dígito do celular (`^55[0-9]{2}9[0-9]{8}$`),
-o zero de tronco (`^550`) e a forma local sem DDI (`^[0-9]{10,11}$` —
-`canonicalizar()` nunca produz essa forma para número brasileiro, mas um
-importador que não canonicalizasse antes de escrever poderia).
+Desde `db/migrations/014_uma_linha_por_pessoa.sql`, `leads_crm.phone` é
+**sempre** a forma canônica (só dígitos, brasileiro sem o 9º dígito) —
+garantido pelo banco, não por convenção de quem escreve. `CHECK
+leads_crm_phone_canonico_check` proíbe três formas físicas: o 9º dígito do
+celular (`^55[0-9]{2}9[0-9]{8}$`), o zero de tronco (`^550`) e a forma
+local sem DDI (`^[0-9]{10,11}$` — `canonicalizar()` nunca produz essa forma
+para número brasileiro, mas um importador que não canonicalizasse antes de
+escrever poderia).
 
 **Consequência para o importador do Supabase:** ele precisa canonicalizar
 (`shared/phone.py::canonicalizar`) **antes** de inserir, não depois. Uma
@@ -326,6 +326,15 @@ recusada pelo Postgres) em vez de criar silenciosamente uma segunda linha
 para o mesmo lead — esse é o comportamento desejado. Não trate uma
 `CheckViolation` aqui como bug do importador para contornar; é o banco
 recusando um telefone que chegou sem canonicalizar.
+
+**A cláusula da forma local sem DDI também recusa um estrangeiro legítimo
+de 10 ou 11 dígitos.** Não é alcançável hoje — `resolver_telefone` (o
+caminho de leitura do webhook) só aceita JIDs de 12 a 14 dígitos, então
+nenhum lead real chega com 10/11 — mas o importador da Fase 4, que lê direto
+do Supabase sem passar por `resolver_telefone`, pode encontrar um. Se
+encontrar, é uma restrição real do banco, não um bug do importador para
+contornar com um patch silencioso: registre o lead como descartado (mesmo
+padrão de `leads_descartados`) em vez de forçar a gravação.
 
 **As 3.368 linhas / 151 duplicatas medidas na base legada estão no
 Supabase, não em `leads_crm`.** O `leads_crm` do harness só é escrito por
