@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from whatsapp_langchain.agents.catalog.elevec_sdr.prompts import SYSTEM_PROMPT
+from whatsapp_langchain.agents.catalog.elevec_sdr.tools import TOOLS_ELEVEC
 
 EVIDENCE_PATH = (
     Path(__file__).resolve().parents[2] / "docs" / "evidencias" / "prompt-renata-n8n.md"
@@ -135,3 +136,27 @@ def test_prompt_tem_placeholders_de_contexto():
 def test_prompt_nao_tem_residuo_de_sintaxe_n8n():
     assert "{{" not in SYSTEM_PROMPT
     assert "$now" not in SYSTEM_PROMPT
+
+
+def test_toda_tool_citada_no_prompt_existe_no_agente():
+    """O SOP manda chamar sete tools — o agente precisa ter as sete.
+
+    O par natural das âncoras acima: elas garantem que o prompt continua
+    citando `update_crm` e `human_handover`, isto garante que citá-las não
+    é promessa vazia. Sem esta checagem, um `tools=TOOLS_AGENDA` esquecido
+    em `agent.py` deixaria a Renata mandando o lead para um humano que
+    nunca é avisado, sem nada quebrar em teste.
+    """
+    disponiveis = {tool.name for tool in TOOLS_ELEVEC}
+    citadas = {
+        "calendar_get_many",
+        "calendar_agendar",
+        "calendar_update",
+        "calendar_delete",
+        "calendar_get_event",
+        "update_crm",
+        "human_handover",
+    }
+    assert citadas <= disponiveis
+    for nome in citadas:
+        assert nome in SYSTEM_PROMPT

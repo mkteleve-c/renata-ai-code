@@ -69,7 +69,7 @@ from whatsapp_langchain.shared.google_calendar import (
     FUSO,
     GoogleCalendarClient,
 )
-from whatsapp_langchain.shared.phone import canonicalizar, from_e164
+from whatsapp_langchain.shared.phone import canonico_do_lead
 
 from ..contexto import sanitizar_nome, telefone_do_turno
 
@@ -443,7 +443,7 @@ def validar_slot(momento: datetime, agora: datetime) -> str | None:
 
 
 def _canonico(telefone: str) -> str:
-    return canonicalizar(telefone) or from_e164(telefone)
+    return canonico_do_lead(telefone)
 
 
 async def carregar_lead(telefone: str) -> dict[str, Any] | None:

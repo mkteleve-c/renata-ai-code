@@ -114,6 +114,20 @@ class Settings(BaseSettings):
     google_refresh_token: str = ""
     google_calendar_id: str = ""
 
+    # --- Pipedrive (funil comercial do SDR) ---
+    # Os stage_id vieram do workflow `#4 CRM Control` do n8n e são do
+    # pipeline comercial em produção. `desqualificado` não move card — só
+    # atualiza o banco —, por isso não tem stage aqui.
+    pipedrive_api_token: str = ""
+    pipedrive_stage_qualificado: int = 12
+    pipedrive_stage_agendado: int = 13
+
+    # --- Handover ---
+    # Número (E.164 ou só dígitos) que recebe o aviso quando `human_handover`
+    # desliga o agente. Vazio = ninguém é avisado; o desligamento acontece
+    # do mesmo jeito.
+    handover_notify_phone: str = ""
+
     # --- Rate Limit ---
     rate_limit_per_hour: int = 30
 

@@ -7,8 +7,8 @@ Este arquivo contém a factory `build_graph()`. Para langgraph dev,
 veja graph.py que exporta a variável `graph`.
 
 Diferenças em relação ao illumi_assistant/rhawk_assistant nesta fase:
-- Tools de agenda ligadas (CRM e handover entram na task 6). A Renata não
-  usa save_memory/read_memory mesmo se um store for passado, para paridade
+- Tools de agenda, CRM e handover ligadas. A Renata não usa
+  save_memory/read_memory mesmo se um store for passado, para paridade
   com o n8n, que não tem memória cross-thread.
 - temperature=0.3, replicando a configuração do nó AI Agent no n8n
   (ver docs/evidencias/prompt-renata-n8n.md) — um agente cujo valor é
@@ -33,7 +33,7 @@ from whatsapp_langchain.shared.llm import create_chat_model
 
 from .contexto import criar_middleware_contexto
 from .prompts import SYSTEM_PROMPT
-from .tools import TOOLS_AGENDA
+from .tools import TOOLS_ELEVEC
 
 
 def build_graph(
@@ -47,11 +47,12 @@ def build_graph(
     - summarize: Sumariza mensagens antigas (custo extra, preserva contexto)
     - none: Sem gerenciamento de contexto
 
-    As cinco tools de agenda (`calendar_get_many`, `calendar_agendar`,
-    `calendar_update`, `calendar_delete`, `calendar_get_event`) entram
-    sempre: elas resolvem credencial e lead em tempo de chamada e devolvem
-    mensagem — nunca exceção — quando algo falta, então ligar
-    condicionalmente só esconderia a causa do agente.
+    As sete tools (`calendar_get_many`, `calendar_agendar`,
+    `calendar_update`, `calendar_delete`, `calendar_get_event`,
+    `update_crm`, `human_handover`) entram sempre: elas resolvem credencial
+    e lead em tempo de chamada e devolvem mensagem — nunca exceção — quando
+    algo falta, então ligar condicionalmente só esconderia a causa do
+    agente.
 
     Não usa memória semântica — paridade com o n8n, que não tem memória
     cross-thread.
@@ -77,7 +78,7 @@ def build_graph(
 
     return create_agent(
         model=model,
-        tools=TOOLS_AGENDA,
+        tools=TOOLS_ELEVEC,
         system_prompt=SYSTEM_PROMPT,
         middleware=middleware,
         checkpointer=checkpointer,

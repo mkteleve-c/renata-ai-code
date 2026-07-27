@@ -169,3 +169,20 @@ def to_e164(canonico: str) -> str:
 
 def from_e164(e164: str) -> str:
     return e164.lstrip("+")
+
+
+def canonico_do_lead(telefone: str) -> str:
+    """Chave de `leads_crm.phone` a partir do telefone que o turno carrega.
+
+    O harness trabalha em E.164 (`+5511955554444`, em
+    `message_queue.phone_number` e no `thread_id`); `leads_crm.phone` é a
+    forma canônica, só dígitos e sem o 9º. Todo consumidor do lead — o
+    middleware de contexto e as tools de agenda, CRM e handover — precisa da
+    MESMA conversão: duas implementações divergiriam em silêncio e cada uma
+    escreveria numa linha diferente do mesmo lead.
+
+    `from_e164` é o fallback para o que `canonicalizar` recusa (LID, grupo,
+    número malformado): melhor consultar com os dígitos crus e não achar
+    nada do que estourar no meio do turno.
+    """
+    return canonicalizar(telefone) or from_e164(telefone)
