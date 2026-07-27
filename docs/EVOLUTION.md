@@ -252,29 +252,53 @@ figurinha é uma mensagem no chat e merece resposta).
 Áudio de voz (PTT) não tem campo próprio: no Baileys é `audioMessage` com
 `ptt: true`. Não existe `pttMessage`.
 
-## Limitações conhecidas
+## Verificado contra a instância real
 
-Duas coisas não foram verificadas contra o servidor real e estão cobertas
-apenas por mock. Ambas devem ser exercitadas antes do cutover:
+O envio foi exercitado em 26/07/2026 contra a instância `instancia-apioficial`
+(número `+55 11 91998-0518`, nome verificado *Comercial - Eleve-C*, qualidade
+GREEN), com janela de 24h aberta por uma mensagem de entrada:
 
-1. **O formato do `POST /message/sendText`.** A autenticação foi validada
-   contra o servidor, mas o envio nunca foi disparado — fazê-lo entregaria uma
-   mensagem de WhatsApp a uma pessoa real. Teste manualmente contra o seu
-   próprio número antes de considerar o canal pronto.
+| O que | Resultado |
+|---|---|
+| Resposta do `sendText` | `{"key":{"id":"wamid…","remoteJid":"…","fromMe":true}, "status":"PENDING"}` |
+| Telefone **canônico de 12 dígitos**, sem o 9 | **entrega** |
+| `number` sem o `+` | aceito |
+| `remoteJidAlt` no payload de entrada | ausente, como esperado |
 
-   O *shape da resposta* deixou de ser risco: o cliente extrai o id de
-   `{"key":{"id":…}}`, de `{"messages":[{"id":…}]}` (o formato nativo da Cloud
-   API, que a Evolution pode repassar) e de qualquer um dos dois aninhado em
-   `data`. E **2xx sem id reconhecível não é erro** — a mensagem já saiu;
-   levantar ali fazia o processor marcar `failed`, tentar de novo e entregar a
-   mesma mensagem três vezes. Sai um `warning` (`evolution_send_sem_id`) com o
-   corpo recebido: se ele aparecer no log depois do cutover, é sinal de que o
-   parser precisa de mais um shape — não de que a entrega falhou.
-2. **A forma da key de mídia.** A instância não tem nenhuma mensagem de mídia
-   armazenada (`findMessages` filtrando por `audioMessage` e `imageMessage`
-   devolve 0), então ela é **inferida** da documentação do Baileys. O primeiro
-   áudio real que chegar é o teste de verdade. O `media_type` saiu dessa lista:
-   agora vem do `mimetype` do próprio payload.
+**A Evolution normaliza a resposta da Cloud API para o formato Baileys** antes
+de devolver — o `{"messages":[{"id":…}]}` nativo da Meta não chega ao cliente.
+
+Distribuição real de formas de telefone em 50 mensagens recentes: **35 com 12
+dígitos (sem o 9) e 15 com 13 (com o 9)**. A base mista é tráfego corrente, não
+resíduo legado — é o que justifica a canonicalização.
+
+> **A janela de 24h da Cloud API oficial vale para tudo.** Sem uma mensagem de
+> entrada recente, texto livre é rejeitado pela Meta: só template aprovado
+> alcança quem não escreveu primeiro. Isso condiciona o follow-up (o degrau de
+> 23 horas encosta no limite) e a primeira abordagem a leads de formulário, que
+> nunca abriram janela nenhuma.
+
+## Limitação conhecida
+
+**A forma da key de mídia.** A instância não tinha nenhuma mensagem de mídia
+armazenada quando o canal foi construído (`findMessages` filtrando por
+`audioMessage` e `imageMessage` devolvia 0), então o envelope que
+`getBase64FromMediaMessage` espera é **inferido** da documentação do Baileys. O
+primeiro áudio real que chegar é o teste de verdade.
+
+O `media_type` deixou de ser inferência: vem do `mimetype` do próprio payload.
+
+### Rede de segurança no envio
+
+Mesmo com o shape da resposta agora verificado, o cliente extrai o id de
+`{"key":{"id":…}}`, de `{"messages":[{"id":…}]}` e de qualquer um dos dois
+aninhado em `data`. E **2xx sem id reconhecível não é erro** — a mensagem já
+saiu; levantar ali fazia o processor marcar `failed`, tentar de novo e entregar
+a mesma mensagem três vezes.
+
+Sai um `warning` (`evolution_send_sem_id`) com o corpo recebido: se ele aparecer
+no log depois do cutover, é sinal de que o parser precisa de mais um shape —
+não de que a entrega falhou.
 
 ## Diagnóstico
 
