@@ -14,12 +14,14 @@ from whatsapp_langchain.agents.catalog.elevec_sdr.tools.crm import (
 )
 from whatsapp_langchain.shared.db import get_pool
 from whatsapp_langchain.shared.leads import aplicar_gate
+from whatsapp_langchain.worker import followup
 from whatsapp_langchain.worker.evolution_client import EvolutionSendError
 from whatsapp_langchain.worker.followup import (
     LeadReivindicado,
     _enviar_reivindicados,
     _reivindicar_na_conexao,
     ainda_vale_enviar,
+    contar_bloqueados_por_janela,
     montar_mensagem,
     primeiro_nome,
     reivindicar,
@@ -135,6 +137,18 @@ async def test_agente_pausado_nao_e_reivindicado(lead_factory):
     assert await _reivindicar() == []
 
 
+async def test_lead_com_followup_active_false_nao_e_reivindicado(lead_factory):
+    """Mesma classe da checagem de `agent_active` acima, mas para
+    `followup_active` — caminho independente de desligamento da régua."""
+    await lead_factory(
+        "5511900000036",
+        followup_active=False,
+        followup_count=0,
+        minutos_desde_inbound=60,
+    )
+    assert await _reivindicar() == []
+
+
 async def test_lead_que_voltou_de_uma_reuniao_cancelada_nao_e_perseguido(lead_factory):
     """Passa pela função de verdade da Fase 2, não por estado montado à mão."""
     await lead_factory(
@@ -189,10 +203,93 @@ async def test_duas_transacoes_realmente_sobrepostas_nao_pegam_o_mesmo_lead(
     assert len(telefones) == 6
 
 
+async def test_par_duplicado_e_reivindicado_uma_unica_vez(lead_factory):
+    """`phone` não é identidade — gate, blocklist e `variacoes()` tratam a
+    mesma pessoa com/sem o 9º dígito como um par; a reivindicação, antes
+    deste fix, não. Reproduzido ao vivo: o par abaixo, sem dedup, saía
+    inteiro do mesmo lote e a mesma pessoa recebia a mesma mensagem duas
+    vezes. Duplicata é realidade documentada desta base (~155 casos, ver
+    a especificação), alcançável tanto pelo backfill da 013 quanto pelo
+    caminho `agente_desligado` do gate — nenhum dos dois deduplica.
+    """
+    sem_9 = await lead_factory(
+        "551187654321", followup_count=0, minutos_desde_inbound=30
+    )
+    com_9 = await lead_factory(
+        "5511987654321", followup_count=0, minutos_desde_inbound=30
+    )
+
+    reivindicados = {r.phone for r in await _reivindicar()}
+
+    achados = reivindicados & {sem_9, com_9}
+    assert achados, "nenhum dos dois lados do par foi reivindicado"
+    assert len(achados) == 1, (
+        "os DOIS lados do mesmo par foram reivindicados no mesmo lote — a "
+        "mesma pessoa receberia a mesma mensagem duas vezes"
+    )
+
+    # o lado de fora não perde estado — só não participou deste lote.
+    de_fora = com_9 if achados == {sem_9} else sem_9
+    assert await _followup_count(de_fora) == 0
+
+
+async def test_par_duplicado_com_last_inbound_at_identico_ainda_desempata(lead_factory):
+    """O desempate do dedup é pela tupla `(last_inbound_at, phone)`, não só
+    por `last_inbound_at` — o backfill da 013 grava a MESMA marca de tempo
+    nas duas metades do par. Com empate exato e desempate só por
+    timestamp, nenhum dos dois lados venceria o `not exists` e os DOIS
+    passariam — a mesma duplicidade que o dedup existe para fechar."""
+    pool = await get_pool()
+    sem_9 = await lead_factory(
+        "551187654323", followup_count=0, minutos_desde_inbound=30
+    )
+    com_9 = await lead_factory(
+        "5511987654323", followup_count=0, minutos_desde_inbound=30
+    )
+    async with pool.connection() as conn:
+        await conn.execute(
+            "update leads_crm set last_inbound_at = "
+            "(select last_inbound_at from leads_crm where phone = %s) "
+            "where phone = %s",
+            (sem_9, com_9),
+        )
+        await conn.commit()
+
+    achados = {r.phone for r in await _reivindicar()} & {sem_9, com_9}
+    assert len(achados) == 1, achados
+
+
+async def test_rodada_nao_manda_duas_mensagens_para_o_mesmo_par_duplicado(lead_factory):
+    """Mesmo cenário acima, mas pela `rodada` inteira — a forma como o
+    Crítico foi reproduzido de verdade: `{'enviados': 2}` para o mesmo par."""
+    await lead_factory("551187654322", followup_count=0, minutos_desde_inbound=30)
+    await lead_factory("5511987654322", followup_count=0, minutos_desde_inbound=30)
+
+    enviados = []
+
+    class ClienteQueRegistra:
+        async def send_message(self, to, body, **kwargs):
+            enviados.append(to)
+            return "id"
+
+    resumo = await rodada(await get_pool(), ClienteQueRegistra())
+    assert resumo["enviados"] == 1
+    assert len(enviados) == 1
+
+
 async def test_lead_que_falou_entre_o_claim_e_o_envio_nao_recebe(lead_factory):
     """O claim commita e só então o HTTP acontece. Nesse intervalo o lead pode
-    ter escrito — e mandar "Fulano?" em cima da mensagem dele é o pior caso."""
-    await lead_factory("5511900000060", followup_count=0, minutos_desde_inbound=30)
+    ter escrito — e mandar "Fulano?" em cima da mensagem dele é o pior caso.
+
+    O telefone usa a forma canônica estável (sem o 9º dígito) de propósito:
+    com um telefone "com o 9", o caminho normal de `aplicar_gate` RENOMEIA a
+    linha (`update ... set phone = sem_9 ... where phone = com_9`), e o
+    `ainda_vale_enviar` cairia no ramo "lead sumiu" — provando um bug
+    diferente do que este teste existe para travar. É a mesma armadilha do
+    telefone em `TELEFONE_CANONICO_ESTAVEL`.
+    """
+    phone = "551190000060"
+    await lead_factory(phone, followup_count=0, minutos_desde_inbound=30)
 
     enviados = []
 
@@ -207,8 +304,12 @@ async def test_lead_que_falou_entre_o_claim_e_o_envio_nao_recebe(lead_factory):
     # o lead escreve agora, entre o claim e o envio
     await aplicar_gate(
         await get_pool(),
-        key={"remoteJid": "5511900000060@s.whatsapp.net", "fromMe": False},
+        key={"remoteJid": f"{phone}@s.whatsapp.net", "fromMe": False},
         push_name="Fulano",
+    )
+    assert await _followup_count(phone) == 0, (
+        "o gate tem que ter zerado o contador aqui — é esse zeramento, não "
+        "'lead sumiu', que este teste precisa provar que barra o envio"
     )
 
     await _enviar_reivindicados(reivindicados, ClienteQueRegistra())
@@ -241,6 +342,232 @@ async def test_rodada_conta_os_bloqueados_por_janela(lead_factory):
 
 async def test_ainda_vale_enviar_falso_para_lead_inexistente():
     assert await ainda_vale_enviar(await get_pool(), "5511900000099", 1) is False
+
+
+async def test_ainda_vale_enviar_falso_quando_nivel_nao_bate_mais(lead_factory):
+    phone = await lead_factory(
+        "5511900000090",
+        followup_count=2,
+        minutos_desde_inbound=5,
+        minutos_desde_interacao=0,
+    )
+    assert await ainda_vale_enviar(await get_pool(), phone, nivel=1) is False
+
+
+async def test_ainda_vale_enviar_falso_quando_followup_active_false(lead_factory):
+    phone = await lead_factory(
+        "5511900000091",
+        followup_count=1,
+        followup_active=False,
+        minutos_desde_inbound=5,
+        minutos_desde_interacao=0,
+    )
+    assert await ainda_vale_enviar(await get_pool(), phone, nivel=1) is False
+
+
+async def test_ainda_vale_enviar_falso_quando_agent_active_false(lead_factory):
+    """A checagem que o docstring vende como a proteção real contra um
+    humano pausando pelo ChatWoot no meio do lote — sem teste direto até
+    aqui, sobrevivia a mutação."""
+    phone = await lead_factory(
+        "5511900000092",
+        followup_count=1,
+        agent_active=False,
+        minutos_desde_inbound=5,
+        minutos_desde_interacao=0,
+    )
+    assert await ainda_vale_enviar(await get_pool(), phone, nivel=1) is False
+
+
+async def test_ainda_vale_enviar_falso_quando_inbound_passa_do_instante_do_claim(
+    lead_factory,
+):
+    """Guarda defensiva para um caminho de escrita FUTURO — hoje nenhum
+    caminho real do gate chega neste ramo (ver o docstring de
+    `ainda_vale_enviar`): o `agente_desligado` já cai em `agent_active`
+    acima, e o caminho normal zera `followup_count` no mesmo `now()` em
+    que grava `last_inbound_at`. Construído direto no banco para testar o
+    ramo isoladamente, sem depender de nenhum caminho real ficar
+    inalcançável.
+    """
+    phone = await lead_factory(
+        "5511900000094",
+        followup_count=1,
+        minutos_desde_interacao=10,  # "instante do claim", 10 min atrás
+        minutos_desde_inbound=1,  # last_inbound_at mais recente que isso
+    )
+    assert await ainda_vale_enviar(await get_pool(), phone, nivel=1) is False
+
+
+async def test_ainda_vale_enviar_verdadeiro_quando_nada_mudou(lead_factory):
+    phone = await lead_factory(
+        "5511900000093",
+        followup_count=1,
+        minutos_desde_inbound=20,
+        minutos_desde_interacao=0,
+    )
+    assert await ainda_vale_enviar(await get_pool(), phone, nivel=1) is True
+
+
+async def test_excecao_no_meio_do_lote_nao_trava_o_resto_nem_perde_o_log(
+    lead_factory, monkeypatch
+):
+    """`ainda_vale_enviar` e `montar_mensagem` viviam FORA do try em
+    `_enviar_reivindicados` — uma exceção no lead do meio interrompia o
+    loop inteiro, silenciosamente: os leads seguintes ficavam com
+    `followup_count` já incrementado (pelo claim) mas sem mensagem e sem
+    log de falha nenhum.
+
+    O monkeypatch aqui é sobre controle de fluxo do Python, não sobre a
+    camada de banco: as três chamadas de `ainda_vale_enviar` continuam
+    batendo no Postgres real (delegam para a função original); só a do
+    segundo lead é interceptada para simular uma falha imprevista no meio
+    do lote.
+    """
+    p1 = await lead_factory("5511900000101", followup_count=0, minutos_desde_inbound=30)
+    p2 = await lead_factory("5511900000102", followup_count=0, minutos_desde_inbound=30)
+    p3 = await lead_factory("5511900000103", followup_count=0, minutos_desde_inbound=30)
+
+    reivindicados = await _reivindicar()
+    assert {r.phone for r in reivindicados} == {p1, p2, p3}
+
+    original = followup.ainda_vale_enviar
+
+    async def _quebra_no_segundo(pool, phone, nivel):
+        if phone == p2:
+            raise RuntimeError("falha simulada, não é bug de banco")
+        return await original(pool, phone, nivel)
+
+    monkeypatch.setattr(followup, "ainda_vale_enviar", _quebra_no_segundo)
+
+    enviados = []
+
+    class ClienteQueRegistra:
+        async def send_message(self, to, body, **kwargs):
+            enviados.append(to)
+            return "id"
+
+    resumo = await _enviar_reivindicados(reivindicados, ClienteQueRegistra())
+
+    assert resumo["falhas"] == 1
+    assert resumo["enviados"] == 2
+    assert len(enviados) == 2
+
+
+async def test_envio_usa_e164_no_to(lead_factory):
+    phone = await lead_factory(
+        "5511900000110", followup_count=0, minutos_desde_inbound=30
+    )
+    reivindicados = await _reivindicar()
+    alvo = next(r for r in reivindicados if r.phone == phone)
+
+    enviados = []
+
+    class ClienteQueRegistra:
+        async def send_message(self, to, body, **kwargs):
+            enviados.append(to)
+            return "id"
+
+    await _enviar_reivindicados([alvo], ClienteQueRegistra())
+    assert enviados == [f"+{phone}"]
+
+
+async def test_rodada_usa_default_corrente_de_settings_via_monkeypatch(
+    lead_factory, monkeypatch
+):
+    """Prova o mecanismo do sentinel `None`: sem passar kwarg nenhum de
+    degrau/limite para `rodada`, o valor efetivo é o de `settings` NO
+    MOMENTO DA CHAMADA — não uma cópia congelada na importação do módulo.
+    Um default `= settings.followup_x` no cabeçalho da função não seria
+    alcançado por `monkeypatch.setattr(settings, ...)`; isso ia morder as
+    Tasks 4 e 6, que precisam variar `FOLLOWUP_*` em teste sem mexer em
+    env global.
+    """
+    await lead_factory("551190000130", followup_count=0, minutos_desde_inbound=10)
+    monkeypatch.setattr(followup.settings, "followup_nivel1_minutos", 5)
+    monkeypatch.setattr(followup.settings, "followup_batch_size", 1)
+
+    enviados = []
+
+    class ClienteQueRegistra:
+        async def send_message(self, to, body, **kwargs):
+            enviados.append(to)
+            return "id"
+
+    resumo = await rodada(await get_pool(), ClienteQueRegistra())
+    assert resumo["enviados"] == 1, (
+        "10 min não vence o degrau 1 com o default de 15 min — só vence "
+        "com o valor monkeypatchado (5 min) sendo lido de verdade"
+    )
+
+
+async def test_reivindicar_chamado_direto_usa_default_corrente_de_settings(
+    lead_factory, monkeypatch
+):
+    """`rodada` sempre encaminha `None` explícito para `reivindicar`
+    (nunca lê `settings` sozinha), então o teste acima não prova nada sobre
+    o default da PRÓPRIA `reivindicar` — só sobre o de
+    `_reivindicar_na_conexao`. Quem chama `reivindicar` direto (como
+    `_reivindicar()` neste arquivo, sem passar `n1_min`) usa o default do
+    cabeçalho de `reivindicar` mesmo, e é esse caminho que este teste
+    tranca."""
+    await lead_factory("551190000132", followup_count=0, minutos_desde_inbound=10)
+    monkeypatch.setattr(followup.settings, "followup_nivel1_minutos", 5)
+
+    reivindicados = await _reivindicar()
+    assert len(reivindicados) == 1, (
+        "10 min não vence o degrau 1 com o default de 15 min — só vence "
+        "com o valor monkeypatchado (5 min) sendo lido de verdade por "
+        "reivindicar() diretamente, sem passar por rodada()"
+    )
+
+
+async def test_contar_bloqueados_por_janela_usa_default_corrente_de_settings(
+    lead_factory, monkeypatch
+):
+    await lead_factory("551190000131", followup_count=0, minutos_desde_inbound=20)
+    # degrau 1 (default 15 min) já vencido aos 20 min; a janela default
+    # (23h30 de folga) não fechou aos 20 min — não bloqueado ainda. Encurtar
+    # a margem para 1439 min (janela de 1 min) fecha a janela e o lead passa
+    # a contar como bloqueado — só se o default for lido em tempo de chamada.
+    monkeypatch.setattr(followup.settings, "followup_janela_margem_minutos", 1439)
+    assert await contar_bloqueados_por_janela(await get_pool()) == 1
+
+
+async def test_rodada_reativa_agentes_com_reativacao_agendada_vencida(lead_factory):
+    """`reativar_agentes` existia sem chamador. Decisão: chamar no início de
+    `rodada`, por paridade com o ciclo da especificação — é seguro porque
+    hoje nada escreve `agent_reactivate_at` (o `UPDATE` afeta zero linhas
+    em produção), e este teste prova o comportamento para quando algo
+    passar a escrever."""
+    phone = await lead_factory(
+        "5511900000111",
+        agent_active=False,
+        followup_active=False,
+        followup_count=0,
+        minutos_desde_inbound=None,
+    )
+    pool = await get_pool()
+    async with pool.connection() as conn:
+        await conn.execute(
+            "update leads_crm set agent_reactivate_at = now() - interval '1 minute' "
+            "where phone = %s",
+            (phone,),
+        )
+        await conn.commit()
+
+    await rodada(pool, _ClienteMudo())
+
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            "select agent_active, agent_reactivate_at from leads_crm where phone = %s",
+            (phone,),
+        )
+        linha = await cur.fetchone()
+    assert linha is not None
+    agent_active, agent_reactivate_at = linha
+    assert agent_active is True
+    assert agent_reactivate_at is None
 
 
 def test_nivel_1_usa_so_o_primeiro_nome():
@@ -277,3 +604,39 @@ def test_primeiro_nome_de_nome_composto():
 
 def test_primeiro_nome_de_none_e_none():
     assert primeiro_nome(None) is None
+
+
+def test_nivel_2_usa_o_texto_fixo_da_especificacao_e_nao_vaza_nome():
+    texto_fixo = (
+        "Opa, imagino que esteja corrido ai! Só para não perdermos o timing da "
+        "sua aplicação, consegue falar agora?"
+    )
+    assert montar_mensagem(2, "Fulano") == texto_fixo
+    assert montar_mensagem(2, None) == texto_fixo, "nível 2 não pode vazar o nome"
+
+
+def test_pushname_sem_espaco_nao_vaza_para_o_whatsapp():
+    """`pushName` é atributo do WhatsApp escolhido pelo REMETENTE — texto de
+    um estranho indo para uma mensagem que sai do número comercial da
+    empresa. Sem espaço, `.split(" ")[0]` sozinho não segura nada."""
+    texto = montar_mensagem(1, "Ganhe1000reais>>http://evil.tld")
+    assert texto == "Oi?", texto
+
+
+def test_pushname_so_pontuacao_vira_saudacao_generica():
+    assert montar_mensagem(1, "?") == "Oi?"
+
+
+def test_pushname_com_digito_nao_e_primeiro_nome():
+    assert primeiro_nome("Jo4o") is None
+
+
+def test_pushname_com_hifen_ou_apostrofo_e_nome_de_verdade():
+    """Nome de verdade com hífen/apóstrofo entre partes não pode ser
+    penalizado pela blindagem contra pushName malicioso."""
+    assert primeiro_nome("Ana-Maria Silva") == "Ana-Maria"
+    assert primeiro_nome("O'Brien") == "O'Brien"
+
+
+def test_pushname_muito_longo_nao_vaza():
+    assert primeiro_nome("a" * 50) is None
