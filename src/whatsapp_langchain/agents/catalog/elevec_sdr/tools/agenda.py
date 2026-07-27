@@ -1161,16 +1161,25 @@ async def calendar_delete(event_id: str = "") -> str:
             "cadastro do lead — acione o human_handover."
         )
 
-    # O funil anda junto com a agenda. Sem isto o lead fica preso em
-    # `agendou_sessao` sem reunião e com o follow-up desligado — nenhuma
-    # tool de agenda escreve `phase`, então não haveria caminho de volta.
-    # Ver `reverter_fase_apos_cancelamento`.
-    revertida = await reverter_fase_apos_cancelamento(telefone)
+    # O funil anda junto com a agenda — banco e card. Sem isto o lead fica
+    # preso em `agendou_sessao` sem reunião e com o follow-up desligado:
+    # nenhuma tool de agenda escreve `phase`, então não haveria caminho de
+    # volta. **Depois** de limpar o vínculo, nunca antes — se a limpeza
+    # falhar, o `return` acima sai com a linha intacta (fase e
+    # `google_event_id` como estavam), em vez de deixar um lead meio
+    # revertido. Ver `reverter_fase_apos_cancelamento`.
+    revertida, aviso_card = await reverter_fase_apos_cancelamento(telefone)
     if revertida == "erro":
         logger.error("agenda_fase_nao_revertida", telefone=telefone)
         return interno(
             "Cancelado na agenda. ATENÇÃO: não consegui devolver o lead para "
             "'qualificado' no funil — acione o human_handover."
+        )
+
+    if aviso_card:
+        return interno(
+            f"Cancelado. A consultoria foi removida da agenda. ATENÇÃO: "
+            f"{aviso_card} de volta — avise o time comercial."
         )
 
     return "Cancelado. A consultoria foi removida da agenda."

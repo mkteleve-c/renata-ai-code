@@ -837,8 +837,11 @@ async def test_ciclo_completo_agenda_cancela_reagenda(
     assert "Fase atualizada" in saida
     assert len(agenda_falsa.criados) == 2
     assert len(agenda_falsa.deletados) == 1
-    # 12 (qualificado) → 13 (agendou) → 13 de novo, depois do ciclo.
-    assert pipedrive.movidos == [(DEAL, 12), (DEAL, 13), (DEAL, 13)]
+    # 12 (qualificado) → 13 (agendou) → **12 de volta no cancelamento** → 13.
+    # Sem o 12 do meio o time comercial veria "agendou sessão" para uma
+    # reunião que não existe mais, e nada depois moveria o card: o
+    # `update_crm('qualificado')` seguinte devolve `inalterada`.
+    assert pipedrive.movidos == [(DEAL, 12), (DEAL, 13), (DEAL, 12), (DEAL, 13)]
 
 
 async def test_cancelamento_nao_religa_followup_de_lead_pausado(
@@ -874,12 +877,14 @@ async def test_cancelamento_nao_promove_lead_desqualificado(
     assert lido["google_event_id"] is None
 
 
-async def test_reverter_e_idempotente(limpar, turno):
+async def test_reverter_e_idempotente(limpar, turno, pipedrive):
     await criar_lead(phase="agendou_sessao", followup_active=False)
 
-    assert await crm.reverter_fase_apos_cancelamento(E164) == "revertida"
-    assert await crm.reverter_fase_apos_cancelamento(E164) == "nao_aplicavel"
+    assert await crm.reverter_fase_apos_cancelamento(E164) == ("revertida", "")
+    assert await crm.reverter_fase_apos_cancelamento(E164) == ("nao_aplicavel", "")
     assert (await ler_lead())["phase"] == "qualificado"
+    # A segunda passada não pode mexer no card de novo.
+    assert pipedrive.movidos == [(DEAL, 12)]
 
 
 # --- A guarda de retrocesso, agora condicionada ao evento -------------------
@@ -936,3 +941,112 @@ async def test_volta_para_qualificado_nao_religa_followup_de_lead_pausado(
     lido = await ler_lead()
     assert lido["phase"] == "qualificado"
     assert lido["followup_active"] is False
+
+
+async def test_cancelamento_devolve_o_card_para_o_estagio_de_qualificado(
+    limpar, turno, pipedrive, agenda_falsa
+):
+    # A ida move o card; a volta precisa mover também. É o espelho da regra
+    # da rodada 1: lá o risco era card sem gravação, aqui é gravação sem
+    # card — e o time comercial vendo "agendou sessão" para uma reunião
+    # cancelada.
+    await criar_lead(phase="agendou_sessao", google_event_id="ev-1")
+
+    await agenda.calendar_delete.ainvoke({})
+
+    assert (await ler_lead())["phase"] == "qualificado"
+    assert pipedrive.movidos == [(DEAL, 12)]
+
+
+async def test_cancelamento_sem_pipedriveid_nao_chama_o_crm(
+    limpar, turno, pipedrive, agenda_falsa
+):
+    await criar_lead(phase="agendou_sessao", google_event_id="ev-1", pipedriveid=None)
+
+    saida = await agenda.calendar_delete.ainvoke({})
+
+    assert (await ler_lead())["phase"] == "qualificado"
+    assert pipedrive.movidos == []
+    assert "ATENÇÃO" not in saida
+
+
+async def test_reversao_nao_aplicavel_nao_mexe_no_card(
+    limpar, turno, pipedrive, agenda_falsa
+):
+    # Lead desqualificado com evento: a fase não volta, então o card
+    # também não pode voltar.
+    await criar_lead(phase="desqualificado", google_event_id="ev-1")
+
+    await agenda.calendar_delete.ainvoke({})
+
+    assert pipedrive.movidos == []
+
+
+async def test_falha_ao_mover_o_card_de_volta_vira_aviso_e_nao_desfaz_nada(
+    limpar, turno, pipedrive, agenda_falsa, capsys
+):
+    await criar_lead(phase="agendou_sessao", google_event_id="ev-1")
+    pipedrive.erro = RuntimeError("pipedrive fora do ar")
+
+    saida = await agenda.calendar_delete.ainvoke({})
+
+    # O cancelamento na agenda e a fase no banco valeram; só o espelho
+    # externo ficou para trás, e com rastro para reconciliar.
+    assert agenda_falsa.deletados == ["ev-1"]
+    assert (await ler_lead())["phase"] == "qualificado"
+    assert "Cancelado" in saida
+    assert "ATENÇÃO" in saida
+    assert "crm_card_nao_movido" in capsys.readouterr().out
+
+
+async def test_falha_na_reversao_pede_handover(
+    limpar, turno, pipedrive, agenda_falsa, monkeypatch, capsys
+):
+    """O ramo de erro da reversão dentro de `calendar_delete`.
+
+    A reversão contra o banco real já é testada à parte; o que falta cobrir
+    é a reação de `calendar_delete` quando ela falha — o evento já saiu da
+    agenda e o funil ficou para trás, que é exatamente quando um humano
+    precisa ser chamado.
+    """
+
+    async def falhando(telefone):
+        return "erro", ""
+
+    monkeypatch.setattr(agenda, "reverter_fase_apos_cancelamento", falhando)
+    await criar_lead(phase="agendou_sessao", google_event_id="ev-1")
+
+    saida = await agenda.calendar_delete.ainvoke({})
+
+    assert agenda_falsa.deletados == ["ev-1"]
+    assert "ATENÇÃO" in saida
+    assert "human_handover" in saida
+    assert "agenda_fase_nao_revertida" in capsys.readouterr().out
+
+
+async def test_vinculo_e_limpo_antes_de_reverter_a_fase(
+    limpar, turno, pipedrive, agenda_falsa, monkeypatch
+):
+    """A ordem importa: limpar o vínculo primeiro, reverter depois.
+
+    Se a limpeza do `google_event_id` falha, `calendar_delete` sai pelo
+    `return` de erro **antes** de tocar na fase — a linha fica exatamente
+    como estava. Com a ordem invertida sobraria um lead meio revertido:
+    fase `qualificado` e `google_event_id` ainda apontando para um evento
+    que já não existe, que é o estado em que `update_crm` recusaria a
+    correção pela guarda de retrocesso.
+    """
+
+    async def nao_grava(*args, **kwargs):
+        return False
+
+    monkeypatch.setattr(agenda, "gravar_agendamento", nao_grava)
+    await criar_lead(phase="agendou_sessao", google_event_id="ev-1")
+
+    saida = await agenda.calendar_delete.ainvoke({})
+
+    lido = await ler_lead()
+    assert lido["phase"] == "agendou_sessao", "a fase não pode ter sido revertida"
+    assert lido["google_event_id"] == "ev-1"
+    assert pipedrive.movidos == []
+    assert "human_handover" in saida

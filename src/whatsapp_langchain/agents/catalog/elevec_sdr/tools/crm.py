@@ -288,11 +288,12 @@ async def gravar_fase(
     return "gravou"
 
 
-async def reverter_fase_apos_cancelamento(telefone: str) -> str:
-    """Devolve o lead de `agendou_sessao` para `qualificado`. Nunca levanta.
+async def reverter_fase_apos_cancelamento(telefone: str) -> tuple[str, str]:
+    """Devolve o lead de `agendou_sessao` para `qualificado` — banco e card.
 
-    Desfechos: `"revertida"`, `"nao_aplicavel"` (o lead não estava em
-    `agendou_sessao`) e `"erro"`.
+    Devolve `(status, aviso_card)`, com status em `"revertida"`,
+    `"nao_aplicavel"` (o lead não estava em `agendou_sessao`) e `"erro"`.
+    Nunca levanta.
 
     **Quem cancela a reunião é quem mexe na fase.** Deixar isso a cargo de o
     modelo lembrar de chamar `update_crm` depois de `calendar_delete` seria
@@ -301,17 +302,33 @@ async def reverter_fase_apos_cancelamento(telefone: str) -> str:
     de sucesso e o funil anda junto com a agenda, atomicamente do ponto de
     vista de quem olha o CRM.
 
+    **O card volta junto, e isso não é simetria decorativa.** A ida
+    (`update_crm`) move o card; a volta precisa mover também, senão o time
+    comercial continua vendo "agendou sessão" para uma reunião que não
+    existe mais — e `update_crm('qualificado')` depois disso devolveria
+    `inalterada` (a fase já é essa) e nunca moveria. Seria o espelho do
+    problema que a guarda da rodada 1 resolveu: lá o risco era card sem
+    gravação, aqui seria gravação sem card. Mesmo tratamento de falha do
+    `update_crm`: `mover_card` não levanta e o aviso sobe para quem chamou.
+
     **`where phase = 'agendou_sessao'` faz o trabalho de três guardas.** Ele
     (a) impede que um lead `desqualificado` que tinha reunião marcada seja
     promovido de volta a `qualificado` por um cancelamento, (b) torna a
-    função idempotente — cancelar duas vezes não reescreve nada — e (c)
-    dispensa ler a fase antes.
+    função idempotente — cancelar duas vezes não reescreve nada nem mexe no
+    card de novo — e (c) dispensa ler a fase antes.
 
-    **`followup_active = agent_active` é a religada com trava.** O lead sem
-    reunião precisa voltar para a régua de cobrança, senão o cancelamento o
-    aposenta em silêncio. Mas `human_handover` desliga `agent_active`, e
-    religar a cobrança de um lead que uma pessoa pausou desfaria a decisão
-    dela. Copiar `agent_active` resolve os dois casos numa expressão.
+    **`followup_active = agent_active` restaura a coerência da coluna, não
+    promete perseguição.** `agendou_sessao` desligou a régua *como
+    consequência de existir reunião marcada*; sumindo a reunião, a
+    consequência tem que sumir junto, senão fica um `false` órfão que
+    ninguém sabe explicar depois. O que **não** acontece é o lead voltar a
+    receber follow-up agora: a régua especificada filtra
+    `phase NOT IN ('agendou_sessao','desqualificado','perdido','qualificado')`
+    — `qualificado` está de fora, então a coluna é inerte para envio neste
+    estado. Ela só volta a importar se o lead andar para uma fase que a
+    régua persegue, e é justamente aí que um `false` esquecido faria
+    estrago. `human_handover` zera `agent_active`, e copiá-lo impede que o
+    cancelamento desfaça a pausa decidida por uma pessoa.
     """
     canonico = canonico_do_lead(telefone)
     try:
@@ -322,24 +339,27 @@ async def reverter_fase_apos_cancelamento(telefone: str) -> str:
                 "  phase = 'qualificado'::lead_phase,"
                 "  followup_active = agent_active"
                 " where phone = %s and phase = 'agendou_sessao'"
-                " returning followup_active",
+                " returning followup_active, pipedriveid",
                 (canonico,),
             )
             linha = await cur.fetchone()
     except Exception as erro:
         logger.error("crm_reversao_falhou", phone=canonico, erro=str(erro))
-        return "erro"
+        return "erro", ""
 
     if linha is None:
         logger.info("crm_reversao_nao_aplicavel", phone=canonico)
-        return "nao_aplicavel"
+        return "nao_aplicavel", ""
 
     logger.info(
         "crm_fase_revertida_apos_cancelamento",
         phone=canonico,
         followup_religado=linha[0],
     )
-    return "revertida"
+
+    # Só quem gravou move o card — mesma regra da ida.
+    _moveu, aviso_card = await mover_card(linha[1], "qualificado")
+    return "revertida", aviso_card
 
 
 async def mover_card(pipedriveid: Any, phase: str) -> tuple[bool, str]:
