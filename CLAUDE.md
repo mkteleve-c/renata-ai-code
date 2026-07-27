@@ -43,7 +43,7 @@ src/whatsapp_langchain/
 └── shared/        # config (Settings + channel_status/validate_runtime_settings),
                    # db pool, queue ops, models (MessagingChannel), llm factory, structlog
 
-db/migrations/     # 001_initial → 006_message_channel (rodam no startup da API automaticamente)
+db/migrations/     # 001_initial → 014_uma_linha_por_pessoa (rodam no startup da API automaticamente)
 frontend/          # Next.js 16 admin panel (Better Auth, fetch server-side da API; proxy.ts faz auth gate)
 deploy/            # docker-compose.prod.yml + Traefik v3.6.15 + scripts (template para VPS)
 docs/              # ARCHITECTURE, GETTING_STARTED, ADDING_AGENTS, DATABASE, TWILIO, META, UAZAPI, DEPLOY, RAILWAY, STRESS_TESTING

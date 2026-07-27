@@ -120,7 +120,10 @@ Roda na API, **antes** de enfileirar, e replica o SQL que o n8n usava:
 2. **Blocklist** — igualdade sobre o telefone canônico
 3. **Variações do 9º dígito** — gera as formas com e sem o 9
 4. **`fromMe = true`** → desliga agente e follow-up, descarta
-5. **Ler o lead e checar `agent_active`** → se `false`, descarta **sem escrever**
+5. **Ler o lead e checar `agent_active`** → se `false`, descarta a mensagem, mas
+   **grava `last_inbound_at`**: a janela de 24h da Cloud API é fato sobre a Meta,
+   não sobre o nosso funil. Congelar esse relógio durante um handover humano
+   deixaria o lead inalcançável pela régua na retomada, com a janela real aberta.
 6. **Upsert** — canoniza a chave, promove `formulario_preenchido → iniciou_conversa`
 7. **Enfileira** com `channel='evolution'`
 
