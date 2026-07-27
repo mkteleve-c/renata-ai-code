@@ -24,12 +24,15 @@ import asyncio
 import psycopg
 import pytest
 import pytest_asyncio
+import structlog
 
 from whatsapp_langchain.agents.catalog.elevec_sdr.tools.crm import (
     reverter_fase_apos_cancelamento,
 )
+from whatsapp_langchain.shared.config import settings
 from whatsapp_langchain.shared.db import get_pool
 from whatsapp_langchain.shared.leads import aplicar_gate
+from whatsapp_langchain.shared.models import MessagingChannel
 from whatsapp_langchain.worker import followup
 from whatsapp_langchain.worker.evolution_client import EvolutionSendError
 from whatsapp_langchain.worker.followup import (
@@ -43,6 +46,7 @@ from whatsapp_langchain.worker.followup import (
     reivindicar,
     rodada,
 )
+from whatsapp_langchain.worker.main import _parar_followup, iniciar_followup
 
 # Round-trip por `canonicalizar`: "55" + DDD(11) + 8 dígitos, sem inserir o
 # 9º dígito — permanece igual a si mesmo depois de canonicalizado. Usado nos
@@ -766,3 +770,148 @@ def test_pushname_com_hifen_ou_apostrofo_e_nome_de_verdade():
 
 def test_pushname_muito_longo_nao_vaza():
     assert primeiro_nome("a" * 50) is None
+
+
+# --- `iniciar_followup`: a task no worker (Fase 3, Task 4) ----------------
+#
+# `FOLLOWUP_ENABLED=false` por padrão é sagrado: subir o worker não pode,
+# por si só, começar a mandar WhatsApp para lead nenhum. Estes testes usam
+# `capture_logs` (não `caplog`) porque `structlog.get_logger()` sem
+# `setup_logging()` (nunca chamada nos testes) usa `PrintLoggerFactory` —
+# escreve direto em stdout, fora do módulo `logging` padrão que `caplog`
+# intercepta. `structlog.testing.capture_logs()` funciona independente da
+# configuração global.
+
+
+async def test_followup_desligado_por_padrao_nao_sobe(monkeypatch):
+    monkeypatch.setattr(settings, "followup_enabled", False)
+    pool = await get_pool()
+    tarefa = iniciar_followup(
+        pool, outbounds={MessagingChannel.EVOLUTION: _ClienteMudo()}
+    )
+    assert tarefa is None
+
+
+async def test_sem_cliente_evolution_nao_sobe(monkeypatch):
+    monkeypatch.setattr(settings, "followup_enabled", True)
+    pool = await get_pool()
+    with structlog.testing.capture_logs() as logs:
+        tarefa = iniciar_followup(
+            pool, outbounds={MessagingChannel.META: _ClienteMudo()}
+        )
+    assert tarefa is None
+    assert any(evento["event"] == "followup_sem_canal" for evento in logs)
+
+
+async def test_em_modo_mock_a_regua_sobe_e_roda(monkeypatch):
+    """Documenta a surpresa: em `OUTBOUND_MODE=mock`, `channel_status()`
+    marca todo canal como completo e `_build_outbound_clients` instancia
+    todos — então "tem cliente Evolution" é vacuamente verdadeiro, e com
+    `FOLLOWUP_ENABLED=true` a régua SOBE E RODA DE VERDADE contra o cliente
+    mock em dev. Inofensivo (o mock não manda WhatsApp nenhum), mas é
+    surpresa.
+    """
+    chamou = asyncio.Event()
+
+    async def _rodada_stub(pool, cliente):
+        chamou.set()
+        return {"enviados": 0, "falhas": 0, "abortados": 0, "bloqueados_por_janela": 0}
+
+    monkeypatch.setattr("whatsapp_langchain.worker.main.rodada", _rodada_stub)
+    monkeypatch.setattr(settings, "followup_enabled", True)
+    monkeypatch.setattr(settings, "followup_interval_seconds", 60)
+
+    pool = await get_pool()
+    tarefa = iniciar_followup(
+        pool, outbounds={MessagingChannel.EVOLUTION: _ClienteMudo()}
+    )
+    try:
+        assert tarefa is not None
+        await asyncio.wait_for(chamou.wait(), timeout=2)
+    finally:
+        await _parar_followup(tarefa)
+
+
+async def test_excecao_numa_rodada_nao_derruba_o_loop(monkeypatch):
+    """Sem o `try/except` por rodada, um erro de banco mata a régua até o
+    próximo deploy — e "régua parada" e "ninguém elegível" ficam
+    indistinguíveis de fora, porque as duas dão zero envio."""
+    chamadas = []
+    terceira = asyncio.Event()
+
+    async def rodada_que_explode(*args, **kwargs):
+        chamadas.append(1)
+        if len(chamadas) >= 3:
+            terceira.set()
+        if len(chamadas) == 1:
+            raise RuntimeError("banco caiu")
+        return {"enviados": 0, "falhas": 0, "abortados": 0, "bloqueados_por_janela": 0}
+
+    monkeypatch.setattr("whatsapp_langchain.worker.main.rodada", rodada_que_explode)
+    monkeypatch.setattr(settings, "followup_enabled", True)
+    monkeypatch.setattr(settings, "followup_interval_seconds", 0.01)
+
+    pool = await get_pool()
+    tarefa = iniciar_followup(
+        pool, outbounds={MessagingChannel.EVOLUTION: _ClienteMudo()}
+    )
+    assert tarefa is not None
+    await asyncio.wait_for(terceira.wait(), timeout=5)
+    await _parar_followup(tarefa)
+
+    assert len(chamadas) >= 3, "o loop tem que sobreviver à primeira exceção"
+
+
+async def test_parar_followup_cancela_task_pendurada():
+    """Task de background esquecida no shutdown polui as rodadas seguintes
+    da suíte (e, em produção, segue rodando depois do processo achar que já
+    parou). `_parar_followup` isola esse cancelamento para ser testável sem
+    precisar rodar `main()` inteiro.
+
+    Propositalmente NÃO envolve `_parar_followup(tarefa)` num
+    `asyncio.wait_for` com timeout: `Task.cancel()` repassa o cancelamento
+    para o que a task está aguardando no momento (`_fut_waiter`) — se
+    `_parar_followup` estiver suspensa em `await task` quando o `wait_for`
+    externo estoura o timeout e cancela ESSA chamada, o cancelamento vaza
+    para dentro de `tarefa` de qualquer jeito, mesmo com o `task.cancel()`
+    de produção removido. Isso mascara exatamente a mutação que este teste
+    precisa pegar. Por isso o cancelamento roda como task separada e o
+    teste faz polling curto e limitado — sem nunca cancelar nada por fora.
+    """
+    rodou = asyncio.Event()
+
+    async def _loop_infinito():
+        while True:
+            rodou.set()
+            await asyncio.sleep(0.01)
+
+    tarefa = asyncio.create_task(_loop_infinito())
+    parar_task: asyncio.Task[None] | None = None
+    try:
+        await asyncio.wait_for(rodou.wait(), timeout=2)
+
+        parar_task = asyncio.create_task(_parar_followup(tarefa))
+        for _ in range(100):
+            if parar_task.done():
+                break
+            await asyncio.sleep(0.01)
+
+        assert parar_task.done(), (
+            "_parar_followup nunca retornou — sem cancel(), fica preso no await"
+        )
+        assert tarefa.done()
+        assert tarefa.cancelled()
+    finally:
+        for t in (parar_task, tarefa):
+            if t is not None and not t.done():
+                t.cancel()
+        for t in (parar_task, tarefa):
+            if t is not None:
+                try:
+                    await t
+                except BaseException:
+                    pass
+
+
+async def test_parar_followup_com_none_nao_faz_nada():
+    await _parar_followup(None)

@@ -10,9 +10,10 @@ Uso:
 """
 
 import asyncio
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 
 import structlog
+from psycopg_pool import AsyncConnectionPool
 
 from whatsapp_langchain.shared.config import settings
 from whatsapp_langchain.shared.db import (
@@ -28,6 +29,7 @@ from whatsapp_langchain.shared.observability import setup_logging
 from whatsapp_langchain.shared.queue import contar_pendentes_por_canal
 from whatsapp_langchain.worker.consumer import claim_next_message
 from whatsapp_langchain.worker.evolution_client import EvolutionClient
+from whatsapp_langchain.worker.followup import ClienteOutbound, rodada
 from whatsapp_langchain.worker.meta_client import MetaClient
 from whatsapp_langchain.worker.processor import OutboundClient, process_message
 from whatsapp_langchain.worker.twilio_client import TwilioClient
@@ -148,6 +150,82 @@ def _canais_sem_cliente(
     }
 
 
+async def _loop_followup(pool: AsyncConnectionPool, cliente: ClienteOutbound) -> None:
+    """Chama `rodada` em loop, isolando exceção por rodada.
+
+    Sem o `try/except` aqui, uma exceção (erro de banco, timeout do canal)
+    mata a task inteira em silêncio até o próximo deploy — "régua parada" e
+    "ninguém elegível" ficam indistinguíveis de fora, porque as duas dão zero
+    envio. `followup_rodada_falhou` é o sinal que diferencia os dois casos.
+    """
+    while True:
+        try:
+            resultado = await rodada(pool, cliente)
+            logger.info("followup_rodada", **resultado)
+        except Exception as erro:
+            logger.warning("followup_rodada_falhou", erro=str(erro))
+        await asyncio.sleep(settings.followup_interval_seconds)
+
+
+def iniciar_followup(
+    pool: AsyncConnectionPool,
+    outbounds: Mapping[MessagingChannel, ClienteOutbound],
+) -> asyncio.Task[None] | None:
+    """Sobe a régua de follow-up como task ao lado do loop de consumo.
+
+    Três coisas não óbvias:
+
+    1. `FOLLOWUP_ENABLED=false` é o padrão e é sagrado — subir o worker não
+       pode, por si só, começar a mandar WhatsApp para lead nenhum. A flag
+       só vira `true` no cutover, deliberadamente.
+    2. Sem fail-fast: quando a flag está desligada ou não há cliente
+       Evolution em `outbounds`, esta função devolve `None` e loga o
+       motivo — nunca `SystemExit`. `validate_runtime_settings` roda também
+       no lifespan da API, que não roda follow-up; derrubar o boot por uma
+       flag do worker penalizaria a API à toa, e impediria `run_migrations`
+       de rodar.
+    3. Em `OUTBOUND_MODE=mock`, `channel_status()` marca todo canal como
+       completo e `_build_outbound_clients` instancia todos — então "tem
+       cliente Evolution" é vacuamente verdadeiro, e a régua SOBE E RODA DE
+       VERDADE contra o cliente mock em dev com a flag ligada. Inofensivo
+       (o mock não manda WhatsApp nenhum), mas é surpresa — ver
+       `test_em_modo_mock_a_regua_sobe_e_roda`.
+    """
+    if not settings.followup_enabled:
+        logger.info("followup_desligado")
+        return None
+
+    cliente = outbounds.get(MessagingChannel.EVOLUTION)
+    if cliente is None:
+        logger.warning(
+            "followup_sem_canal",
+            canais_disponiveis=[canal.value for canal in outbounds],
+        )
+        return None
+
+    logger.info(
+        "followup_iniciado", interval_seconds=settings.followup_interval_seconds
+    )
+    return asyncio.create_task(_loop_followup(pool, cliente))
+
+
+async def _parar_followup(task: asyncio.Task[None] | None) -> None:
+    """Cancela e aguarda a task de follow-up no shutdown do worker.
+
+    Extraída à parte para ser testável direto: uma task de background
+    esquecida no `finally` não morre sozinha e polui rodadas seguintes de
+    testes (e, em produção, continua rodando após o processo achar que já
+    encerrou o follow-up).
+    """
+    if task is None:
+        return
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+
 async def main() -> None:
     """Loop principal do Worker.
 
@@ -195,12 +273,15 @@ async def main() -> None:
             ),
         )
 
+    followup_task = iniciar_followup(pool, outbounds)
+
     logger.info(
         "worker_ready",
         poll_interval=settings.poll_interval_seconds,
         memory_enabled=store is not None,
         outbound_mode=outbound_mode,
         enabled_channels=[ch.value for ch in outbounds],
+        followup_task=followup_task is not None,
     )
 
     try:
@@ -222,6 +303,7 @@ async def main() -> None:
     except KeyboardInterrupt:
         logger.info("worker_interrupted")
     finally:
+        await _parar_followup(followup_task)
         if store_stack is not None:
             await store_stack.aclose()
         await checkpointer_stack.aclose()

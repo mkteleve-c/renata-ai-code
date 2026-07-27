@@ -54,7 +54,16 @@ _MINUTOS_POR_DIA = 24 * 60
 
 
 class ClienteOutbound(Protocol):
-    async def send_message(self, to: str, body: str, **kwargs: Any) -> str | None: ...
+    """`**kwargs` de propósito fora daqui: `_enviar_reivindicados` só chama
+    `send_message(to=..., body=...)`, nunca kwarg extra nenhum. Um
+    catch-all `**kwargs: Any` no protocolo obrigaria cada implementação
+    concreta a aceitar kwargs arbitrários também — e nenhum cliente
+    outbound real (`TwilioClient`, `MetaClient`, `UazapiClient`,
+    `EvolutionClient`) faz isso; cada um só tem parâmetros opcionais
+    nomeados além de `to`/`body`. Com a assinatura estreita, os quatro
+    satisfazem este protocolo estruturalmente."""
+
+    async def send_message(self, to: str, body: str) -> str | None: ...
 
 
 @dataclass(frozen=True)
