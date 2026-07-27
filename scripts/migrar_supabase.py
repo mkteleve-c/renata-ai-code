@@ -23,10 +23,13 @@ from __future__ import annotations
 
 import re
 from collections import defaultdict
-from collections.abc import Sequence
-from dataclasses import dataclass
+from collections.abc import Iterable, Sequence
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Any
+
+from psycopg.types.json import Jsonb
+from psycopg_pool import AsyncConnectionPool
 
 from whatsapp_langchain.shared.phone import (
     _digitos_do_jid,
@@ -704,3 +707,414 @@ def gerar_relatorio(
     md.append("")
 
     return "\n".join(md)
+
+
+# =============================================================================
+# Importação e validações bloqueantes (Task 4)
+# =============================================================================
+#
+# Toda validação desta seção ABORTA -- levanta `MigracaoAbortada` -- em vez
+# de logar um aviso e seguir. É o contrato explícito da task: um relatório
+# que mostra o problema depois não substitui uma gravação que se recusa a
+# acontecer com o problema ainda presente. `importar_leads` roda dentro de
+# uma ÚNICA transação (`async with pool.connection() as conn:` já aplica
+# commit/rollback normal do psycopg no fim do bloco -- ver
+# `AsyncConnectionPool.connection`): se qualquer validação pós-escrita
+# falhar, a exceção propaga e o Postgres desfaz TUDO que este `run` gravou.
+# Não existe "migração parcial" como desfecho possível.
+
+
+class MigracaoAbortada(RuntimeError):
+    """Uma validação bloqueante da Task 4 falhou -- a migração para aqui."""
+
+
+# Marca todo descarte que ESTA função grava em `leads_descartados`, para que
+# uma reexecução consiga limpar só o que ela mesma escreveu antes de
+# reinserir -- descartes do gate de ingestão em produção (mesma tabela,
+# `shared/leads.py::_reter_descarte`) nunca carregam esta chave e por isso
+# nunca são tocados pelo DELETE de idempotência abaixo.
+_FONTE_MIGRACAO_DESCARTE = "migracao_supabase_fase4"
+
+# Os ranks de `_FASE_RANK` que contam como "fase avançada" para a validação
+# de não-retrocesso -- qualificado (3), desqualificado/perdido (4) e
+# agendou_sessao (5). formulario_preenchido (1) e iniciou_conversa (2) ficam
+# de fora: são o início do funil, não há "retrocesso" a proteger ali.
+_RANKS_AVANCADOS: tuple[int, ...] = (3, 4, 5)
+
+
+def marcar_reunioes_legadas(
+    fundidas: dict[str, LinhaFundida],
+) -> dict[str, LinhaFundida]:
+    """Grava `metadata["reuniao_legada"] = True` em todo lead fundido cuja
+    fase final é `agendou_sessao`.
+
+    Incondicional para essa fase -- não "quando `google_event_id` está
+    nulo", porque a tabela do Supabase legado NUNCA teve essa coluna (ver
+    "Erro 2" no plano da Fase 4). Não existe um subconjunto "com evento" na
+    origem para excluir: todo lead que chega aqui em `agendou_sessao` tem
+    reunião REAL na agenda do Silvio e nenhum rastro do id dela.
+
+    `crm.py::gravar_fase` passa a exigir esta marca ausente para aceitar a
+    relaxação `agendou_sessao -> qualificado`. Sem a marca, o
+    `google_event_id is null` desses leads seria lido como "reunião
+    cancelada" e devolveria o card do Pipedrive ao estágio 12 com a sessão
+    ainda marcada na agenda -- ver o docstring de `gravar_fase`.
+    """
+    marcadas: dict[str, LinhaFundida] = {}
+    for canonico, fundida in fundidas.items():
+        if fundida.phase == "agendou_sessao":
+            metadata = {**fundida.metadata, "reuniao_legada": True}
+            marcadas[canonico] = replace(fundida, metadata=metadata)
+        else:
+            marcadas[canonico] = fundida
+    return marcadas
+
+
+def validar_soma_fecha(
+    total_origem: int,
+    grupos: dict[str, list[LinhaOrigem]],
+    descartes: Sequence[Descarte],
+) -> None:
+    """origem = migrados + descartados -- nada pode sumir em silêncio.
+
+    Mesma soma que `gerar_relatorio` já verifica -- repetida aqui de
+    propósito: o relatório é para leitura humana e pode nunca ser aberto
+    antes do cutover rodar. Esta chamada é o que impede a GRAVAÇÃO de
+    acontecer quando a soma não fecha, relatório lido ou não.
+    """
+    migrados = sum(len(linhas) for linhas in grupos.values())
+    total_descartes = len(descartes)
+    if migrados + total_descartes != total_origem:
+        raise MigracaoAbortada(
+            f"a soma não fecha: origem={total_origem}, migrados={migrados}, "
+            f"descartados={total_descartes} (soma={migrados + total_descartes}) "
+            "-- abortando antes de gravar qualquer coisa"
+        )
+
+
+# As quatro regras do CHECK real de `leads_crm.phone` (007_elevec.sql +
+# 014_uma_linha_por_pessoa.sql), duplicadas aqui DE PROPÓSITO -- não
+# importadas de um extrator que lê o SQL do disco, porque o script de
+# produção não deve depender de abrir um arquivo de migração em runtime
+# para decidir se pode escrever. `tests/unit/test_migrar_supabase.py::
+# test_saida_sempre_satisfaz_o_check_do_banco` é quem mantém as cópias
+# honestas (extrai o CHECK do SQL e compara contra `normalizar_telefone`).
+_CHECK_BASICO = re.compile(r"^[0-9]{8,15}$")
+_CHECK_9_DIGITO_BR = re.compile(r"^55[0-9]{2}9[0-9]{8}$")
+_CHECK_10_11_DIGITOS = re.compile(r"^[0-9]{10,11}$")
+
+
+def _satisfaz_check_leads_crm(canonico: str) -> bool:
+    return (
+        bool(_CHECK_BASICO.fullmatch(canonico))
+        and not _CHECK_9_DIGITO_BR.fullmatch(canonico)
+        and not canonico.startswith("550")
+        and not _CHECK_10_11_DIGITOS.fullmatch(canonico)
+    )
+
+
+def validar_canonicos_no_check(fundidas: dict[str, LinhaFundida]) -> None:
+    """Toda linha que vai para `leads_crm` passa no CHECK -- verificado
+    ANTES de qualquer `INSERT`, para a importação nunca quebrar no meio com
+    parte dos leads dentro e parte fora.
+
+    Redundante com a garantia de `normalizar_telefone` (Task 2) por
+    desenho: aquela é a primeira linha de defesa e depende de
+    `agrupar_por_canonico` ter sido chamada sobre TODO `LinhaOrigem`. Esta
+    roda sobre o resultado já fundido -- o que de fato vira `INSERT` -- e é
+    o que pega um bug futuro que quebre a primeira sem que um teste
+    unitário isolado dela note.
+    """
+    invalidos = sorted(c for c in fundidas if not _satisfaz_check_leads_crm(c))
+    if invalidos:
+        raise MigracaoAbortada(
+            f"{len(invalidos)} canônico(s) fundido(s) não satisfazem o CHECK "
+            f"de leads_crm.phone: {invalidos[:10]} -- abortando antes de "
+            "gravar qualquer coisa"
+        )
+
+
+def validar_session_ids_historico(
+    session_ids: Iterable[str], canonicos_migrados: set[str]
+) -> None:
+    """100% dos `session_id` do histórico legado precisam casar com um lead
+    migrado.
+
+    A FK de `legacy_chat_history.phone -> leads_crm(phone)` (migração 015)
+    já garante isso no banco quando a Task 5 escrever o histórico -- mas o
+    erro de uma `ForeignKeyViolation` no meio de um `INSERT` em massa não
+    diz QUAL `session_id` sobrou de fora. Esta validação roda antes de
+    qualquer escrita e nomeia os órfãos. `session_id` é o telefone bruto do
+    n8n e passa pela MESMA normalização dos leads (Task 2) -- dois
+    `session_id` distintos que convergem para o mesmo canônico não são
+    órfãos, é o telefone gravado em duas formas.
+    """
+    orfaos = sorted(
+        {
+            session_id
+            for session_id in session_ids
+            if normalizar_telefone(session_id).canonico not in canonicos_migrados
+        }
+    )
+    if orfaos:
+        raise MigracaoAbortada(
+            f"{len(orfaos)} session_id(s) do histórico não casam com nenhum "
+            f"lead migrado: {orfaos[:10]} -- abortando antes de gravar "
+            "qualquer coisa"
+        )
+
+
+def _contagem_cumulativa_por_rank(fases: Iterable[str | None]) -> dict[int, int]:
+    """Para cada rank de `_RANKS_AVANCADOS`, quantas fases têm rank >= ele."""
+    contagem = dict.fromkeys(_RANKS_AVANCADOS, 0)
+    for fase in fases:
+        rank = _rank_fase(fase)
+        for alvo in _RANKS_AVANCADOS:
+            if rank >= alvo:
+                contagem[alvo] += 1
+    return contagem
+
+
+def validar_fases_nao_retrocederam(
+    esperado: dict[int, int], persistido: dict[int, int]
+) -> None:
+    """A fusão só promove, nunca rebaixa -- e a gravação não pode perder isso.
+
+    `esperado` vem do resultado em memória de `fundir_grupo`: por
+    construção (`_fase_vencedora`), o rank final de um grupo é o MAIOR rank
+    entre seus membros -- nunca cai. `persistido` vem de uma leitura real
+    do banco DEPOIS do `INSERT`/`UPDATE`, para o mesmo conjunto de
+    canônicos. Comparar contra o banco, e não só contra a própria memória,
+    é o que pega um bug na escrita em si (coluna trocada, upsert que
+    silenciosamente não atualiza `phase`) -- comparar só em memória nunca
+    falharia, porque seria comparar o resultado contra ele mesmo.
+
+    `>=`, não `==`, de propósito: a base de origem está viva (ver "O que
+    foi medido" no plano da Fase 4) -- um lead migrado pode ter avançado de
+    fase por uma conversa real acontecendo durante a janela da migração, e
+    isso não é regressão. O que não pode acontecer é o banco mostrar MENOS
+    leads em fase avançada do que a fusão calculou.
+    """
+    for rank in _RANKS_AVANCADOS:
+        minimo = esperado.get(rank, 0)
+        real = persistido.get(rank, 0)
+        if real < minimo:
+            raise MigracaoAbortada(
+                f"contagem de leads com fase rank>={rank} caiu na gravação: "
+                f"esperado >= {minimo}, achado {real} -- abortando"
+            )
+
+
+async def _validar_nenhum_last_inbound_at(conn: Any, canonicos: Iterable[str]) -> None:
+    """`last_inbound_at` nasce `NULL` -- o contrato que a Fase 3 deixou escrito.
+
+    Copiar `last_interaction_at` pareceria óbvio e é errado: para quem já
+    recebeu follow-up aquele valor é o NOSSO envio, não o inbound do lead
+    -- superestimar a janela de 24h da Cloud API manda mensagem que a Meta
+    rejeita, em escala (ver `013_last_inbound_at.sql`). O importador nunca
+    inclui esta coluna em `_SQL_UPSERT_LEAD`; esta validação confirma
+    contra o banco real, dentro da mesma transação da escrita -- não só
+    contra a leitura do código-fonte.
+    """
+    lista = list(canonicos)
+    if not lista:
+        return
+    cur = await conn.execute(
+        "select phone from leads_crm"
+        " where phone = any(%s) and last_inbound_at is not null",
+        (lista,),
+    )
+    linhas = await cur.fetchall()
+    if linhas:
+        vazados = sorted(linha[0] for linha in linhas)
+        raise MigracaoAbortada(
+            f"{len(vazados)} lead(s) importado(s) já têm last_inbound_at "
+            f"preenchido: {vazados[:10]} -- contrato da Fase 3 violado, "
+            "abortando"
+        )
+
+
+def _linha_para_payload(linha: LinhaOrigem) -> dict[str, Any]:
+    """`LinhaOrigem` -> `dict` serializável em JSON, para `leads_descartados.payload`.
+
+    `datetime` não é serializável pelo `json.dumps` que `Jsonb` usa por
+    baixo -- converte para ISO 8601 aqui, uma vez, em vez de todo chamador
+    ter que lembrar disso.
+    """
+
+    def _iso(valor: datetime | None) -> str | None:
+        return valor.isoformat() if valor is not None else None
+
+    return {
+        "phone": linha.phone,
+        "phase": linha.phase,
+        "created_at": _iso(linha.created_at),
+        "last_interaction_at": _iso(linha.last_interaction_at),
+        "pipedriveid": linha.pipedriveid,
+        "email": linha.email,
+        "name": linha.name,
+        "username": linha.username,
+        "source": linha.source,
+        "followup_count": linha.followup_count,
+        "agent_active": linha.agent_active,
+        "followup_active": linha.followup_active,
+        "agent_reactivate_at": _iso(linha.agent_reactivate_at),
+        "metadata": linha.metadata,
+    }
+
+
+@dataclass(frozen=True)
+class ResultadoImportacao:
+    """Contagens da importação real -- o que o `main()` da Task 6 reporta."""
+
+    total_origem: int
+    leads_gravados: int
+    descartes_gravados: int
+    reunioes_legadas_marcadas: int
+
+
+_SQL_UPSERT_LEAD = """
+insert into leads_crm (
+    phone, pipedriveid, name, username, email, source,
+    phase, followup_count, followup_active, agent_active,
+    agent_reactivate_at, created_at, last_interaction_at, metadata
+) values (
+    %s, %s, %s, %s, %s, %s::lead_source,
+    %s::lead_phase, %s, %s, %s,
+    %s, %s, %s, %s
+)
+on conflict (phone) do update set
+    pipedriveid = excluded.pipedriveid,
+    name = excluded.name,
+    username = excluded.username,
+    email = excluded.email,
+    source = excluded.source,
+    phase = excluded.phase,
+    followup_count = excluded.followup_count,
+    followup_active = excluded.followup_active,
+    agent_active = excluded.agent_active,
+    agent_reactivate_at = excluded.agent_reactivate_at,
+    created_at = excluded.created_at,
+    last_interaction_at = excluded.last_interaction_at,
+    metadata = excluded.metadata
+"""
+
+# NUNCA lista `last_inbound_at` -- nem no INSERT nem no `do update set`. Um
+# upsert que a incluísse (mesmo com `excluded.last_inbound_at`, que seria
+# sempre NULL vindo do INSERT) reabriria o mesmo furo que 013 fechou: a
+# coluna tem que nascer e permanecer NULL até o gate de ingestão real
+# escrever nela. `google_event_id`, `faturamento_mensal` e
+# `qualificacao_notas` também ficam de fora -- a origem não tem essas três
+# colunas (ver "Erro 2" no plano), e omiti-las do `do update set` protege
+# qualquer valor real que `update_crm`/`calendar_agendar` já tenham escrito
+# numa reexecução contra um lead que passou a existir em produção.
+
+_SQL_INSERT_DESCARTE = """
+insert into leads_descartados (phone_original, motivo, payload)
+values (%s, %s, %s)
+"""
+
+
+async def importar_leads(
+    pool: AsyncConnectionPool,
+    total_origem: int,
+    grupos: dict[str, list[LinhaOrigem]],
+    fundidas: dict[str, LinhaFundida],
+    descartes: Sequence[Descarte],
+    session_ids_historico: Sequence[str] = (),
+    *,
+    agora: datetime | None = None,
+) -> ResultadoImportacao:
+    """Grava a fusão em `leads_crm`/`leads_descartados`, atrás de validações
+    bloqueantes que abortam -- nunca avisam.
+
+    Ordem:
+
+    1. Validações PURAS que não tocam o banco -- soma fecha, CHECK,
+       `session_id`s do histórico -- rodam ANTES de qualquer escrita e
+       abortam sem que uma única linha entre no Postgres.
+    2. `marcar_reunioes_legadas` computa o `metadata` final em memória.
+    3. Todo `INSERT`/`UPDATE` acontece dentro do MESMO bloco de conexão.
+       `async with pool.connection() as conn:` já aplica o comportamento
+       normal de conexão do psycopg -- commit no fim sem exceção, rollback
+       se qualquer coisa levantar dentro do bloco (documentado em
+       `AsyncConnectionPool.connection`) -- então não há necessidade de uma
+       transação aninhada explícita.
+    4. As validações que DEPENDEM do banco -- `last_inbound_at`, fases não
+       retrocederam -- rodam por último, ainda dentro do bloco. Se
+       qualquer uma falhar, a exceção propaga e desfaz TUDO que este `run`
+       gravou.
+
+    Idempotente: `leads_crm` usa `ON CONFLICT (phone) DO UPDATE` com os
+    MESMOS valores computados -- rodar duas vezes com a mesma fusão produz
+    a mesma linha, nunca duplica. `leads_descartados` não tem chave única
+    (é depósito de qualquer coisa, ver a migração 015), então a
+    idempotência aqui é um `DELETE` restrito ao marcador
+    `_FONTE_MIGRACAO_DESCARTE` seguido de reinserção -- nunca toca em
+    descartes do gate de ingestão em produção, que não carregam essa
+    chave.
+    """
+    validar_soma_fecha(total_origem, grupos, descartes)
+    validar_canonicos_no_check(fundidas)
+    if session_ids_historico:
+        validar_session_ids_historico(session_ids_historico, set(fundidas))
+
+    marcadas = marcar_reunioes_legadas(fundidas)
+    reunioes_legadas = sum(
+        1 for f in marcadas.values() if f.metadata.get("reuniao_legada") is True
+    )
+    esperado = _contagem_cumulativa_por_rank(f.phase for f in marcadas.values())
+    momento = agora or datetime.now(UTC)
+
+    async with pool.connection() as conn:
+        for canonico, fundida in marcadas.items():
+            await conn.execute(
+                _SQL_UPSERT_LEAD,
+                (
+                    canonico,
+                    fundida.pipedriveid,
+                    fundida.name,
+                    fundida.username,
+                    fundida.email,
+                    fundida.source,
+                    fundida.phase,
+                    fundida.followup_count,
+                    fundida.followup_active,
+                    fundida.agent_active,
+                    fundida.agent_reactivate_at,
+                    fundida.created_at or momento,
+                    fundida.last_interaction_at or momento,
+                    Jsonb(fundida.metadata),
+                ),
+            )
+
+        await conn.execute(
+            "delete from leads_descartados where payload->>'fonte_migracao' = %s",
+            (_FONTE_MIGRACAO_DESCARTE,),
+        )
+        for descarte in descartes:
+            payload = _linha_para_payload(descarte.linha)
+            payload["fonte_migracao"] = _FONTE_MIGRACAO_DESCARTE
+            await conn.execute(
+                _SQL_INSERT_DESCARTE,
+                (descarte.phone_origem, descarte.motivo, Jsonb(payload)),
+            )
+
+        await _validar_nenhum_last_inbound_at(conn, marcadas.keys())
+
+        cur = await conn.execute(
+            "select phase from leads_crm where phone = any(%s)",
+            (list(marcadas.keys()),),
+        )
+        linhas_persistidas = await cur.fetchall()
+        persistido = _contagem_cumulativa_por_rank(
+            linha[0] for linha in linhas_persistidas
+        )
+        validar_fases_nao_retrocederam(esperado, persistido)
+
+    return ResultadoImportacao(
+        total_origem=total_origem,
+        leads_gravados=len(marcadas),
+        descartes_gravados=len(descartes),
+        reunioes_legadas_marcadas=reunioes_legadas,
+    )

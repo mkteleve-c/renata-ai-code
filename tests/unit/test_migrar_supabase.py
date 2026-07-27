@@ -16,12 +16,19 @@ from scripts.migrar_supabase import (
     Descarte,
     LinhaFundida,
     LinhaOrigem,
+    MigracaoAbortada,
     Normalizado,
+    _contagem_cumulativa_por_rank,
     agrupar_por_canonico,
     fundir_grupo,
     fundir_todos,
     gerar_relatorio,
+    marcar_reunioes_legadas,
     normalizar_telefone,
+    validar_canonicos_no_check,
+    validar_fases_nao_retrocederam,
+    validar_session_ids_historico,
+    validar_soma_fecha,
 )
 
 _RAIZ = Path(__file__).resolve().parents[2]
@@ -676,3 +683,155 @@ def test_relatorio_lista_todos_os_descartes_com_motivo():
     assert "telefone_ausente" in secao_descartes
     assert "colide_com_forma_local_br" in secao_descartes
     assert "+14242123771" in secao_descartes
+
+
+# =============================================================================
+# Importação e validações bloqueantes (Task 4) -- só a parte PURA, sem banco.
+#
+# `importar_leads` em si (a escrita real) e a validação de `last_inbound_at`
+# (que só existe contra o Postgres) estão em
+# `tests/integration/test_migrar_supabase.py` -- "camada de banco testada
+# contra o Postgres real, nunca monkeypatchada" não é negociável neste
+# projeto. O que mora aqui é o que roda ANTES de qualquer escrita: soma
+# fecha, CHECK, session_ids do histórico, contagem de fases e a marcação de
+# `reuniao_legada` -- puro, sem I/O, testável em memória.
+# =============================================================================
+
+
+def test_marcar_reunioes_legadas_marca_so_quem_chega_em_agendou_sessao():
+    agendou = fundir_grupo(
+        "551100001111", [_linha("551100001111", phase="agendou_sessao")]
+    )
+    qualificado = fundir_grupo(
+        "551100002222", [_linha("551100002222", phase="qualificado")]
+    )
+
+    marcadas = marcar_reunioes_legadas(
+        {"551100001111": agendou, "551100002222": qualificado}
+    )
+
+    assert marcadas["551100001111"].metadata["reuniao_legada"] is True
+    assert "reuniao_legada" not in marcadas["551100002222"].metadata
+
+
+def test_marcar_reunioes_legadas_preserva_o_resto_do_metadata():
+    agendou = fundir_grupo(
+        "551100001111",
+        [
+            _linha(
+                "551100001111",
+                phase="agendou_sessao",
+                metadata={"origem_pipedrive": "deal-123"},
+            )
+        ],
+    )
+
+    marcadas = marcar_reunioes_legadas({"551100001111": agendou})
+
+    assert marcadas["551100001111"].metadata["origem_pipedrive"] == "deal-123"
+    # `linhas_fundidas` é recalculado por `fundir_grupo` a partir dos
+    # telefones reais do grupo -- não é o que este teste está verificando.
+    assert marcadas["551100001111"].metadata["linhas_fundidas"] == ["551100001111"]
+    assert marcadas["551100001111"].metadata["reuniao_legada"] is True
+
+
+def test_validar_soma_fecha_aceita_quando_bate():
+    grupos = {"551100001111": [_linha("551100001111")]}
+    descartes = [Descarte("null", "telefone_ausente", _linha(None))]
+
+    validar_soma_fecha(2, grupos, descartes)  # não levanta
+
+
+def test_validar_soma_fecha_aborta_quando_nao_bate():
+    grupos = {"551100001111": [_linha("551100001111")]}
+    descartes: list[Descarte] = []
+
+    with pytest.raises(MigracaoAbortada, match="soma não fecha"):
+        validar_soma_fecha(2, grupos, descartes)  # origem diz 2, só existe 1
+
+
+def test_validar_canonicos_no_check_aceita_canonicos_validos():
+    fundida = fundir_grupo("551187654321", [_linha("551187654321")])
+
+    validar_canonicos_no_check({"551187654321": fundida})  # não levanta
+
+
+@pytest.mark.parametrize(
+    "canonico_invalido",
+    [
+        "1234567890",  # 10 dígitos -- colide com forma local BR
+        "12345678901",  # 11 dígitos -- idem
+        "5511987654321",  # BR com o 9º dígito -- o CHECK proíbe
+        "55011987654321",  # zero de tronco
+    ],
+)
+def test_validar_canonicos_no_check_aborta_com_canonico_fora_do_check(
+    canonico_invalido,
+):
+    """`fundir_grupo` não valida o próprio argumento `canonico` -- só quem
+    chama (`agrupar_por_canonico`, via `normalizar_telefone`) garante que
+    ele é válido. Simula aqui o bug de um `canonico` inválido ter chegado
+    até a fusão, para provar que a Task 4 pega isso ANTES de gravar.
+    """
+    fundida = fundir_grupo(canonico_invalido, [_linha(canonico_invalido)])
+
+    with pytest.raises(MigracaoAbortada, match="CHECK"):
+        validar_canonicos_no_check({canonico_invalido: fundida})
+
+
+def test_validar_session_ids_historico_aceita_quando_todos_casam():
+    canonicos = {"551187654321"}
+
+    validar_session_ids_historico(
+        ["551187654321", "+5511987654321"], canonicos
+    )  # não levanta
+
+
+def test_validar_session_ids_historico_normaliza_antes_de_comparar():
+    """`session_id` do n8n pode vir com o 9º dígito -- tem que convergir
+    para o mesmo canônico do lead, não ser tratado como órfão."""
+    canonicos = {"551187654321"}
+
+    validar_session_ids_historico(["11987654321"], canonicos)  # não levanta
+
+
+def test_validar_session_ids_historico_aborta_com_orfao():
+    canonicos = {"551187654321"}
+
+    with pytest.raises(MigracaoAbortada, match="session_id"):
+        validar_session_ids_historico(["551199998888"], canonicos)
+
+
+def test_validar_session_ids_historico_aborta_quando_nao_normaliza():
+    canonicos = {"551187654321"}
+
+    with pytest.raises(MigracaoAbortada, match="session_id"):
+        validar_session_ids_historico(["null"], canonicos)
+
+
+def test_contagem_cumulativa_por_rank():
+    fases = ["formulario_preenchido", "qualificado", "agendou_sessao", "perdido", None]
+
+    contagem = _contagem_cumulativa_por_rank(fases)
+
+    # rank 3 (qualificado): qualificado, agendou_sessao e perdido -- 3.
+    assert contagem[3] == 3
+    # rank 4 (desqualificado/perdido): agendou_sessao e perdido -- 2.
+    assert contagem[4] == 2
+    # rank 5 (agendou_sessao): só agendou_sessao -- 1.
+    assert contagem[5] == 1
+
+
+def test_validar_fases_nao_retrocederam_aceita_igual_ou_maior():
+    esperado = {3: 5, 4: 2, 5: 1}
+
+    validar_fases_nao_retrocederam(esperado, {3: 5, 4: 2, 5: 1})  # igual, não levanta
+    # base viva: o banco pode mostrar MAIS (conversa real durante a janela).
+    validar_fases_nao_retrocederam(esperado, {3: 6, 4: 3, 5: 2})  # não levanta
+
+
+def test_validar_fases_nao_retrocederam_aborta_quando_persistido_e_menor():
+    esperado = {3: 5, 4: 2, 5: 1}
+
+    with pytest.raises(MigracaoAbortada, match="rank>=5"):
+        validar_fases_nao_retrocederam(esperado, {3: 5, 4: 2, 5: 0})

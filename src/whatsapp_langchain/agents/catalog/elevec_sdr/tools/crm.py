@@ -191,6 +191,21 @@ async def gravar_fase(
     lugar nenhum, então um lead com a reunião cancelada ficava preso em
     `agendou_sessao` com o follow-up morto e nenhum caminho de volta.
 
+    **A mesma relaxação também exige `metadata->>'reuniao_legada'`
+    ausente (Fase 4, migração do Supabase).** A tabela legada não tem
+    `google_event_id` — não é coluna nula por cancelamento, é coluna que
+    nunca existiu na origem. Os leads que a migração trouxe em
+    `agendou_sessao` têm reunião REAL na agenda do Silvio e chegam com
+    `google_event_id is null` só porque não havia de onde copiar o valor.
+    Sem esta segunda condição, a relaxação acima leria esse `null` como
+    "reunião cancelada" e aceitaria devolver o lead a `qualificado` —
+    puxando o card do Pipedrive de volta ao estágio 12 com a reunião ainda
+    marcada. `scripts/migrar_supabase.py` grava
+    `metadata->>'reuniao_legada' = true` exatamente nesses leads; a
+    relaxação só se aplica quando essa marca está ausente (`null` ou
+    diferente de `'true'`) — ou seja, quando o `null` do evento é fato
+    genuíno do nosso sistema, não lacuna de importação.
+
     `followup_active` tem duas regras, e a ordem do `case` importa:
 
     - **voltar de `agendou_sessao` para `qualificado` religa `followup_active`**,
@@ -247,7 +262,10 @@ async def gravar_fase(
                 "   and not ("
                 "     %s::lead_phase = 'qualificado'"
                 "     and phase = 'agendou_sessao'"
-                "     and google_event_id is not null"
+                "     and ("
+                "       google_event_id is not null"
+                "       or coalesce(metadata->>'reuniao_legada', 'false') = 'true'"
+                "     )"
                 "   )"
                 " returning phase",
                 (

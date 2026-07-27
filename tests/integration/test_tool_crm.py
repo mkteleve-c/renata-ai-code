@@ -19,6 +19,7 @@ from typing import Any
 
 import pytest
 from langchain_core.runnables.config import var_child_runnable_config
+from psycopg.types.json import Jsonb
 
 from whatsapp_langchain.agents.catalog.elevec_sdr.tools import agenda, crm, handover
 from whatsapp_langchain.agents.catalog.elevec_sdr.tools.crm import update_crm
@@ -64,6 +65,7 @@ async def criar_lead(**campos: Any) -> None:
         "email": None,
         "faturamento_mensal": None,
         "google_event_id": None,
+        "metadata": {},
     }
     base.update(campos)
     pool = await get_pool()
@@ -71,9 +73,10 @@ async def criar_lead(**campos: Any) -> None:
         await conn.execute(
             "insert into leads_crm"
             " (phone, name, pipedriveid, email, faturamento_mensal,"
-            "  source, phase, followup_active, agent_active, google_event_id)"
+            "  source, phase, followup_active, agent_active, google_event_id,"
+            "  metadata)"
             " values (%s, 'Ana', %s, %s, %s, 'whatsapp_direct',"
-            "         %s::lead_phase, %s, %s, %s)",
+            "         %s::lead_phase, %s, %s, %s, %s)",
             (
                 CANONICO,
                 base["pipedriveid"],
@@ -83,6 +86,7 @@ async def criar_lead(**campos: Any) -> None:
                 base["followup_active"],
                 base["agent_active"],
                 base["google_event_id"],
+                Jsonb(base["metadata"]),
             ),
         )
 
@@ -910,6 +914,34 @@ async def test_update_crm_aceita_qualificado_quando_nao_ha_evento(
     assert lido["phase"] == "qualificado"
     assert lido["followup_active"] is True, "voltar para qualificado religa a régua"
     assert "Fase atualizada" in saida
+
+
+async def test_update_crm_recusa_qualificado_para_lead_com_reuniao_legada(
+    limpar, turno, pipedrive
+):
+    """Fase 4: `google_event_id is null` sozinho não basta para leads legados.
+
+    A tabela do Supabase legado nunca teve `google_event_id` -- o `null`
+    aqui não significa "reunião cancelada" (o caso que
+    `test_update_crm_aceita_qualificado_quando_nao_ha_evento` cobre), e sim
+    "nunca soubemos o id de uma reunião real". Sem a marca `reuniao_legada`
+    barrando a relaxação, este lead seria devolvido a `qualificado` e o
+    card do Pipedrive voltaria ao estágio 12 com a sessão ainda marcada na
+    agenda do Silvio.
+    """
+    await criar_lead(
+        phase="agendou_sessao",
+        google_event_id=None,
+        followup_active=False,
+        metadata={"reuniao_legada": True},
+    )
+
+    saida = await update_crm.ainvoke({"phase": "qualificado"})
+
+    lido = await ler_lead()
+    assert lido["phase"] == "agendou_sessao"
+    assert pipedrive.movidos == []
+    assert "tem sessão agendada" in saida
 
 
 async def test_update_crm_recusa_qualificado_com_evento_ainda_vinculado(
