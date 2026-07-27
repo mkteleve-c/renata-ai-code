@@ -957,3 +957,98 @@ chama `send_template`. O cutover precisa dele.
 **Fora de escopo, com motivo:** reabrir janela fechada (exige template de retomada
 aprovado pela Meta — decisão do cliente); ingestão de leads por formulário (a
 especificação já a coloca fora); métricas da régua em `/api/metrics`.
+
+---
+
+## Task 7: uma linha por pessoa — a invariante que a régua não conseguiu defender
+
+> Acrescentada depois da **quarta** revisão da Task 3. As três primeiras rodadas
+> acharam um Crítico cada, sempre na mesma superfície: duas linhas que
+> representam a mesma pessoa recebendo a mesma mensagem.
+
+### Por que o claim não resolve, e não vai resolver
+
+`variacoes()` devolve **duas** formas físicas. Não existe conjunto finito conhecido
+de formas que canonicalizam para um dado valor — a de zero de tronco (`55011…`,
+que `phone.py:19` documenta como ~26 registros legados) é uma; qualquer outra
+malformação é outra. **Alcançar o irmão por enumeração nunca pode ser completo.**
+
+E o `aplicar_gate` tem a mesma limitação (`leads.py:308`), então a terceira forma
+nunca é fundida por inbound: ela não se auto-cura.
+
+Medido na base legada em 27/07/2026:
+
+| | |
+|---|---|
+| linhas | 3.368 |
+| identidades duplicadas | **151** |
+| linhas envolvidas | **305** |
+| grupos de 3 | **3** |
+
+### A inversão
+
+Em vez de a régua se defender de duplicatas, **elas deixam de ser
+representáveis**. A invariante passa a ser: `leads_crm.phone` é **sempre** a forma
+canônica, garantida pelo banco.
+
+Com uma linha por pessoa, os três Críticos e boa parte de `_elegivel_fresco`
+deixam de existir, e o claim volta a ser a consulta única que a Task 3 tinha antes
+das quatro rodadas.
+
+**Files:**
+- Create: `db/migrations/014_uma_linha_por_pessoa.sql`
+- Modify: `src/whatsapp_langchain/worker/followup.py` (simplificar o claim)
+- Test: `tests/integration/test_migracao_014.py`, `tests/integration/test_followup.py`
+
+- [ ] **Step 1: A migração consolida, e só então tranca**
+
+Ordem obrigatória — o `CHECK` só pode entrar depois de as linhas obedecerem:
+
+1. Fundir cada grupo que compartilha identidade canônica numa linha só, com as
+   **mesmas regras que `leads.py` já implementa**: `_vencedor_pausa`
+   (`agent_active = false` vence), precedência de `phase`, campos de conteúdo do
+   registro com `last_interaction_at` mais recente, `max(followup_count)`,
+   `min(last_inbound_at)` — o mais conservador para a janela —, e `metadata`
+   registrando as formas absorvidas, como a `012` já faz.
+2. `CHECK` novo proibindo a forma com nono dígito (`phone !~ '^55[0-9]{2}9[0-9]{8}$'`)
+   e o zero de tronco (`phone !~ '^550'`). O `CHECK` existente já barra `+` e
+   máscara.
+
+Não reimplemente a fusão em SQL se puder reusar o que existe — mas se reimplementar,
+**escreva no comentário que as duas cópias precisam andar juntas**.
+
+- [ ] **Step 2: Testes da migração**
+
+Lendo o SQL do arquivo real, como `test_migracao_013.py` faz. Cobrir: par com-9/sem-9;
+**trio incluindo a forma de zero de tronco**; grupo com um lado pausado (a pausa
+tem que vencer); grupo com `followup_count` divergente (o maior vence); grupo com
+`last_inbound_at` divergente (o menor vence); e que o `CHECK` rejeita as três
+formas proibidas depois de aplicado.
+
+- [ ] **Step 3: Simplificar o claim**
+
+Com a invariante garantida, remova `_SQL_TRAVAR_IRMAOS`, `_elegivel_fresco` e o
+agrupamento em Python. O claim volta a ser a consulta única com
+`FOR UPDATE SKIP LOCKED`. **Mantenha** a checagem de blocklist e `ainda_vale_enviar` —
+elas resolvem outro problema.
+
+Deixe um teste que prove que a invariante vale: tentar inserir a forma com nono
+dígito tem que levantar.
+
+- [ ] **Step 4: Os dois Importantes que sobraram da Task 3**
+
+- **Mutação sobrevivente:** remover `"qualificado"` de `_FASES_TERMINAIS` passa nos
+  727 testes **e envia de verdade**. É a fase para onde `reverter_fase_apos_cancelamento`
+  devolve o lead quando a reunião é cancelada. `ainda_vale_enviar` não olha `phase`.
+- **Starvation por blocklist:** o corte `[:limite]` acontece **antes** do filtro de
+  blocklist. Bloqueados nunca avançam o contador, então ocupam os slots rodada
+  após rodada. Reproduzido: 10 bloqueados mais antigos + 1 lead real → **zero
+  enviados**, por até 23 horas.
+
+- [ ] **Step 5: Contrato para a Fase 4**
+
+O importador do Supabase **canonicaliza antes de inserir**. Com o `CHECK` no lugar,
+violação falha alto em vez de criar duplicata — que é o comportamento desejado.
+Registre em `docs/AGENTE_ELEVEC.md`.
+
+- [ ] **Step 6: Suíte, mutação, commit**
