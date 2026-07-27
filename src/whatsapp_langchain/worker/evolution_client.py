@@ -18,8 +18,11 @@ Por isso send_typing é no-op: chamar o endpoint de presença renderia HTTP
 400 por mensagem, e passar `delay` não produziria indicador nenhum. O
 parâmetro `delay_ms` continua exposto porque funciona em instâncias Baileys.
 
-Mídia recebida vem criptografada (herança do Baileys); baixá-la exige
-getBase64FromMediaMessage, não um GET na URL.
+Mídia recebida nesta integração NÃO vem criptografada: a `url` do payload
+aponta para `lookaside.fbsbx.com` e responde a um GET com a apikey da
+instância em `Authorization: Bearer` (ver `worker/media.py`). Quem baixa é
+o `download_media`, não este cliente. `baixar_midia` continua aqui como
+caminho de instância Baileys — ver a docstring do método.
 
 Suporta `delivery_mode="mock"` para simular envio sem consumir a API real.
 """
@@ -200,8 +203,19 @@ class EvolutionClient:
     async def baixar_midia(self, message_key: dict[str, Any]) -> bytes:
         """Baixa e decifra mídia via /chat/getBase64FromMediaMessage.
 
-        A URL de mídia que chega no payload do webhook é criptografada
-        (herança do Baileys) — um GET direto nela não devolve o arquivo.
+        **Sem chamador neste deploy, de propósito.** Numa instância Baileys
+        a URL do payload aponta para mídia criptografada em
+        `mmg.whatsapp.net` e este endpoint é a única via — ele decifra com a
+        `mediaKey` que a Evolution guardou. Na integração WHATSAPP-BUSINESS
+        desta conta nada disso existe: a URL é aberta e `download_media` faz
+        um GET nela.
+
+        Fica no cliente porque este repositório é um template herdado por
+        clientes que rodam Baileys: para eles, o conserto é trocar o ramo da
+        Evolution em `download_media` por uma chamada a este método, com a
+        `provider_message_key` que a fila já persiste. Removê-lo obrigaria a
+        reescrever (e re-verificar) o parsing de base64 e o tratamento de
+        erro que já estão testados aqui.
 
         Em `delivery_mode="mock"` não há o que simular: o download é uma
         chamada real à Evolution, e devolver bytes falsos levaria a uma

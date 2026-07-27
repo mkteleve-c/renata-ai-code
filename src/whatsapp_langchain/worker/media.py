@@ -53,37 +53,40 @@ async def download_media(
     canal: MessagingChannel | str = MessagingChannel.TWILIO,
     message_key: dict | None = None,
 ) -> bytes:
-    """Baixa mídia usando o mecanismo do canal de origem.
+    """Baixa mídia da URL do payload; o canal decide como autenticar.
 
-    Twilio/Meta/uazapi entregam URL baixável com autenticação. A Evolution
-    não: a URL do payload aponta para mídia criptografada, e o conteúdo
-    decifrado só sai por getBase64FromMediaMessage.
+    Todo canal entrega uma URL baixável por GET — o que muda é o esquema de
+    autenticação. Twilio usa BasicAuth da API Key. A Evolution na integração
+    WHATSAPP-BUSINESS entrega a URL aberta da Cloud API
+    (`lookaside.fbsbx.com`) e aceita a apikey da instância como
+    `Authorization: Bearer`: medido contra a instância real, áudio devolveu
+    200 `audio/ogg` (magic bytes OggS) e imagem 200 `image/jpeg` (JFIF). A
+    mídia NÃO é criptografada nesta integração.
+
+    `message_key` não participa do download: `getBase64FromMediaMessage` é o
+    caminho de instância Baileys, onde a URL aponta para conteúdo cifrado.
+    O parâmetro fica na assinatura porque o processor o entrega a partir de
+    `message_queue.provider_message_key` e porque um herdeiro deste template
+    rodando Baileys troca este ramo por `EvolutionClient.baixar_midia`.
     """
+    if not url:
+        raise ValueError(f"download de mídia exige URL (canal={canal})")
+
+    auth: tuple[str, str] | None = None
+    headers: dict[str, str] | None = None
+
     if canal == MessagingChannel.EVOLUTION:
-        if not message_key:
-            raise ValueError("Evolution exige message_key para baixar mídia")
-
-        from whatsapp_langchain.worker.evolution_client import EvolutionClient
-
-        # `delivery_mode` explícito: sem ele o cliente nascia "real" e o
-        # download batia na API da Evolution mesmo com OUTBOUND_MODE=mock,
-        # furando a semântica de mock em dev com credenciais preenchidas.
-        cliente = EvolutionClient(
-            base_url=settings.evolution_base_url,
-            api_key=settings.evolution_api_key,
-            instance=settings.evolution_instance,
-            delivery_mode=settings.resolved_outbound_mode,
-        )
-        return await cliente.baixar_midia(message_key)
-
-    auth = (
-        (settings.twilio_api_key_sid, settings.twilio_api_key_secret)
-        if settings.twilio_api_key_sid
-        else None
-    )
+        headers = {"Authorization": f"Bearer {settings.evolution_api_key}"}
+    elif settings.twilio_api_key_sid:
+        auth = (settings.twilio_api_key_sid, settings.twilio_api_key_secret)
 
     async with httpx.AsyncClient() as client:
-        response = await client.get(url, auth=auth, follow_redirects=True)
+        response = await client.get(
+            url,
+            auth=auth,
+            headers=headers,
+            follow_redirects=True,
+        )
         response.raise_for_status()
         return response.content
 
@@ -231,22 +234,6 @@ async def _transcribe_audio(media_bytes: bytes, media_type: str) -> str:
     )
 
 
-def _tem_via_de_download(
-    media_url: str | None,
-    canal: MessagingChannel | str,
-    message_key: dict | None,
-) -> bool:
-    """Indica se existe caminho para obter os bytes da mídia.
-
-    Para os demais canais a URL é a única via. Na Evolution a URL do
-    payload é cifrada e pode nem vir — quem baixa é a message_key via
-    getBase64FromMediaMessage.
-    """
-    if canal == MessagingChannel.EVOLUTION:
-        return bool(media_url) or bool(message_key)
-    return bool(media_url)
-
-
 async def preprocess_incoming_message(
     body: str,
     media_url: str | None = None,
@@ -256,9 +243,10 @@ async def preprocess_incoming_message(
 ) -> MediaPreprocessResult:
     """Normaliza entrada para texto antes da chamada ao agente.
 
-    `canal` e `message_key` vêm da mensagem da fila e decidem como a mídia
-    é baixada. Os defaults mantêm o comportamento histórico (Twilio) para
-    chamadores que não os informam.
+    `canal` vem da mensagem da fila e decide como o download se autentica.
+    `message_key` é repassada a `download_media` sem participar do download
+    nos canais de hoje (ver a docstring de lá). Os defaults mantêm o
+    comportamento histórico (Twilio) para chamadores que não os informam.
     """
     if not media_url and not media_type:
         return MediaPreprocessResult(
@@ -267,8 +255,10 @@ async def preprocess_incoming_message(
             media_processing_status="none",
         )
 
-    # Payload de mídia incompleto: não invoca agente.
-    if not _tem_via_de_download(media_url, canal, message_key) or not media_type:
+    # Payload de mídia incompleto: não invoca agente. A URL é a via de
+    # download em todos os canais, Evolution incluída — sem ela não há bytes
+    # a buscar, e o lead recebe a auto-resposta em vez de silêncio.
+    if not media_url or not media_type:
         return MediaPreprocessResult(
             should_invoke_agent=False,
             normalized_text=None,
