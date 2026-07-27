@@ -190,3 +190,30 @@ async def test_json_de_um_item_so_gera_um_send_e_nenhum_sleep():
         twilio.send_message.assert_awaited_once_with("+5511999999999", "oi")
         mock_sleep.assert_not_awaited()
         assert mock_done.await_count == 1
+
+
+async def test_auditoria_grava_cru_ui_grava_baloes_legiveis():
+    """Fix round 1 (Importante 4): mark_done (message_queue.response, auditoria)
+    grava o JSON cru; upsert_conversation (conversations.last_message, usado
+    no preview truncado de /chats no admin panel) grava os balões unidos por
+    "\\n" — não o JSON, que apareceria cru e truncado na lista de conversas.
+    """
+    msg = mensagem("elevec_sdr")
+    twilio = AsyncMock()
+    twilio.send_typing = AsyncMock(return_value=True)
+    twilio.send_message = AsyncMock(return_value="SM_OK")
+
+    bruto = '{"messages": ["oi", "tudo bem?"]}'
+
+    pre, load, done, failed, conv, sleep = _patches()
+    with pre, load as mock_load, done as mock_done, failed, conv as mock_conv, sleep:
+        mock_graph = AsyncMock()
+        mock_graph.ainvoke.return_value = {"messages": [MagicMock(content=bruto)]}
+        mock_load.return_value = mock_graph
+
+        from whatsapp_langchain.worker.processor import process_message
+
+        await process_message(msg, AsyncMock(), checkpointer=AsyncMock(), twilio=twilio)
+
+        assert mock_done.await_args.args[2] == bruto
+        assert mock_conv.await_args.kwargs["last_message"] == "oi\ntudo bem?"

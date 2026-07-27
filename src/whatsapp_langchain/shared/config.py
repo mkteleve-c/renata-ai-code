@@ -127,6 +127,17 @@ class Settings(BaseSettings):
     lease_seconds: int = 60
     max_attempts: int = 3
 
+    # --- Balões (resposta em múltiplas mensagens, hoje só elevec_sdr) ---
+    # Espaçamento entre balões enviados em sequência. Não é indicador de
+    # "digitando" — é puramente temporal (o delay_ms do EvolutionClient não
+    # produz efeito nenhum na integração WHATSAPP-BUSINESS desta conta).
+    balao_delay_ms: int = 700
+    # Teto de balões por resposta — acima disso, extrair_baloes concatena o
+    # resto no último balão. Protege lease_seconds: sem teto, uma resposta
+    # com dezenas de itens soma segundos de sleep suficientes para estourar
+    # o lease e, com mais de um worker, duplicar o envio.
+    balao_max_count: int = 10
+
     # --- Media ---
     media_image_enabled: bool = True
     media_audio_enabled: bool = True
