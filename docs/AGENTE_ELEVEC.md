@@ -310,12 +310,14 @@ teardown. Nenhuma escrita chega a serviço externo.
 
 ## Invariante de telefone (contrato para o importador da Fase 4)
 
-Desde a migração `db/migrations/014_uma_linha_por_pessoa.sql`,
-`leads_crm.phone` é **sempre** a forma canônica (só dígitos, brasileiro sem
-o 9º dígito) — garantido pelo banco, não por convenção de quem escreve. O
-`CHECK leads_crm_phone_canonico_check` proíbe as duas formas físicas que
-causavam duplicata de identidade (mesma pessoa, duas linhas): o 9º dígito
-do celular (`^55[0-9]{2}9[0-9]{8}$`) e o zero de tronco (`^550`).
+Desde as migrações `db/migrations/014_uma_linha_por_pessoa.sql` e
+`015_singleton_e_local_sem_ddi.sql`, `leads_crm.phone` é **sempre** a forma
+canônica (só dígitos, brasileiro sem o 9º dígito) — garantido pelo banco,
+não por convenção de quem escreve. `CHECK leads_crm_phone_canonico_check`
+proíbe três formas físicas: o 9º dígito do celular (`^55[0-9]{2}9[0-9]{8}$`),
+o zero de tronco (`^550`) e a forma local sem DDI (`^[0-9]{10,11}$` —
+`canonicalizar()` nunca produz essa forma para número brasileiro, mas um
+importador que não canonicalizasse antes de escrever poderia).
 
 **Consequência para o importador do Supabase:** ele precisa canonicalizar
 (`shared/phone.py::canonicalizar`) **antes** de inserir, não depois. Uma
@@ -324,6 +326,21 @@ recusada pelo Postgres) em vez de criar silenciosamente uma segunda linha
 para o mesmo lead — esse é o comportamento desejado. Não trate uma
 `CheckViolation` aqui como bug do importador para contornar; é o banco
 recusando um telefone que chegou sem canonicalizar.
+
+**As 3.368 linhas / 151 duplicatas medidas na base legada estão no
+Supabase, não em `leads_crm`.** O `leads_crm` do harness só é escrito por
+`aplicar_gate` (sempre grava canônico) — o bloco de consolidação da 014 é
+**inerte** ali; não há nada para ele consolidar num banco que nunca recebeu
+a base legada. Quem de fato consolida os grupos duplicados da base legada é
+o **importador da Fase 4**, na carga única que povoa `leads_crm` pela
+primeira vez. Isso faz dele uma **terceira cópia** das regras de fusão
+(`_vencedor_pausa`, precedência de `phase`, `max(followup_count)`,
+`min(last_inbound_at)`, `linhas_fundidas`), além de `shared/leads.py` e da
+014 — as três precisam andar juntas. A opção mais segura é o importador
+**reusar** a lógica de consolidação da 014 (ou uma função equivalente
+extraída para `shared/`) em vez de reimplementar as regras pela terceira
+vez; se reimplementar mesmo assim, documentar isso explicitamente no código
+do importador, com o mesmo aviso desta seção.
 
 ---
 

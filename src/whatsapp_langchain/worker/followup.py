@@ -114,6 +114,17 @@ class LeadReivindicado:
 # dígito) porque o CHECK da blocklist aceita as duas e o opt-out pode ter
 # sido registrado sob qualquer uma delas — mesma regra de
 # `_telefones_bloqueados`, abaixo, que `ainda_vale_enviar` ainda usa.
+#
+# `and followup_count <= 2` é redundante com as três condições do OR logo
+# abaixo (nenhuma delas casa `followup_count >= 3`) — de propósito: um
+# mutante que trocasse `= 2` por `>= 2` no braço do degrau 3 reabriria a
+# régua para um lead que já recebeu as três mensagens (`followup_count =
+# 3`), que `montar_mensagem` não sabe tratar (`nivel=4` levanta `ValueError`,
+# capturado como falha — nenhum WhatsApp indevido sai, mas o contador sobe
+# e o log enche a cada rodada, por até 23h, sem ninguém perceber). Esta
+# cláusula existe para que "três degraus é o fim" não dependa de nenhuma
+# das três condições estar certa — é uma barreira estrutural, não só
+# convenção do desenho do OR.
 _SQL_ELEGIVEIS_TRAVADOS = """
 select phone, name, followup_count
 from leads_crm
@@ -121,6 +132,7 @@ where followup_active
   and agent_active
   and phase not in ('agendou_sessao','desqualificado','perdido','qualificado')
   and last_inbound_at is not null
+  and followup_count <= 2
   and (
         (followup_count = 0
          and last_inbound_at < now() - make_interval(mins => %(n1)s))
@@ -163,6 +175,7 @@ where followup_active
   and agent_active
   and phase not in ('agendou_sessao','desqualificado','perdido','qualificado')
   and last_inbound_at is not null
+  and followup_count <= 2
   and (
         (followup_count = 0
          and last_inbound_at < now() - make_interval(mins => %(n1)s))
@@ -409,19 +422,20 @@ async def ainda_vale_enviar(pool: AsyncConnectionPool, phone: str, nivel: int) -
       em todo inbound aceito, e é esse zeramento, não o relógio, que este
       código enxerga primeiro.
     - **`last_inbound_at` mais recente que `last_interaction_at`** (que
-      `reivindicar` acabou de gravar como o instante do claim): **é
-      alcançável hoje**, e não só por um caminho futuro — o caminho real é
-      um par duplicado com um lado pausado. Se `com_9` está com
-      `agent_active=false` e `sem_9` (já reivindicado, `agent_active=true`)
-      recebe um inbound novo, `aplicar_gate` funde as duas linhas
-      (`_fundir`/`_vencedor_pausa`) e o `agent_active` da FUSÃO vale
-      `false` (pausa vence, mesmo vindo da linha irmã) — o gate cai no
-      ramo `agente_desligado`, cujo `UPDATE` roda `WHERE phone IN (com_9,
-      sem_9)` e bumpa `last_inbound_at` das DUAS linhas físicas, inclusive
-      a de `sem_9`, sem tocar em `agent_active`/`followup_active`/
-      `followup_count` dela. Nesse caso as quatro checagens anteriores
-      passam limpo em `sem_9` — só esta comparação de relógios pega. Log
-      real capturado: `followup_abortado motivo=lead_falou_apos_o_claim`.
+      `reivindicar` acabou de gravar como o instante do claim): guarda
+      defensiva para um caminho FUTURO, hoje inalcançável por qualquer
+      código real. Até a Task 7, o caminho real era um par duplicado com um
+      lado pausado — `com_9` com `agent_active=false` e `sem_9` (já
+      reivindicado) recebendo inbound novo fundia as duas linhas
+      (`_fundir`/`_vencedor_pausa`) e bumpava `last_inbound_at` de `sem_9`
+      sem tocar `agent_active`/`followup_active`/`followup_count` dela — as
+      quatro checagens anteriores passavam limpo, só esta pegava. O CHECK
+      `leads_crm_phone_canonico_check` (migração 014) tornou essa duplicata
+      irrepresentável, e o caminho fechou. A justificativa que sobra é a
+      mesma do bullet anterior: um webhook do ChatWoot (Task 5) que grave
+      `last_inbound_at` (inbound real chegando por canal lateral) sem
+      passar pelo zeramento de `followup_count` que `aplicar_gate` faz hoje
+      abriria esse mesmo ramo de novo.
     """
     async with pool.connection() as conn:
         if phone in await _telefones_bloqueados(conn, {phone}):

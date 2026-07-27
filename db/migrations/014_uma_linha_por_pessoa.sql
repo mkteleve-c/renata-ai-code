@@ -37,6 +37,16 @@
 -- fase), a outra tem que mudar junto, ou a consolidação de produção e a
 -- fusão do dia a dia do gate divergem silenciosamente. ***
 --
+-- UMA DIVERGÊNCIA DELIBERADA, não esquecimento: `_fundir`/`_persistir_
+-- consolidacao` NUNCA tocam `last_inbound_at` -- a linha canônica que
+-- sobrevive ao gate mantém o valor que ela já tinha, porque o gate grava
+-- essa coluna a cada inbound de qualquer forma (não precisa de fusão para
+-- ficar correta). A consolidação em massa abaixo não tem esse luxo -- é
+-- uma operação única sobre um grupo que pode nunca mais ser revisitado --
+-- então aplica `min(last_inbound_at)` do grupo inteiro, o conservador para
+-- a janela de 24h da régua. As duas regras estão CERTAS cada uma no seu
+-- contexto; não é uma cópia desatualizada da outra.
+--
 -- Por que migração nova em vez de editar uma das anteriores: o runner
 -- (`shared/db.py` e `db/migrate.py`) pula migração pelo NOME do arquivo
 -- registrado em `_migrations` e não guarda checksum -- editar uma já

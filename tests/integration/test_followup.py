@@ -110,6 +110,27 @@ async def test_os_tres_degraus_ancoram_no_inbound(lead_factory):
     assert por_telefone["551100000004"] == 3
 
 
+async def test_limite_prioriza_o_last_inbound_at_mais_antigo(lead_factory):
+    """Justiça de fila: com mais elegíveis do que `limite`, quem espera há
+    mais tempo (`last_inbound_at` mais antigo) tem que ser servido primeiro
+    — não o mais recente. `order by last_inbound_at` sem `desc` é o que
+    garante isso; um `desc` acidental inverteria a prioridade sem quebrar
+    nenhum outro teste desta suíte (nenhum indevido sai, a régua só atende
+    fora de ordem)."""
+    mais_urgente = await lead_factory(
+        "551100000210", followup_count=0, minutos_desde_inbound=90
+    )
+    await lead_factory("551100000211", followup_count=0, minutos_desde_inbound=60)
+    await lead_factory("551100000212", followup_count=0, minutos_desde_inbound=30)
+
+    reivindicados = await _reivindicar(limite=1)
+
+    assert [r.phone for r in reivindicados] == [mais_urgente], (
+        "com limite=1 e três elegíveis, o mais urgente (90 min de espera) "
+        "tem que ser o único reivindicado"
+    )
+
+
 async def test_degrau_2_nao_acumula_sobre_o_degrau_1(lead_factory):
     """A âncora é o inbound, não o envio anterior.
 
@@ -172,6 +193,30 @@ async def test_fase_terminal_nunca_e_perseguida(lead_factory):
             minutos_desde_inbound=60,
         )
     assert await _reivindicar() == []
+
+
+async def test_lead_que_ja_recebeu_os_tres_degraus_nunca_e_reivindicado(lead_factory):
+    """Três degraus é o fim — nenhum quarto envio existe. Um lead em
+    `followup_count = 3` (já passou pelos três), ativo, fase elegível e
+    dentro da janela não pode voltar a ser candidato: nenhuma das três
+    condições do degrau (`= 0`, `= 1`, `= 2`) casa `followup_count = 3`,
+    mas essa proteção não pode depender só disso — um mutante que trocasse
+    `= 2` por `>= 2` no braço do degrau 3 reabriria a régua para este lead,
+    e `montar_mensagem(4)` levantaria a cada rodada (capturado como falha,
+    nenhum WhatsApp indevido sai, mas o contador sobe e o log enche por até
+    23h sem que ninguém perceba). `followup_count <= 2` no predicado é a
+    barreira estrutural contra essa classe de mutação.
+
+    `minutos_desde_inbound` tem que passar do limiar do DEGRAU 3 (23h,
+    `n3_min`) — não um valor pequeno qualquer. Com um valor abaixo do
+    limiar, a condição de tempo do braço `>= 2` (mutado) já falha sozinha,
+    e o teste passaria mesmo SEM a barreira `followup_count <= 2` — não
+    provaria nada sobre ela."""
+    phone = await lead_factory(
+        "551100000201", followup_count=3, minutos_desde_inbound=23 * 60 + 5
+    )
+    assert await _reivindicar() == []
+    assert await _followup_count(phone) == 3, "não pode ter avançado nem sido tocado"
 
 
 async def test_agente_pausado_nao_e_reivindicado(lead_factory):
