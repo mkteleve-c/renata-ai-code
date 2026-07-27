@@ -20,6 +20,7 @@ from scripts.migrar_supabase import (
     MigracaoAbortada,
     Normalizado,
     _contagem_cumulativa_por_rank,
+    _desaninhar_output,
     agrupar_por_canonico,
     extrair_turno_de_conversa,
     fundir_grupo,
@@ -967,11 +968,18 @@ def test_validar_fases_nao_retrocederam_aborta_quando_persistido_e_menor():
 #
 # `n8n_chat_histories.message` é o formato serializado do LangChain:
 # {type, content, additional_kwargs, response_metadata}. Medido contra a
-# origem: `human` (3.316 linhas) nunca tem `content` em JSON; `ai` (4.460
-# linhas) tem 3.316 com `content` que PARECE JSON (as respostas finais,
-# envelope de balões) e 1.144 sem (pedidos de chamada de tool -- e
-# 4460-3316 = 1144, exatamente a contagem de `tool`). Os fixtures abaixo
-# reproduzem essa forma exata, não uma aproximação.
+# origem (via MCP do Supabase, base real -- fix round 1, ver
+# `docs/evidencias/formato-historico-n8n.md`): `human` (3.316 linhas) nunca
+# tem `content` em JSON; `ai` (4.460 linhas) tem 3.316 com `content` que
+# PARECE JSON e 1.144 sem (4460-3316 = 1144, exatamente a contagem de
+# `tool`). Dos 3.316 `ai` com `content` JSON, 100% têm a forma
+# `{"output": {"messages": [...]}}` -- ANINHADA sob `output`, não
+# `{"messages": [...]}` no topo (a primeira versão deste módulo assumia o
+# topo, sem medir; corrigido no fix round 1). Os 1.144 `ai` sem JSON são
+# TEXTO PURO (ex.: `Calling update_crm1 with input: {...}`), nunca
+# `tool_calls` em `additional_kwargs` -- 0 das 8.920 linhas da base tem essa
+# chave. Os fixtures abaixo reproduzem essa forma exata, não uma
+# aproximação.
 
 
 def _msg_human(texto: str) -> dict:
@@ -985,25 +993,30 @@ def _msg_human(texto: str) -> dict:
 
 def _msg_ai_final(baloes: list[str]) -> dict:
     """Um `ai` cujo `content` é o envelope de balões do output parser do
-    n8n -- o formato que `extrair_baloes` desembrulha em produção."""
+    n8n -- ANINHADO sob `output`, a forma medida contra a base real (fix
+    round 1, `docs/evidencias/formato-historico-n8n.md`): das 3.316 linhas
+    `ai` com `content` JSON, 100% têm exatamente
+    `{"output": {"messages": [...]}}`, nenhuma com `messages` no topo."""
     import json as _json
 
     return {
         "type": "ai",
-        "content": _json.dumps({"messages": baloes}),
+        "content": _json.dumps({"output": {"messages": baloes}}),
         "additional_kwargs": {},
         "response_metadata": {},
     }
 
 
 def _msg_ai_tool_call() -> dict:
-    """Um `ai` de PEDIDO de chamada de ferramenta -- `content` vazio, a
-    chamada de verdade mora em `additional_kwargs.tool_calls` (nunca lido
-    por este módulo)."""
+    """Um `ai` de PEDIDO de chamada de ferramenta -- `content` é TEXTO
+    PURO (ex.: medido na origem: `Calling update_crm1 with input: {...}`),
+    não JSON e não vazio; `additional_kwargs.tool_calls` nunca aparece na
+    base real (0 das 8.920 linhas tem essa chave), então este módulo nunca
+    lê `additional_kwargs` para decidir nada."""
     return {
         "type": "ai",
-        "content": "",
-        "additional_kwargs": {"tool_calls": [{"name": "buscar_agenda", "args": {}}]},
+        "content": "Calling buscar_agenda with input: {}",
+        "additional_kwargs": {},
         "response_metadata": {},
     }
 
@@ -1071,6 +1084,86 @@ def test_extrair_turno_de_conversa_descarta_human_vazio():
 
 def test_extrair_turno_de_conversa_tipo_desconhecido_descarta():
     assert extrair_turno_de_conversa({"type": "system", "content": "x"}) is None
+
+
+# --- `_desaninhar_output` (fix round 1) -------------------------------------
+#
+# A primeira versão deste módulo assumia `{"messages": [...]}` no topo do
+# `content` de um `ai` final -- sem medir contra a base real. Medido depois
+# (via MCP do Supabase, 27/07/2026): as 3.316 linhas `ai` com `content` JSON
+# têm TODAS a forma `{"output": {"messages": [...]}}`. `_desaninhar_output`
+# existe para reduzir essa forma à que `extrair_baloes` (elevec_sdr/saida.py,
+# NUNCA alterado por esta correção) já sabe ler.
+
+
+def test_desaninhar_output_extrai_o_objeto_interno():
+    import json as _json
+
+    bruto = _json.dumps({"output": {"messages": ["Oi!", "Tudo bem?"]}})
+
+    assert _desaninhar_output(bruto) == _json.dumps({"messages": ["Oi!", "Tudo bem?"]})
+
+
+def test_desaninhar_output_preserva_forma_sem_output():
+    """O formato do agente NOVO (`messages` no topo, sem embrulho) passa
+    intacto -- `_desaninhar_output` só age quando existe uma chave `output`
+    que é objeto."""
+    import json as _json
+
+    bruto = _json.dumps({"messages": ["Oi!"]})
+
+    assert _desaninhar_output(bruto) == bruto
+
+
+def test_desaninhar_output_preserva_json_nao_e_dict():
+    import json as _json
+
+    bruto = _json.dumps(["Oi!"])
+
+    assert _desaninhar_output(bruto) == bruto
+
+
+def test_desaninhar_output_preserva_quando_output_nao_e_objeto():
+    import json as _json
+
+    bruto = _json.dumps({"output": "texto solto, não objeto"})
+
+    assert _desaninhar_output(bruto) == bruto
+
+
+def test_extrair_turno_de_conversa_desembrulha_a_forma_real_aninhada_em_output():
+    """A forma MEDIDA na base real -- ver o cabeçalho da seção Task 5 no
+    módulo. Este é o teste que teria falhado contra a implementação
+    original (que buscava `messages` no topo): sem `_desaninhar_output`,
+    `extrair_baloes` não acha a lista, loga `extrair_baloes_sem_lista_
+    messages` e devolve o JSON cru como balão único."""
+    turno = extrair_turno_de_conversa(_msg_ai_final(["Oi, Diego!", "Tudo certo?"]))
+
+    assert turno == ("ai", "Oi, Diego!\n\nTudo certo?")
+    assert "output" not in turno[1]
+    assert "{" not in turno[1]
+
+
+def test_extrair_turno_de_conversa_ai_json_sem_lista_de_baloes_vira_balao_unico():
+    """Nenhuma linha da base real tem essa forma (medido: 0 de 3.316) --
+    mas o código não pode travar se aparecer. `content` JSON sem `messages`
+    nem no topo nem sob `output` cai no MESMO fallback que `extrair_baloes`
+    já usa para qualquer JSON sem a lista de balões: o texto JSON inteiro
+    vira um balão único (com aviso de log em `extrair_baloes`), nunca uma
+    exceção nem uma perda silenciosa da linha."""
+    mensagem = {
+        "type": "ai",
+        "content": '{"algum_campo": "sem messages em lugar nenhum"}',
+        "additional_kwargs": {},
+        "response_metadata": {},
+    }
+
+    turno = extrair_turno_de_conversa(mensagem)
+
+    assert turno is not None
+    papel, conteudo = turno
+    assert papel == "ai"
+    assert conteudo == '{"algum_campo": "sem messages em lugar nenhum"}'
 
 
 def _linha_hist(

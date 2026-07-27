@@ -1367,15 +1367,32 @@ async def importar_leads(
 #
 # `4460 - 3316 = 1144`, exatamente a contagem de `tool`. Isso não é
 # coincidência: os `ai` cujo `content` NÃO parece JSON são os PEDIDOS de
-# chamada de ferramenta que o modelo emitia (o texto ali é irrelevante ou
-# vazio -- a chamada de fato mora em `additional_kwargs.tool_calls`, que este
-# módulo nunca lê); os `ai` cujo `content` PARECE JSON são as respostas
-# FINAIS -- o envelope de balões `{"messages": [...]}` que o output parser do
-# n8n produzia, o mesmo formato que `extrair_baloes` (elevec_sdr/saida.py)
-# desembrulha em produção hoje. `extrair_turno_de_conversa` classifica pela
-# MESMA distinção -- tenta `json.loads` no `content` de um `ai`; sucesso é
-# resposta final (desembrulhada via `extrair_baloes`, REUSADO, não
-# reimplementado), falha é ruído de tool call e o turno é descartado.
+# chamada de ferramenta que o modelo emitia -- medido: é TEXTO PURO (ex.:
+# `Calling update_crm1 with input: {...}`), nunca `tool_calls` em
+# `additional_kwargs` (nenhuma das 8.920 linhas da base tem essa chave); os
+# `ai` cujo `content` PARECE JSON são as respostas FINAIS. `extrair_turno_
+# de_conversa` classifica pela MESMA distinção -- tenta `json.loads` no
+# `content` de um `ai`; sucesso é resposta final, falha é ruído de tool call
+# e o turno é descartado.
+#
+# FIX ROUND 1 -- o envelope da resposta final está ANINHADO sob `output`,
+# não `{"messages": [...]}` no topo como a primeira versão deste módulo
+# assumia (extrapolando do formato que `extrair_baloes`, elevec_sdr/saida.py,
+# desembrulha HOJE em produção para o agente NOVO). Medido contra a base real
+# via MCP do Supabase (não fixture, não suposição): as 3.316 linhas `ai` com
+# `content` JSON têm TODAS, sem exceção, a forma
+# `{"output": {"messages": ["Oi, Diego!", "Recebi sua mensagem..."]}}` --
+# 0 têm `messages` no topo, 0 têm `output` sem `messages` array, 0 têm item
+# não-string ou lista vazia dentro de `messages`. `_desaninhar_output`
+# resolve esse embrulho ANTES de chamar `extrair_baloes` -- que continua
+# INTOCADO (é código de produção da Fase 2, e o formato do agente novo é
+# `messages` no topo mesmo; `output` é embrulho do n8n, problema só da
+# importação). Sem desaninhar, as 3.316 respostas da Renata entrariam no
+# histórico como blobs de JSON cru (`extrair_baloes` cai no fallback de
+# balão único quando não acha `messages` no topo) -- e o modelo passaria a
+# ver as próprias falas passadas nesse formato, o pior tipo de ruído possível
+# para um agente cuja saída é justamente um envelope JSON. Evidência
+# completa, com as queries: `docs/evidencias/formato-historico-n8n.md`.
 #
 # `tool` nunca entra: é resultado de execução de ferramenta, nunca texto que
 # o lead leu. As tools referenciadas por esse ruído mudaram de assinatura
@@ -1402,6 +1419,44 @@ def _eh_json_valido(texto: str) -> bool:
     except (ValueError, TypeError):
         return False
     return True
+
+
+def _desaninhar_output(bruto: str) -> str:
+    """Desembrulha o envelope aninhado do n8n ANTES de `extrair_baloes` ver
+    o texto -- fix round 1, ver o cabeçalho da seção acima.
+
+    O `content` medido de um `ai` final é `{"output": {"messages": [...]}}`,
+    não `{"messages": [...]}` no topo. `extrair_baloes` (elevec_sdr/saida.py)
+    procura `messages` no TOPO -- é o formato que o agente NOVO produz, sem
+    embrulho, e ele continua correto para esse caso; não é alterado aqui. O
+    que este módulo faz é reduzir o formato ANTIGO ao formato que
+    `extrair_baloes` já sabe ler: se `bruto` parsear como um objeto com uma
+    chave `output` que também é um objeto, devolve o JSON SERIALIZADO desse
+    objeto interno (`{"messages": [...]}`) -- pronto para `extrair_baloes`
+    desembrulhar normalmente.
+
+    Quando `bruto` NÃO tem essa forma -- já vem sem `output` (ex.: uma
+    migração futura, ou dado de outra origem), ou `output` não é um objeto
+    -- devolve `bruto` sem alterar. `extrair_baloes` então tenta o caminho
+    normal dele: acha `messages` no topo se houver, ou cai no fallback de
+    balão único (o texto JSON inteiro como uma string) se não achar em lugar
+    nenhum. Medido contra a base real (27/07/2026, via MCP do Supabase): das
+    3.316 linhas `ai` com `content` JSON, 100% têm `output.messages` como
+    array de strings não vazio -- nenhuma cai no fallback hoje. O fallback
+    existe mesmo assim porque este módulo processa uma base viva (ver o
+    plano da Fase 4) -- uma linha futura com `content` JSON mas sem a lista
+    de balões em lugar nenhum não pode travar a importação; vira um balão
+    único com o JSON cru (mesmo comportamento — e mesmo aviso de log — que
+    `extrair_baloes` já aplica para qualquer JSON sem `messages`), não uma
+    exceção.
+    """
+    try:
+        dados = json.loads(bruto)
+    except (ValueError, TypeError):
+        return bruto
+    if isinstance(dados, dict) and isinstance(dados.get("output"), dict):
+        return json.dumps(dados["output"])
+    return bruto
 
 
 @dataclass(frozen=True)
@@ -1437,11 +1492,13 @@ def extrair_turno_de_conversa(mensagem: dict[str, Any]) -> tuple[str, str] | Non
       respostas da Renata).
     - `type == "ai"`: só entra se `content` parsear como JSON -- é a
       distinção medida acima entre resposta final (JSON) e pedido de
-      chamada de ferramenta (não-JSON). Quando entra, `content` passa por
-      `extrair_baloes` (reusado de `elevec_sdr/saida.py`, nunca
-      reimplementado) e os balões saem juntos numa string só, separados por
-      linha em branco -- é UM turno de conversa, mesmo tendo sido enviado
-      como vários balões de WhatsApp.
+      chamada de ferramenta (não-JSON). Quando entra, `content` passa
+      primeiro por `_desaninhar_output` (desembrulha o `{"output": {...}}`
+      medido na origem -- fix round 1) e SÓ DEPOIS por `extrair_baloes`
+      (reusado de `elevec_sdr/saida.py`, nunca reimplementado, nunca
+      alterado); os balões saem juntos numa string só, separados por linha
+      em branco -- é UM turno de conversa, mesmo tendo sido enviado como
+      vários balões de WhatsApp.
     - `type == "tool"`, ou qualquer outro valor: nunca entra.
 
     `content` vazio ou só espaço, em qualquer ramo, também descarta o
@@ -1458,7 +1515,8 @@ def extrair_turno_de_conversa(mensagem: dict[str, Any]) -> tuple[str, str] | Non
         bruto = mensagem.get("content")
         if not isinstance(bruto, str) or not _eh_json_valido(bruto):
             return None
-        conteudo = "\n\n".join(extrair_baloes(bruto)).strip()
+        desaninhado = _desaninhar_output(bruto)
+        conteudo = "\n\n".join(extrair_baloes(desaninhado)).strip()
         return ("ai", conteudo) if conteudo else None
 
     return None
