@@ -34,7 +34,7 @@ from langchain_core.runnables.config import var_child_runnable_config
 from psycopg_pool import AsyncConnectionPool
 
 from whatsapp_langchain.shared.db import get_pool
-from whatsapp_langchain.shared.phone import from_e164
+from whatsapp_langchain.shared.phone import canonicalizar, from_e164
 
 from .prompts import SYSTEM_PROMPT
 
@@ -44,6 +44,14 @@ FUSO = ZoneInfo("America/Sao_Paulo")
 
 # Os quatro placeholders do prompt. `{Nome}` NÃO está aqui de propósito.
 CAMPOS = ("nome", "origem", "telefone", "data_hoje")
+
+# Lead sem nome é rotina — o gate grava `nullif(pushName, '')`. Sem sentinel,
+# o SOP renderiza "Oi, !" e pode ecoar o vazio para o lead.
+NOME_AUSENTE = "não informado"
+
+# `name` vem do `pushName` do WhatsApp (~25 caracteres na prática), mas
+# `manual_import` e as escritas de CRM não têm esse teto.
+LIMITE_NOME = 60
 
 # `%A` depende do locale do processo — no n8n o `toFormat('EEEE')` saía no
 # locale do container. Fixar em português aqui torna a saída determinística e
@@ -67,17 +75,44 @@ def formatar_data_hoje(agora: datetime | None = None) -> str:
     `America/Sao_Paulo`. As duas colapsaram num único `{data_hoje}`, então o
     valor precisa carregar data, hora E dia da semana: a Renata sugere
     horários de agenda a partir daqui.
+
+    `agora` existe para os testes injetarem instantes conhecidos. Sem
+    tzinfo, é lido como relógio de parede de São Paulo — nunca como o fuso
+    do processo, que faria o resultado mudar de máquina para máquina.
     """
-    momento = agora.astimezone(FUSO) if agora else datetime.now(FUSO)
+    if agora is None:
+        momento = datetime.now(FUSO)
+    elif agora.tzinfo is None:
+        momento = agora.replace(tzinfo=FUSO)
+    else:
+        momento = agora.astimezone(FUSO)
+
     return (
         f"{momento.strftime('%d/%m/%Y %H:%M:%S')} ({DIAS_DA_SEMANA[momento.weekday()]})"
     )
 
 
+def sanitizar_nome(bruto: str | None) -> str:
+    """Deixa o `name` do lead seguro para entrar no system prompt.
+
+    `leads_crm.name` vem do `pushName` do WhatsApp, escolhido pelo próprio
+    lead, e é interpolado dentro das instruções de um agente que chama
+    `calendar_agendar` e `human_handover` sob regras marcadas "INVIOLÁVEL".
+    Com `\\n` cru, um nome consegue reproduzir um bloco
+    `## Dados do Lead Atual:` falso no meio do prompt.
+
+    Colapsar espaço em branco mata a quebra de linha; o teto de
+    comprimento fecha o caso das origens sem limite (`manual_import`, as
+    escritas de CRM da Task 6).
+    """
+    limpo = " ".join((bruto or "").split())
+    return limpo[:LIMITE_NOME] if limpo else NOME_AUSENTE
+
+
 def contexto_vazio(telefone: str = "") -> dict[str, str]:
     """Contexto sem lead: nada de placeholder cru sobrando no prompt."""
     return {
-        "nome": "",
+        "nome": NOME_AUSENTE,
         "origem": "",
         "telefone": telefone,
         "data_hoje": formatar_data_hoje(),
@@ -89,16 +124,22 @@ async def carregar_contexto(
 ) -> dict[str, str]:
     """Lê nome e origem do lead em `leads_crm`. Nunca levanta.
 
-    `phone_e164` é a representação do harness (`+551155554444`, em
+    `phone_e164` é a representação do harness (`+5511955554444`, em
     `message_queue.phone_number` e no `thread_id`); `leads_crm.phone` é a
-    canônica só com dígitos. `from_e164` faz a conversão — fatiar string aqui
-    seria reinventar a regra do 9º dígito pela metade.
+    canônica, só dígitos e sem o 9º dígito. Quem aplica essa regra é
+    `canonicalizar` — `from_e164` só tira o "+", e sozinho ele acertaria o
+    lead apenas no canal Evolution, que já passa pelo gate
+    (`to_e164(resultado.canonico)`). Twilio, Meta e uazapi entregam o
+    número COM o 9: sem canonicalizar, apontar qualquer um deles para
+    `?agent=elevec_sdr` erraria o lead em 100% dos casos brasileiros, em
+    silêncio. `from_e164` fica como fallback para o que `canonicalizar`
+    recusa (LID, grupo, número malformado) — melhor consultar com os
+    dígitos crus e não achar nada do que estourar no meio do turno.
 
-    Lead inexistente devolve strings vazias: o turno vale mais que o
-    contexto, e o SOP já lida com um lead sem nome (Fase 1 pede o primeiro
-    nome do que a pessoa escrever).
+    Lead inexistente devolve o sentinel de nome e strings vazias no resto:
+    o turno vale mais que o contexto.
     """
-    canonico = from_e164(phone_e164)
+    canonico = canonicalizar(phone_e164) or from_e164(phone_e164)
     contexto = contexto_vazio(canonico)
 
     try:
@@ -117,7 +158,7 @@ async def carregar_contexto(
         return contexto
 
     nome, origem = linha
-    contexto["nome"] = nome or ""
+    contexto["nome"] = sanitizar_nome(nome)
     contexto["origem"] = origem or ""
     return contexto
 
@@ -127,6 +168,14 @@ def interpolar(prompt: str, contexto: dict[str, str]) -> str:
 
     `str.replace` token a token, nunca `.format()` — ver o docstring do
     módulo sobre a chave literal `{Nome}`.
+
+    A substituição é em cascata, na ordem de `CAMPOS`: um valor que contém
+    o token de um campo posterior é reinterpolado (um lead chamado
+    literalmente `{telefone}` renderiza o próprio número). O alcance é
+    trocar um campo do contexto por outro do mesmo contexto — nunca
+    injetar instrução nova — e `sanitizar_nome` já impede o caso que
+    importava. Coberto por
+    `test_valor_que_parece_placeholder_e_reinterpolado`.
     """
     texto = prompt
     for campo in CAMPOS:
