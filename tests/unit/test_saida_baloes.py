@@ -166,3 +166,66 @@ def test_texto_como_content_blocks_nao_quebra():
     direto nisso quebraria antes de qualquer parsing."""
     conteudo = [{"type": "text", "text": '{"messages": ["oi"]}'}]
     assert extrair_baloes(conteudo) == ["oi"]
+
+
+# --- Fix round 2: a cerca ancorada regrediu o caso mais comum (Importante) ---
+#
+# Ancorar a cerca (^...$) resolveu o balão com ``` embutido, mas quebrou
+# preâmbulo/epílogo ao redor da cerca — que é bem mais frequente (LLM
+# escrevendo "Aqui está:" antes ou "Espero ter ajudado!" depois do bloco
+# ```json). Correção: tenta a cerca ancorada primeiro (mais segura), depois
+# o texto bruto direto (cobre o ``` embutido, que já é JSON válido sem
+# stripping), e só por último a cerca livre/não-ancorada (cobre
+# preâmbulo/epílogo, com o risco de falso positivo que só vale correr por
+# último). Os três casos abaixo precisam funcionar ao mesmo tempo.
+
+
+def test_preambulo_antes_da_cerca_e_ignorado():
+    bruto = 'Aqui está:\n```json\n{"messages": ["oi"]}\n```'
+    assert extrair_baloes(bruto) == ["oi"]
+
+
+def test_epilogo_depois_da_cerca_e_ignorado():
+    bruto = '```json\n{"messages": ["oi"]}\n```\nEspero ter ajudado!'
+    assert extrair_baloes(bruto) == ["oi"]
+
+
+def test_preambulo_e_epilogo_ao_redor_da_cerca():
+    bruto = 'Aqui está:\n```json\n{"messages": ["oi"]}\n```\nEspero ter ajudado!'
+    assert extrair_baloes(bruto) == ["oi"]
+
+
+def test_cerca_embutida_continua_funcionando_com_a_cerca_livre():
+    """Não pode regredir: o caso que motivou a âncora continua correto agora
+    que a cerca livre é só a terceira tentativa, não a única."""
+    bruto = '{"messages": ["use ```codigo``` assim", "ok?"]}'
+    assert extrair_baloes(bruto) == ["use ```codigo``` assim", "ok?"]
+
+
+# --- Fix round 2: buraco 1 — descarte silencioso em _texto_de_conteudo ---
+
+
+def test_content_block_nao_string_e_descartado_com_log():
+    """Item de content block que não é str nem dict com "text" era
+    descartado em silêncio — mesmo padrão do Crítico, um nível acima."""
+    conteudo = [{"type": "text", "text": '{"messages": ["oi"]}'}, {"type": "image"}]
+    with capture_logs() as logs:
+        resultado = extrair_baloes(conteudo)
+    assert resultado == ["oi"]
+    assert any(
+        log["event"] == "extrair_baloes_content_block_descartado" for log in logs
+    )
+
+
+# --- Fix round 2: buraco 2 — texto vazio sem log e sem fallback visível ---
+
+
+def test_texto_vazio_loga_e_nao_manda_corpo_vazio():
+    """[""] vira send_message(body=""), que provedores rejeitam — queimando
+    3 tentativas de retry à toa (a causa é determinística, não passageira).
+    Devolve um texto de fallback visível em vez de string vazia."""
+    with capture_logs() as logs:
+        resultado = extrair_baloes("")
+    assert resultado != [""]
+    assert resultado[0]
+    assert any(log["event"] == "extrair_baloes_texto_vazio" for log in logs)

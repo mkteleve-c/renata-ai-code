@@ -217,3 +217,34 @@ async def test_auditoria_grava_cru_ui_grava_baloes_legiveis():
 
         assert mock_done.await_args.args[2] == bruto
         assert mock_conv.await_args.kwargs["last_message"] == "oi\ntudo bem?"
+
+
+async def test_content_blocks_em_agente_sem_baloes_nao_quebra_upsert():
+    """Fix round 2 (Menor): 'BaseMessage.content' pode vir list[str | dict]
+    (multimodal) mesmo para agentes fora da Renata. Antes desta correção,
+    baloes = [response_text] com response_text sendo uma lista fazia
+    "\\n".join(baloes) estourar TypeError DEPOIS do mark_done já ter rodado —
+    um ponto de falha novo que não existia com last_message=response_text.
+    """
+    msg = mensagem("rhawk_assistant")
+    twilio = AsyncMock()
+    twilio.send_typing = AsyncMock(return_value=True)
+    twilio.send_message = AsyncMock(return_value="SM_OK")
+
+    content_blocks = [{"type": "text", "text": "oi"}]
+
+    pre, load, done, failed, conv, sleep = _patches()
+    with pre, load as mock_load, done as mock_done, failed, conv as mock_conv, sleep:
+        mock_graph = AsyncMock()
+        mock_graph.ainvoke.return_value = {
+            "messages": [MagicMock(content=content_blocks)]
+        }
+        mock_load.return_value = mock_graph
+
+        from whatsapp_langchain.worker.processor import process_message
+
+        # Não pode lançar TypeError.
+        await process_message(msg, AsyncMock(), checkpointer=AsyncMock(), twilio=twilio)
+
+        assert mock_done.await_count == 1
+        assert isinstance(mock_conv.await_args.kwargs["last_message"], str)

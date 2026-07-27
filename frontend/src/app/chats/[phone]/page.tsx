@@ -4,8 +4,19 @@ import { Badge } from "@/components/ui/badge";
 import { Card, CardContent } from "@/components/ui/card";
 import { getChatMessages } from "@/lib/api";
 import { requireSession } from "@/lib/session";
+import { extrairBaloes } from "@/lib/baloes";
 
 export const dynamic = "force-dynamic";
+
+/**
+ * Único agente do catálogo que devolve JSON estruturado (`{"messages": [...]}`)
+ * em `message.response` — os demais respondem texto puro. Mesmo gate do
+ * backend (`processor.py`, `BALOES_AGENT_ID`): aplicar o parser fora desse
+ * agente arriscaria mostrar `[bruto]` corretamente, mas sem necessidade —
+ * texto puro nunca é JSON, então o parser já devolveria balão único de
+ * qualquer forma; o gate só deixa a intenção explícita.
+ */
+const AGENTE_BALOES_ID = "elevec_sdr";
 
 /**
  * Mapa de variantes do Badge para cada status de mensagem.
@@ -137,15 +148,26 @@ export default async function ChatDetailPage({
                   </p>
                 </div>
 
-                {/* Resposta da IA — só exibe se existir */}
+                {/* Resposta da IA — só exibe se existir. message.response é
+                    o texto CRU salvo pelo backend (auditoria); para a Renata
+                    ele é o JSON de balões — extrairBaloes só formata a
+                    exibição, não persiste nada. */}
                 {message.response && (
-                  <div className="rounded-lg bg-primary/5 border border-primary/10 p-3">
+                  <div className="rounded-lg bg-primary/5 border border-primary/10 p-3 space-y-2">
                     <p className="text-xs font-medium text-muted-foreground mb-1">
                       Assistente
                     </p>
-                    <p className="text-sm whitespace-pre-wrap">
-                      {message.response}
-                    </p>
+                    {(message.agent_id === AGENTE_BALOES_ID
+                      ? extrairBaloes(message.response)
+                      : [message.response]
+                    ).map((balao, index) => (
+                      <p
+                        key={index}
+                        className="text-sm whitespace-pre-wrap"
+                      >
+                        {balao}
+                      </p>
+                    ))}
                   </div>
                 )}
 

@@ -64,7 +64,7 @@ OutboundClient = TwilioClient | MetaClient | UazapiClient | EvolutionClient
 # Único agente do catálogo que devolve JSON estruturado (`{"messages": [...]}`)
 # no texto final — os demais (illumi_assistant, rhawk_assistant) respondem
 # texto puro e não podem passar por extrair_baloes. `extrair_baloes` é
-# importado sob demanda (lazy) dentro do branco que usa BALOES_AGENT_ID, não
+# importado sob demanda (lazy) dentro do branch que usa BALOES_AGENT_ID, não
 # aqui no topo: `load_graph(message.agent_id, ...)` já importa dinamicamente
 # o pacote `catalog.elevec_sdr` quando (e só quando) agent_id == "elevec_sdr"
 # — importar aqui em cima faria o worker carregar o catálogo da Renata
@@ -347,7 +347,7 @@ async def process_message(
         # não é acionado para eles, e o comportamento existente (um único
         # send_message com o texto integral) fica idêntico.
         if message.agent_id == BALOES_AGENT_ID:
-            # Import lazy e local ao branco: load_graph(message.agent_id, ...)
+            # Import lazy e local ao branch: load_graph(message.agent_id, ...)
             # acima já importou dinamicamente o pacote catalog.elevec_sdr
             # para chegar até aqui (agent_id só é "elevec_sdr" se o grafo da
             # Renata acabou de ser carregado), então este import não soma
@@ -359,7 +359,14 @@ async def process_message(
 
             baloes = extrair_baloes(response_text)
         else:
-            baloes = [response_text]
+            # response_text normalmente é str, mas `BaseMessage.content` no
+            # langchain_core é tipado `str | list[str | dict]` — um agente
+            # fora da Renata que algum dia devolver content blocks não pode
+            # quebrar o "\n".join(baloes) do upsert_conversation abaixo com
+            # TypeError (join exige que todo item da lista seja string).
+            baloes = [
+                response_text if isinstance(response_text, str) else str(response_text)
+            ]
 
         await _send_baloes(client, message, baloes)
 

@@ -28,17 +28,32 @@ from whatsapp_langchain.shared.config import settings
 
 logger = structlog.get_logger()
 
-# A cerca só conta se envolver o texto INTEIRO (do começo ao fim, depois do
-# strip) — ancorada com ^...$ e re.S para o `.` cruzar linhas. Sem âncora, um
-# balão que contém ```código``` no meio do próprio conteúdo (ex.: a Renata
-# ensinando alguém a formatar texto) seria capturado como se fosse a cerca
-# externa, quebrando o parse de um JSON que era válido. re.I porque modelos
-# variam entre ```json e ```JSON.
-CERCA = re.compile(r"^```(?:json)?\s*(.*?)\s*```$", re.S | re.I)
+# Cerca ancorada: só conta se envolver o texto INTEIRO (do começo ao fim,
+# depois do strip). Tentada primeiro porque é a mais segura — não corre risco
+# de casar com um ``` que esteja dentro do conteúdo de um balão (ex.: a
+# Renata ensinando alguém a formatar texto com ```código```).
+CERCA_ANCORADA = re.compile(r"^```(?:json)?\s*(.*?)\s*```$", re.S | re.I)
+
+# Cerca livre: primeira ocorrência de ``` em qualquer posição do texto — cobre
+# preâmbulo/epílogo ao redor da cerca ("Aqui está:\n```json\n{...}\n```" ou
+# "```json\n{...}\n```\nEspero ter ajudado!"), que é bem mais comum do que um
+# balão com ``` embutido. Só é tentada como ÚLTIMO recurso, depois de tentar
+# o texto bruto direto sem stripping nenhum — porque ela pode dar falso
+# positivo no caso do balão com ``` embutido, e só vale correr esse risco
+# depois de esgotar as opções mais seguras (ver `_candidatos_json`).
+CERCA_LIVRE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.S | re.I)
 
 # Tamanho da prévia de texto nos logs de fallback — o suficiente para
 # diagnosticar sem inflar o log com a resposta inteira.
 PREVIEW_LEN = 200
+
+# Texto vazio nunca deveria acontecer (o agente sempre produz algum
+# conteúdo), mas se acontecer, devolver [""] geraria um send_message(body="")
+# — a maioria dos provedores de WhatsApp rejeita corpo vazio, e como a causa
+# é determinística (não é uma falha de rede passageira), as 3 tentativas de
+# retry seriam queimadas à toa no mesmo resultado. Preferimos um texto visível
+# ao lead, mesmo genérico, a um envio fadado a falhar 3 vezes.
+TEXTO_VAZIO_FALLBACK = "Desculpa, tive um problema para te responder agora."
 
 
 def _preview(bruto: str) -> str:
@@ -53,32 +68,74 @@ def _texto_de_conteudo(conteudo: Any) -> str:
     dicts com chave "text", formato multimodal) em vez de string simples.
     Chamar `.strip()` direto nisso quebraria com AttributeError antes de
     qualquer parsing.
+
+    Blocos que não são string nem dict com "text" são descartados — mas,
+    diferente da versão anterior, o descarte é logado. É o mesmo padrão do
+    Crítico corrigido em `extrair_baloes` (item não-string em `messages`),
+    um nível acima: perder conteúdo sem log é sempre um bug, mesmo quando o
+    conteúdo perdido não é texto.
     """
     if isinstance(conteudo, str):
         return conteudo
     if isinstance(conteudo, list):
         partes = []
+        descartados = []
         for item in conteudo:
             if isinstance(item, str):
                 partes.append(item)
             elif isinstance(item, dict) and isinstance(item.get("text"), str):
                 partes.append(item["text"])
+            else:
+                descartados.append(type(item).__name__)
+        if descartados:
+            logger.warning("extrair_baloes_content_block_descartado", tipos=descartados)
         return "\n".join(partes)
     return "" if conteudo is None else str(conteudo)
+
+
+def _candidatos_json(bruto: str) -> list[str]:
+    """Ordem de tentativas de extração do JSON candidato.
+
+    1. Cerca ancorada (o texto INTEIRO está dentro de um bloco ```): caso
+       mais estrito, sem risco de falso positivo.
+    2. O texto bruto direto, sem stripping de cerca nenhuma: cobre o caso de
+       um balão que só PARECE ter cerca porque contém ``` no meio de uma
+       string — aqui o texto inteiro já é JSON válido, e tentar isolar uma
+       cerca primeiro pegaria o trecho errado.
+    3. Cerca livre (primeira ocorrência de ``` em qualquer posição): cobre
+       preâmbulo/epílogo ao redor da cerca. Só tentada por último porque,
+       ao contrário da ancorada, pode casar com um ``` que esteja dentro do
+       valor de um balão — um falso positivo que só vale correr depois de
+       esgotar as opções 1 e 2.
+    """
+    candidatos: list[str] = []
+    if ancorada := CERCA_ANCORADA.match(bruto):
+        candidatos.append(ancorada.group(1).strip())
+    candidatos.append(bruto)
+    if livre := CERCA_LIVRE.search(bruto):
+        conteudo = livre.group(1).strip()
+        if conteudo not in candidatos:
+            candidatos.append(conteudo)
+    return candidatos
 
 
 def extrair_baloes(texto: Any) -> list[str]:
     bruto = _texto_de_conteudo(texto).strip()
     if not bruto:
-        return [""]
+        logger.warning("extrair_baloes_texto_vazio")
+        return [TEXTO_VAZIO_FALLBACK]
 
-    candidato = bruto
-    if cerca := CERCA.match(bruto):
-        candidato = cerca.group(1).strip()
+    dados: Any = None
+    parseou = False
+    for candidato in _candidatos_json(bruto):
+        try:
+            dados = json.loads(candidato)
+        except (ValueError, TypeError):
+            continue
+        parseou = True
+        break
 
-    try:
-        dados = json.loads(candidato)
-    except (ValueError, TypeError):
+    if not parseou:
         logger.warning("extrair_baloes_json_invalido", preview=_preview(bruto))
         return [bruto]
 
