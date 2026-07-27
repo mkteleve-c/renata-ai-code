@@ -31,6 +31,18 @@ resto.
 indefinido, e quem religa a Renata é uma pessoa. Preencher uma reativação
 automática aqui devolveria a conversa ao agente sozinha, justamente no lead
 que alguém decidiu que precisava de humano.
+
+**O número do responsável passa por `canonicalizar`, não por `.strip()`.**
+`HANDOVER_NOTIFY_PHONE` é digitado por uma pessoa, e um valor como
+`"11 97777-6666"` sobrevive a qualquer checagem de "está preenchido" e só
+morre no envio — dentro do `except` que existe para não derrubar o
+desligamento. O resultado seria handover silencioso **com a variável
+preenchida**, que é pior que vazia porque ninguém suspeita da configuração.
+`validate_runtime_settings` recusa o valor irreconhecível no boot; aqui a
+canonicalização garante que o que passou no boot é o que sai no envio.
+
+**Todo retorno desta tool é marcado `[sistema]`** — nenhum deles carrega
+conteúdo que o lead precise ouvir. Ver `interno.py`.
 """
 
 from __future__ import annotations
@@ -40,10 +52,16 @@ from langchain_core.tools import tool
 
 from whatsapp_langchain.shared.config import settings
 from whatsapp_langchain.shared.db import get_pool
-from whatsapp_langchain.shared.phone import canonico_do_lead, from_e164
+from whatsapp_langchain.shared.phone import (
+    canonicalizar,
+    canonico_do_lead,
+    from_e164,
+    to_e164,
+)
 from whatsapp_langchain.worker.evolution_client import EvolutionClient
 
 from ..contexto import telefone_do_turno
+from .interno import interno
 
 logger = structlog.get_logger()
 
@@ -145,11 +163,24 @@ async def notificar_responsavel(
     Sem `HANDOVER_NOTIFY_PHONE` configurado não há para quem mandar: fica o
     `warning` e a tool segue. Não é erro de execução, é configuração
     ausente — e o desligamento do agente já aconteceu.
+
+    O número passa por `canonicalizar` (ver o docstring do módulo): é a
+    mesma normalização que o outbound do harness aplica ao telefone do lead,
+    e é o que faz `"11 97777-6666"` chegar em vez de morrer no `except`.
+    Valor irreconhecível vira `warning` e nenhuma tentativa de envio — o
+    `except` é para o canal cair, não para configuração errada.
     """
-    destino = settings.handover_notify_phone.strip()
-    if not destino:
+    bruto = settings.handover_notify_phone.strip()
+    if not bruto:
         logger.warning("handover_sem_numero_de_aviso", phone=telefone)
         return False
+
+    canonico = canonicalizar(bruto)
+    if not canonico:
+        logger.error("handover_numero_de_aviso_invalido", phone=telefone)
+        return False
+
+    destino = to_e164(canonico)
 
     try:
         await obter_cliente().send_message(
@@ -183,7 +214,7 @@ async def human_handover(motivo: str) -> str:
     telefone = telefone_do_turno()
     if not telefone:
         logger.warning("handover_sem_telefone_no_config")
-        return (
+        return interno(
             "Não consegui identificar o lead nesta conversa, então não "
             "consegui desligar o agente. Encerre a conversa."
         )
@@ -192,19 +223,21 @@ async def human_handover(motivo: str) -> str:
     avisado = await notificar_responsavel(telefone, motivo, pausado)
 
     if not pausado:
-        return (
+        return interno(
             "ATENÇÃO: não consegui desligar o agente no cadastro deste lead. "
             "Encerre a conversa mesmo assim e não continue o atendimento."
         )
 
     if not avisado:
-        return (
+        return interno(
             "Agente desligado para este lead — um humano assume daqui. "
             "Não consegui avisar o responsável automaticamente. "
             "Encerre a conversa."
         )
 
-    return "Agente desligado para este lead e responsável avisado. Encerre a conversa."
+    return interno(
+        "Agente desligado para este lead e responsável avisado. Encerre a conversa."
+    )
 
 
 TOOLS_HANDOVER = [human_handover]

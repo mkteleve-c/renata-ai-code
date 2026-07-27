@@ -13,6 +13,7 @@ Dublados: o Pipedrive (é o CRM de produção da empresa — **nenhum card real 
 movido em teste**), a agenda do Google e o cliente de saída do WhatsApp.
 """
 
+import asyncio
 from datetime import datetime
 from typing import Any
 
@@ -22,6 +23,7 @@ from langchain_core.runnables.config import var_child_runnable_config
 from whatsapp_langchain.agents.catalog.elevec_sdr.tools import agenda, crm, handover
 from whatsapp_langchain.agents.catalog.elevec_sdr.tools.crm import update_crm
 from whatsapp_langchain.agents.catalog.elevec_sdr.tools.handover import human_handover
+from whatsapp_langchain.agents.catalog.elevec_sdr.tools.interno import PREFIXO_INTERNO
 from whatsapp_langchain.shared.db import get_pool
 from whatsapp_langchain.shared.google_calendar import FUSO
 
@@ -29,7 +31,11 @@ CANONICO = "551155552222"
 E164 = "+5511955552222"
 
 DEAL = "7788"
-NOTIFY = "+5511977776666"
+
+# Como o operador digita e como o envio sai: `canonicalizar` tira o 9º
+# dígito, a mesma normalização que o outbound do harness aplica ao lead.
+NOTIFY_CONFIGURADO = "+5511977776666"
+NOTIFY_ENVIADO = "+551177776666"
 
 TERCA = datetime(2026, 2, 10, 10, 0, tzinfo=FUSO)
 
@@ -143,6 +149,7 @@ def turno():
 def pipedrive(monkeypatch):
     falso = PipedriveFalso()
     monkeypatch.setattr(crm, "obter_cliente", lambda: falso)
+    monkeypatch.setattr(crm.settings, "pipedrive_api_token", "tok-de-teste")
     monkeypatch.setattr(crm.settings, "pipedrive_stage_qualificado", 12)
     monkeypatch.setattr(crm.settings, "pipedrive_stage_agendado", 13)
     return falso
@@ -152,7 +159,7 @@ def pipedrive(monkeypatch):
 def evolution(monkeypatch):
     falso = EvolutionFalso()
     monkeypatch.setattr(handover, "obter_cliente", lambda: falso)
-    monkeypatch.setattr(handover.settings, "handover_notify_phone", NOTIFY)
+    monkeypatch.setattr(handover.settings, "handover_notify_phone", NOTIFY_CONFIGURADO)
     return falso
 
 
@@ -270,6 +277,111 @@ async def test_sem_pipedriveid_nao_chama_o_pipedrive(
     assert "ATENÇÃO" not in saida
 
 
+async def test_sem_token_do_pipedrive_nao_e_incidente(
+    limpar, turno, pipedrive, monkeypatch
+):
+    # Deploy sem Pipedrive é escolha válida. Sem a checagem do token, o
+    # ValueError do construtor cairia no except genérico e TODA transição
+    # devolveria "o card não foi movido — avise o time comercial",
+    # indistinguível de CRM fora do ar.
+    monkeypatch.setattr(crm.settings, "pipedrive_api_token", "")
+    await criar_lead()
+
+    saida = await update_crm.ainvoke({"phase": "qualificado"})
+
+    assert (await ler_lead())["phase"] == "qualificado"
+    # Sem token não se tenta a chamada — nem para colher o erro.
+    assert pipedrive.movidos == []
+    assert "ATENÇÃO" not in saida
+    assert "Card movido" not in saida
+
+
+# --- Concorrência: a guarda é o UPDATE, não uma comparação em Python --------
+
+
+async def test_duas_chamadas_para_a_mesma_fase_movem_o_card_uma_vez_so(
+    limpar, turno, pipedrive
+):
+    """O caso que a guarda existe para resolver.
+
+    É também o mais provável: o modelo emite a mesma `tool_call` duas vezes
+    na mesma mensagem (o ToolNode do LangGraph as executa em paralelo), ou
+    duas réplicas do worker pegam turnos do mesmo lead — o `claim_next` usa
+    `FOR UPDATE SKIP LOCKED` sem serializar por telefone.
+
+    Com a comparação de fase feita em Python (ler → comparar → gravar), as
+    duas chamadas passavam pelo curto-circuito e **as duas** moviam o card.
+    Com o predicado no `where`, o Postgres serializa: a segunda transação
+    reavalia depois do commit da primeira, casa zero linhas — e quem casa
+    zero linhas não move card.
+    """
+    await criar_lead(phase="iniciou_conversa")
+
+    resultados = await asyncio.gather(
+        update_crm.ainvoke({"phase": "qualificado"}),
+        update_crm.ainvoke({"phase": "qualificado"}),
+    )
+
+    assert (await ler_lead())["phase"] == "qualificado"
+    assert pipedrive.movidos == [(DEAL, 12)]
+    # A outra sai por "nada a atualizar" em vez de fingir que gravou.
+    assert len([s for s in resultados if "Fase atualizada" in s]) == 1
+
+
+async def test_alvos_concorrentes_nunca_terminam_com_o_funil_para_tras(
+    limpar, turno, pipedrive
+):
+    """Alvos diferentes concorrentes nunca desfazem `agendou_sessao`.
+
+    As duas chamadas são transições legítimas e distintas, então as duas
+    gravam e as duas movem card — isso está certo, o lead transicionou duas
+    vezes. O que **não** pode acontecer é o funil andar para trás: sem a
+    recusa de retrocesso, em 1 de 5 rodadas medidas o lead terminava em
+    `qualificado` com a reunião marcada na agenda do Silvio.
+
+    Vale a mesma doutrina de `shared/leads.py`: reunião marcada é fato
+    verificável, `qualificado` é julgamento — o fato vence.
+
+    O que a guarda no `where` garante além disso é que **não existe
+    movimento de card sem gravação correspondente**.
+    """
+    await criar_lead(phase="iniciou_conversa")
+
+    resultados = await asyncio.gather(
+        update_crm.ainvoke({"phase": "qualificado"}),
+        update_crm.ainvoke({"phase": "agendou_sessao"}),
+    )
+
+    gravacoes = [s for s in resultados if "Fase atualizada" in s]
+    assert len(pipedrive.movidos) == len(gravacoes)
+    assert (await ler_lead())["phase"] == "agendou_sessao"
+
+
+async def test_qualificado_nao_desfaz_uma_sessao_agendada(limpar, turno, pipedrive):
+    # Sequencial, sem corrida: a recusa não é um detalhe de concorrência, é
+    # regra de funil. Reunião marcada existe no Google Calendar.
+    await criar_lead(phase="agendou_sessao", followup_active=False)
+
+    saida = await update_crm.ainvoke({"phase": "qualificado"})
+
+    assert (await ler_lead())["phase"] == "agendou_sessao"
+    assert pipedrive.movidos == []
+    assert "já tem sessão agendada" in saida
+
+
+async def test_desqualificado_pode_sobrescrever_sessao_agendada(
+    limpar, turno, pipedrive
+):
+    # `desqualificado` não é estágio anterior, é saída — um lead pode
+    # revelar um desqualificador depois de agendar, e o time precisa ver
+    # isso no funil.
+    await criar_lead(phase="agendou_sessao")
+
+    await update_crm.ainvoke({"phase": "desqualificado"})
+
+    assert (await ler_lead())["phase"] == "desqualificado"
+
+
 # --- Pipedrive: quando falha ------------------------------------------------
 
 
@@ -293,11 +405,20 @@ async def test_falha_no_card_nao_impede_a_gravacao_da_fase(
 # --- Zero linhas afetadas é falha -------------------------------------------
 
 
-async def test_gravar_fase_sem_lead_no_banco_devolve_false(limpar):
-    # Sem checar `rowcount`, o UPDATE que não casa nenhuma linha é
+async def test_gravar_fase_sem_lead_no_banco_reporta_ausente(limpar):
+    # Sem checar o que voltou, o UPDATE que não casa nenhuma linha é
     # indistinguível do que casou — e a fase "gravada" só existe na frase
     # que a tool devolve ao agente.
-    assert await crm.gravar_fase(E164, "qualificado") is False
+    assert await crm.gravar_fase(E164, "qualificado") == "ausente"
+
+
+async def test_gravar_fase_distingue_ausente_de_ja_aplicada(limpar):
+    # Os dois casos casam zero linhas e são incidentes diferentes: lead que
+    # sumiu do cadastro vs. outro turno que chegou primeiro.
+    await criar_lead(phase="qualificado")
+
+    assert await crm.gravar_fase(E164, "qualificado") == "inalterada"
+    assert await crm.gravar_fase(E164, "agendou_sessao") == "gravou"
 
 
 async def test_lead_apagado_entre_a_leitura_e_a_gravacao_reporta_falha(
@@ -321,9 +442,11 @@ async def test_lead_apagado_entre_a_leitura_e_a_gravacao_reporta_falha(
     saida = await update_crm.ainvoke({"phase": "qualificado"})
 
     assert await ler_lead() is None
-    assert "Não consegui registrar" in saida
+    assert "sumiu do cadastro" in saida
     assert "human_handover" in saida
     assert "crm_lead_inexistente_na_gravacao" in capsys.readouterr().out
+    # O card não pode se mover para um lead que não está mais no cadastro.
+    assert pipedrive.movidos == []
 
 
 # --- Persistência de e-mail e faturamento -----------------------------------
@@ -420,7 +543,7 @@ async def test_handover_avisa_o_responsavel_com_motivo_e_link(limpar, turno, evo
     await human_handover.ainvoke({"motivo": "tentativa de jailbreak"})
 
     assert len(evolution.enviados) == 1
-    assert evolution.enviados[0]["to"] == NOTIFY
+    assert evolution.enviados[0]["to"] == NOTIFY_ENVIADO
     corpo = evolution.enviados[0]["body"]
     assert "tentativa de jailbreak" in corpo
     assert "https://wa.me/5511955552222" in corpo
@@ -487,6 +610,75 @@ async def test_handover_corta_motivo_gigante(limpar, turno, evolution):
     corpo = evolution.enviados[0]["body"]
     assert len(corpo) < 500
     assert "https://wa.me/" in corpo
+
+
+# --- Telefone do responsável ------------------------------------------------
+
+
+async def test_numero_de_aviso_digitado_por_humano_chega_ao_destino(
+    limpar, turno, evolution, monkeypatch
+):
+    # `"11 97777-6666"` sobrevive a qualquer checagem de "está preenchido" e
+    # só morre no envio, dentro do except que existe para não derrubar o
+    # desligamento: handover silencioso COM a variável preenchida.
+    monkeypatch.setattr(handover.settings, "handover_notify_phone", "11 97777-6666")
+    await criar_lead()
+
+    await human_handover.ainvoke({"motivo": "erro"})
+
+    assert len(evolution.enviados) == 1
+    assert evolution.enviados[0]["to"] == NOTIFY_ENVIADO
+
+
+async def test_numero_de_aviso_irreconhecivel_nao_tenta_enviar(
+    limpar, turno, evolution, monkeypatch, capsys
+):
+    monkeypatch.setattr(handover.settings, "handover_notify_phone", "ramal 42")
+    await criar_lead()
+
+    saida = await human_handover.ainvoke({"motivo": "erro"})
+
+    assert (await ler_lead())["agent_active"] is False
+    assert evolution.enviados == []
+    assert "handover_numero_de_aviso_invalido" in capsys.readouterr().out
+    assert "Não consegui avisar o responsável" in saida
+
+
+# --- Texto interno nunca é conteúdo para o lead -----------------------------
+
+
+async def test_todo_retorno_das_duas_tools_vem_marcado(
+    limpar, turno, pipedrive, evolution
+):
+    """Cada string destas tools nomeia máquina interna.
+
+    "Pipedrive", "cadastro do lead", "human_handover", "follow-up": nada
+    disso pode chegar ao WhatsApp de um lead da EleveC. O prefixo é o que
+    permite ao prompt ter UMA regra verificável em vez de uma lista de
+    frases que envelhece a cada edição de tool.
+    """
+    await criar_lead()
+
+    saidas = [
+        await update_crm.ainvoke({"phase": "fase_que_nao_existe"}),
+        await update_crm.ainvoke({"phase": "qualificado"}),
+        await update_crm.ainvoke({"phase": "qualificado"}),
+        await update_crm.ainvoke({"phase": "agendou_sessao"}),
+        await human_handover.ainvoke({"motivo": "erro técnico"}),
+    ]
+
+    for saida in saidas:
+        assert saida.startswith(PREFIXO_INTERNO), saida
+
+
+async def test_marcador_sobrevive_aos_caminhos_de_falha(limpar, turno, evolution):
+    saidas = [
+        await update_crm.ainvoke({"phase": "qualificado"}),  # lead ausente
+        await human_handover.ainvoke({"motivo": "erro"}),  # lead ausente
+    ]
+
+    for saida in saidas:
+        assert saida.startswith(PREFIXO_INTERNO), saida
 
 
 # --- Coordenação com a Task 5: a coluna passa a vencer o argumento ----------

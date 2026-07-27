@@ -7,8 +7,7 @@ motivo de esta tool existir em vez de um `UPDATE` solto:
    phase", e a diferença não é cosmética: reescrever `agendou_sessao` por
    cima de `agendou_sessao` desligaria `followup_active` de novo num lead
    que um humano pode ter reativado à mão, e mandaria o card ao Pipedrive
-   toda vez que o modelo repetisse a chamada. Aqui a fase igual sai antes de
-   tocar banco ou CRM.
+   toda vez que o modelo repetisse a chamada.
 2. **`agendou_sessao` e `desqualificado` desligam o follow-up.** Reunião
    marcada e lead descartado são os dois desfechos em que continuar cobrando
    pelo WhatsApp só queima a relação.
@@ -20,29 +19,43 @@ motivo de esta tool existir em vez de um `UPDATE` solto:
 agenda (`telefone_do_turno`): um `phone` por argumento deixaria o modelo
 desqualificar o lead da conversa anterior.
 
-**Card primeiro, banco depois.** As duas escritas podem falhar isoladamente
-e a ordem decide qual estado sobra:
+**Quem decide a mudança é o `UPDATE`, não uma comparação em Python.** A
+regra 1 parece um `if` e não é: ler a fase, comparar e depois gravar é um
+TOCTOU, e as duas janelas existem de verdade neste sistema — o `ToolNode` do
+LangGraph executa em paralelo as `tool_calls` de uma mesma mensagem do
+modelo, e o `claim_next` usa `FOR UPDATE SKIP LOCKED` sem serializar por
+telefone, então duas réplicas do worker processam turnos do mesmo lead ao
+mesmo tempo. Medido: duas `update_crm` concorrentes com alvos diferentes
+moviam o card **duas vezes** e deixavam a fase final não determinística.
 
-- Pipedrive antes do banco: uma falha na gravação deixa o card movido e a
-  fase antiga. A tool devolve falha, o agente repete, o `PUT` é idempotente
-  e o banco é tentado de novo — converge.
-- Banco antes do Pipedrive: uma falha no card deixa a fase nova gravada, e
-  aí a regra 1 faz a repetição sair pelo curto-circuito de "fase igual". O
-  card fica parado para sempre, sem ninguém saber.
+A guarda mora no SQL — `where phone = %s and phase is distinct from
+%s::lead_phase` — e **só quem casou uma linha move o card**. A serialização
+é do Postgres: das duas transações concorrentes, a segunda reavalia o
+predicado depois do commit da primeira e casa zero linhas.
 
-Por isso o card vai primeiro. Falha dele **não** aborta a gravação: o
-funil interno (que é quem alimenta a régua de follow-up e o gate de
-ingestão) não pode ficar refém do CRM externo estar de pé. O que sobra é um
-`logger.error` com `deal_id` e `stage_id` — tudo que a reconciliação manual
-precisa — e um aviso no texto devolvido ao agente.
+**O card vem depois do banco, e a ordem não é o que evita divergência.**
+Registrado com precisão porque a versão anterior deste texto vendia demais:
+com a gravação não abortando por falha de card, **as duas ordens** deixam o
+mesmo estado divergente possível — card falha, fase grava, a próxima
+chamada casa zero linhas pela guarda e o card fica atrás. O que a ordem
+banco-primeiro compra é a atomicidade da regra 1 (sem ela não há guarda), e
+o que sobra da falha de card é `crm_card_nao_movido` com `deal_id` e
+`stage_id` no log, mais um aviso no texto devolvido ao agente. É um caminho
+de reconciliação manual, não uma garantia de convergência.
+
+Falha do Pipedrive não aborta a gravação de propósito: o funil interno é
+quem alimenta a régua de follow-up e o gate de ingestão, e não pode ficar
+refém de o CRM externo estar de pé.
 
 **`email` e `faturamento_mensal` passam a ser persistidos aqui.** Até a Task
 5 nenhuma tool gravava esses dois campos, e por isso `calendar_agendar` os
 aceitava por argumento — o que permitia ao modelo satisfazer a "sequência
 INVIOLÁVEL" na mesma chamada, sem nunca ter perguntado ao lead. Com a
 gravação acontecendo aqui, `_preferir_coluna` (em `agenda.py`) passa a ter
-o que preferir: o valor que o lead **realmente disse** está no banco e vence
-o argumento do turno.
+o que preferir. **O portão foi condicionado, não fechado**: `_preferir_coluna`
+é `coluna or argumento`, então a coluna só vence quando está preenchida —
+sem um `update_crm` prévio, um e-mail inventado pelo modelo ainda satisfaz a
+sequência. Fechar de vez é trabalho da Task 7 (ver o relatório).
 
 **`name` NÃO é escrito por esta tool, de propósito.** `leads_crm.name` é
 interpolado dentro do system prompt da Renata; hoje ele só nasce do
@@ -50,6 +63,9 @@ interpolado dentro do system prompt da Renata; hoje ele só nasce do
 modelo um caminho de escrita nesse campo abriria uma origem sem teto para
 texto que volta como instrução. `sanitizar_nome` continua sendo a defesa na
 leitura — mas a defesa mais barata é não abrir a porta.
+
+**Todo retorno desta tool é marcado `[sistema]`** — nenhum deles carrega
+conteúdo que o lead precise ouvir. Ver `interno.py`.
 """
 
 from __future__ import annotations
@@ -65,6 +81,7 @@ from whatsapp_langchain.shared.phone import canonico_do_lead
 from whatsapp_langchain.shared.pipedrive import PipedriveClient
 
 from ..contexto import telefone_do_turno
+from .interno import interno
 
 logger = structlog.get_logger()
 
@@ -134,8 +151,35 @@ async def gravar_fase(
     phase: str,
     email: str = "",
     faturamento_mensal: str = "",
-) -> bool:
-    """Grava a fase (e o que mais vier) no lead. `False` = nada foi gravado.
+) -> str:
+    """Grava a fase **se ela for diferente da atual**. Devolve o que houve.
+
+    Desfechos: `"gravou"`, `"inalterada"` (a fase já era essa — ninguém
+    escreveu nada), `"recusada"` (a mudança seria um retrocesso), `"ausente"`
+    (não há linha para este telefone) e `"erro"`. Quem chama decide o card e
+    a frase a partir daí.
+
+    **`qualificado` nunca sobrescreve `agendou_sessao`.** É a mesma doutrina
+    que `shared/leads.py` já aplica na consolidação de duplicatas —
+    *"agendou_sessao vence tudo: reunião marcada é fato verificável (existe
+    evento no Google Calendar)"*. Sem essa recusa, duas chamadas concorrentes
+    com alvos contraditórios deixam o funil andando para trás: medido, em 1
+    de 5 rodadas o lead terminava em `qualificado` com a reunião marcada na
+    agenda do Silvio. `desqualificado` continua podendo sobrescrever — não é
+    estágio anterior, é saída, e um lead pode revelar um desqualificador
+    depois de agendar.
+
+    **A regra "nunca reescreva a mesma phase" mora aqui, no `where`.** Fazer
+    a comparação em Python — ler, comparar, gravar — é um TOCTOU, e as duas
+    janelas existem neste sistema (ver o docstring do módulo). Medido contra
+    o banco: duas chamadas concorrentes com alvos diferentes moviam o card
+    duas vezes e deixavam a fase final não determinística. Com o predicado
+    no `UPDATE`, das duas transações a segunda reavalia depois do commit da
+    primeira e casa zero linhas — e quem casa zero linhas não move card.
+
+    `is distinct from` e não `<>`: a coluna é nullable (a 007 declara
+    `DEFAULT`, não `NOT NULL`), e `phase <> 'qualificado'` é NULL — logo
+    falso — para um lead com fase nula, que nunca sairia do lugar.
 
     `followup_active = followup_active and not %s` desliga sem religar: uma
     fase que não desliga o follow-up deixa a coluna exatamente como estava,
@@ -146,12 +190,15 @@ async def gravar_fase(
     `email` e `faturamento_mensal` usam `coalesce(nullif(%s, ''), coluna)`:
     argumento vazio nunca apaga o que já está cadastrado.
 
-    **Zero linhas afetadas é falha, não sucesso silencioso.** Lead ausente de
-    `leads_crm` com o card já movido no Pipedrive é o caminho concreto de um
-    funil interno que diverge do externo sem nada no log.
+    **Zero linhas afetadas nunca é sucesso.** Distinguir "não existe" de "já
+    estava nessa fase" custa um `select` no mesmo bloco de conexão e evita
+    reportar lead ausente como se fosse corrida — dois incidentes bem
+    diferentes.
     """
     canonico = canonico_do_lead(telefone)
     desliga = phase in DESLIGAM_FOLLOWUP
+    gravada: tuple[Any, ...] | None = None
+    atual: tuple[Any, ...] | None = None
     try:
         pool = await get_pool()
         async with pool.connection() as conn:
@@ -162,25 +209,52 @@ async def gravar_fase(
                 "  email = coalesce(nullif(%s, ''), email),"
                 "  faturamento_mensal ="
                 "    coalesce(nullif(%s, ''), faturamento_mensal)"
-                " where phone = %s",
+                " where phone = %s"
+                "   and phase is distinct from %s::lead_phase"
+                "   and not ("
+                "     %s::lead_phase = 'qualificado'"
+                "     and phase = 'agendou_sessao'"
+                "   )"
+                " returning phase",
                 (
                     phase,
                     desliga,
                     email or "",
                     faturamento_mensal or "",
                     canonico,
+                    phase,
+                    phase,
                 ),
             )
-            afetadas = cur.rowcount
+            gravada = await cur.fetchone()
+
+            if gravada is None:
+                cur = await conn.execute(
+                    "select phase from leads_crm where phone = %s", (canonico,)
+                )
+                atual = await cur.fetchone()
     except Exception as erro:
         logger.error(
             "crm_fase_nao_gravada", phone=canonico, phase=phase, erro=str(erro)
         )
-        return False
+        return "erro"
 
-    if afetadas == 0:
-        logger.error("crm_lead_inexistente_na_gravacao", phone=canonico, phase=phase)
-        return False
+    if gravada is None:
+        if atual is None:
+            logger.error(
+                "crm_lead_inexistente_na_gravacao", phone=canonico, phase=phase
+            )
+            return "ausente"
+        if atual[0] == phase:
+            logger.info("crm_fase_ja_estava_aplicada", phone=canonico, phase=phase)
+            return "inalterada"
+        logger.warning(
+            "crm_retrocesso_de_fase_recusado",
+            phone=canonico,
+            atual=atual[0],
+            pedida=phase,
+        )
+        return "recusada"
 
     logger.info(
         "crm_fase_gravada",
@@ -188,16 +262,23 @@ async def gravar_fase(
         phase=phase,
         followup_desligado=desliga,
     )
-    return True
+    return "gravou"
 
 
 async def mover_card(pipedriveid: Any, phase: str) -> tuple[bool, str]:
     """Move o card, se houver o que mover. Devolve `(moveu, motivo)`.
 
     Nunca levanta: falha de CRM externo não pode derrubar o turno nem
-    impedir a gravação da fase no banco. `moveu=False` com `motivo=""`
-    significa "não havia card para mover" — que é o caso normal de
-    `desqualificado` e de lead sem `pipedriveid`, não um erro.
+    desfazer a fase já gravada. `moveu=False` com `motivo=""` significa "não
+    havia card para mover" — o caso normal de `desqualificado`, de lead sem
+    `pipedriveid` e de deploy sem Pipedrive configurado, nenhum deles um
+    erro.
+
+    **Token ausente é configuração, não incidente.** Sem essa checagem o
+    `ValueError` do construtor cairia no `except` genérico e *toda* transição
+    para `qualificado`/`agendou_sessao` devolveria "o card não foi movido —
+    avise o time comercial", indistinguível de CRM fora do ar. Deploy sem
+    Pipedrive é uma escolha válida.
     """
     stage_id = stage_da_fase(phase)
     if stage_id is None:
@@ -207,6 +288,10 @@ async def mover_card(pipedriveid: Any, phase: str) -> tuple[bool, str]:
     deal_id = (pipedriveid or "").strip() if isinstance(pipedriveid, str) else ""
     if not deal_id:
         logger.info("crm_lead_sem_pipedriveid", phase=phase)
+        return False, ""
+
+    if not settings.pipedrive_api_token.strip():
+        logger.info("crm_pipedrive_nao_configurado", phase=phase, deal_id=deal_id)
         return False, ""
 
     try:
@@ -246,42 +331,65 @@ async def update_crm(
     """
     alvo = (phase or "").strip().lower()
     if alvo not in FASES_PERMITIDAS:
-        return f"Fase '{phase}' não existe. Use uma de: {', '.join(FASES_PERMITIDAS)}."
+        return interno(
+            f"Fase '{phase}' não existe. Use uma de: {', '.join(FASES_PERMITIDAS)}."
+        )
 
     telefone = telefone_do_turno()
     if not telefone:
         logger.warning("crm_sem_telefone_no_config")
-        return (
+        return interno(
             "Não consegui identificar o lead nesta conversa e não vou "
             "atualizar o funil às cegas. Acione o human_handover."
         )
 
+    # Leitura adiantada só para o `pipedriveid` e para a recusa amigável da
+    # fase repetida. Ela NÃO é a guarda — a guarda é o `where` de
+    # `gravar_fase`, e é ela que decide se o card se move.
     estado = await carregar_estado(telefone)
     if estado is None:
-        return (
+        return interno(
             "Não encontrei este lead no cadastro, então não há fase para "
             "atualizar. Siga a conversa e acione o human_handover se "
             "precisar de registro manual."
         )
 
     if estado["phase"] == alvo:
-        # Curto-circuito antes de banco e CRM: ver a regra 1 no docstring.
         logger.info("crm_fase_inalterada", phase=alvo)
-        return f"O lead já está em '{alvo}'. Nada a atualizar."
+        return interno(f"O lead já está em '{alvo}'. Nada a atualizar.")
 
-    moveu, aviso_card = await mover_card(estado["pipedriveid"], alvo)
-
-    gravou = await gravar_fase(
+    resultado = await gravar_fase(
         telefone,
         alvo,
         email=email,
         faturamento_mensal=faturamento_mensal,
     )
-    if not gravou:
-        return (
+
+    if resultado == "erro":
+        return interno(
             f"Não consegui registrar a fase '{alvo}' no cadastro do lead. "
             "Tente de novo; se persistir, acione o human_handover."
         )
+
+    if resultado == "ausente":
+        return interno(
+            f"O lead sumiu do cadastro antes de eu gravar a fase '{alvo}'. "
+            "Acione o human_handover para registro manual."
+        )
+
+    if resultado == "inalterada":
+        # Outra execução chegou nesta fase primeiro (turnos concorrentes do
+        # mesmo lead). Ela já moveu o card; mover de novo seria duplicar.
+        return interno(f"O lead já está em '{alvo}'. Nada a atualizar.")
+
+    if resultado == "recusada":
+        return interno(
+            "Este lead já tem sessão agendada — não vou voltar o funil para "
+            f"'{alvo}'. Se a reunião foi cancelada, use calendar_delete; se "
+            "ele foi desqualificado, use 'desqualificado'."
+        )
+
+    moveu, aviso_card = await mover_card(estado["pipedriveid"], alvo)
 
     partes = [f"Fase atualizada para '{alvo}'."]
     if alvo in DESLIGAM_FOLLOWUP:
@@ -291,7 +399,7 @@ async def update_crm(
     if aviso_card:
         partes.append(f"ATENÇÃO: {aviso_card} — avise o time comercial.")
 
-    return " ".join(partes)
+    return interno(" ".join(partes))
 
 
 TOOLS_CRM = [update_crm]

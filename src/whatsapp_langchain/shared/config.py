@@ -16,6 +16,8 @@ Segredos compartilhados do painel/admin devem ser preenchidos explicitamente.
 from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from whatsapp_langchain.shared.phone import canonicalizar
+
 MIN_PRODUCTION_SECRET_LENGTH = 32
 
 
@@ -287,6 +289,56 @@ class Settings(BaseSettings):
             missing.append("EVOLUTION_INSTANCE")
         return touched, missing
 
+    def _sdr_credentials_status(self) -> tuple[bool, list[str]]:
+        """Retorna (touched, missing) para o agente SDR em modo real.
+
+        Mesma doutrina de "toque parcial" dos canais, e pelo mesmo motivo: o
+        SDR só funciona inteiro. As três credenciais fazem coisas diferentes
+        e cada ausência tem um custo próprio:
+
+        - **Google Calendar** ausente → a Renata não consulta nem marca nada.
+          Falha ruidosa, o lead percebe.
+        - **`PIPEDRIVE_API_TOKEN`** ausente → a fase é gravada no banco e o
+          card fica parado. Falha silenciosa para o time comercial, que só
+          descobre pelo funil vazio.
+        - **`HANDOVER_NOTIFY_PHONE`** ausente → o pior caso: `human_handover`
+          desliga o agente, o lead fica em silêncio esperando, e **nenhuma
+          pessoa é acionada**. O único sinal é uma frase que só o modelo lê.
+
+        Deploys que não usam `elevec_sdr` (illumi, rhawk) não tocam nenhuma
+        das seis variáveis e continuam subindo normalmente — é o que o
+        `touched` garante.
+        """
+        campos = (
+            ("GOOGLE_CLIENT_ID", self.google_client_id),
+            ("GOOGLE_CLIENT_SECRET", self.google_client_secret),
+            ("GOOGLE_REFRESH_TOKEN", self.google_refresh_token),
+            ("GOOGLE_CALENDAR_ID", self.google_calendar_id),
+            ("PIPEDRIVE_API_TOKEN", self.pipedrive_api_token),
+            ("HANDOVER_NOTIFY_PHONE", self.handover_notify_phone),
+        )
+
+        touched = any(valor.strip() for _, valor in campos)
+        missing = [nome for nome, valor in campos if not valor.strip()]
+        return touched, missing
+
+    def _handover_phone_errors(self) -> list[str]:
+        """`HANDOVER_NOTIFY_PHONE` preenchido precisa ser um telefone real.
+
+        Um valor formatado como `"11 97777-6666"` passa em qualquer checagem
+        de "está preenchido" e só falha no envio, dentro do `except` que o
+        handover usa para não derrubar o desligamento — ou seja, handover
+        silencioso **com a variável preenchida**, que é pior que vazia
+        porque ninguém suspeita da configuração.
+        """
+        bruto = self.handover_notify_phone.strip()
+        if not bruto or canonicalizar(bruto):
+            return []
+        return [
+            "HANDOVER_NOTIFY_PHONE não é um telefone reconhecível — use "
+            "E.164 (+5511999998888) ou só dígitos com DDI e DDD."
+        ]
+
     def channel_status(self) -> dict[str, dict[str, object]]:
         """Diagnóstico por canal: touched, complete, missing.
 
@@ -370,6 +422,10 @@ class Settings(BaseSettings):
         - tocado parcialmente em modo real → ValueError (fail-fast)
         - intocado → desabilitado (worker não instancia o cliente)
         - completo → habilitado
+
+        O agente SDR (`elevec_sdr`) segue a mesma doutrina, como um grupo só:
+        Google Calendar + Pipedrive + telefone de handover. Ver
+        `_sdr_credentials_status`.
         """
         token = self.internal_service_token.strip()
         if not token:
@@ -396,6 +452,17 @@ class Settings(BaseSettings):
                         f"modo real — preencha: {missing_list} (ou zere todas as "
                         f"credenciais do canal para desabilitá-lo)."
                     )
+
+            sdr_touched, sdr_missing = self._sdr_credentials_status()
+            if sdr_touched and sdr_missing:
+                errors.append(
+                    "Agente SDR está parcialmente configurado em modo real — "
+                    f"preencha: {', '.join(sdr_missing)} (ou zere todas as seis "
+                    "variáveis para desabilitá-lo). Sem HANDOVER_NOTIFY_PHONE o "
+                    "human_handover desliga o agente sem avisar ninguém."
+                )
+
+            errors.extend(self._handover_phone_errors())
 
         errors.extend(self._evolution_webhook_secret_errors())
 
