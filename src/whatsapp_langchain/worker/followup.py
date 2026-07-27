@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
 
 import structlog
@@ -54,18 +55,25 @@ class LeadReivindicado:
     nivel: int  # 1, 2 ou 3 — já é o novo followup_count
 
 
-# `for update skip locked` fica numa consulta simples (sem CTE, sem
+# `for update skip locked` fica em consultas simples (sem CTE, sem
 # `DISTINCT`) direto em `leads_crm` — medido neste Postgres (16.14): `FOR
 # UPDATE` sobre uma REFERÊNCIA de CTE é descartado em silêncio (a CTE não
 # é uma relação travável; confere mesmo com `AS MATERIALIZED`, então não é
 # efeito de inlining), e `DISTINCT ON` no mesmo nível do `FOR UPDATE` dá
-# erro alto (`FOR UPDATE is not allowed with DISTINCT clause`). Uma
-# subquery derivada em `FROM` (sem CTE) preserva o lock — mas nem essa
-# forma é usada aqui: o dedup de duplicata não roda em SQL nenhuma, roda
-# em Python (`_reivindicar_na_conexao`, abaixo), reaproveitando
+# erro alto (`FOR UPDATE is not allowed with DISTINCT clause`). O dedup de
+# duplicata não roda em SQL nenhuma, roda em Python
+# (`_reivindicar_na_conexao`, abaixo), reaproveitando
 # `shared/phone.canonicalizar` em vez de reimplementar a regra em regex
 # SQL — foi assim que a primeira versão deste dedup perdeu casos (forma
 # local de 11/10 dígitos, zero de tronco) que `canonicalizar` já cobre.
+#
+# Esta é a busca principal: trava (via `FOR UPDATE SKIP LOCKED`) até
+# `limite_busca` candidatos que JÁ satisfazem o predicado de elegibilidade
+# completo. É o que dá a duas transações concorrentes fatias DISJUNTAS do
+# trabalho — cada uma pula o que a outra já travou e segue para o próximo
+# candidato livre, sem nunca esperar. Mas ela sozinha NÃO alcança o irmão
+# fora do predicado (pausado, `last_inbound_at` alguns minutos mais novo,
+# cortado pelo `LIMIT`) — isso é `_SQL_TRAVAR_IRMAOS`, a segunda consulta.
 #
 # O predicado de janela (`last_inbound_at > now() - ... janela`) fica
 # DENTRO desta cláusula — um lead fora da janela não é candidato, então
@@ -77,15 +85,9 @@ class LeadReivindicado:
 # religa `followup_active` quando uma reunião é cancelada e devolve o lead
 # para `qualificado`. Se `qualificado` entrar na régua, esse lead volta a
 # ser perseguido — WhatsApp indevido para gente de verdade.
-#
-# `limite_busca` busca mais candidatos do que `limite` pede — o suficiente
-# para capturar pares/trios duplicados inteiros dentro do lote (a
-# especificação registra casos reais de três linhas para a mesma pessoa).
-# Isso NÃO garante exaustividade contra clusters patológicos maiores que
-# a sobra, mas cobre o perfil real medido (~155 duplicatas em ~3.300
-# leads, a maioria pares). Ver `_FATOR_SOBRA_BUSCA`.
-_SQL_CANDIDATOS = """
-select phone, name, followup_count, last_inbound_at
+_SQL_ELEGIVEIS_TRAVADOS = """
+select phone, name, followup_count, agent_active, followup_active, phase,
+       last_inbound_at
 from leads_crm
 where followup_active
   and agent_active
@@ -105,22 +107,66 @@ limit %(limite_busca)s
 for update skip locked
 """
 
-# Avança `followup_count` de TODAS as linhas físicas decididas em Python
-# (vencedor de cada identidade canônica + seus irmãos presentes no MESMO
-# lote) — não só do vencedor. Sem isso, o vencedor avança e para de casar
-# o predicado de elegibilidade de `_SQL_CANDIDATOS` na próxima rodada
-# (mudou de degrau), enquanto o irmão — que nunca avançou — continua
-# elegível e é reivindicado sozinho na rodada seguinte: duas mensagens em
-# rodadas diferentes em vez de duas na mesma. Reproduzido ao vivo com a
-# `Task 4` rodando a cada 5 minutos. Avançar o par inteiro junto faz as
-# duas linhas saírem do degrau atual ao mesmo tempo e entrarem no próximo
-# também juntas — o par anda em bloco, nunca diverge de novo.
-_SQL_AVANCAR = """
+# A segunda travada — SEM filtro de elegibilidade nenhum, de propósito: é
+# isso que alcança o irmão fora do lote de `_SQL_ELEGIVEIS_TRAVADOS`. Um
+# irmão pausado, um irmão com `last_inbound_at` alguns minutos mais novo
+# (não vence o degrau ainda), um irmão cortado pelo `LIMIT` da primeira
+# consulta — nenhum desses passaria no filtro de elegibilidade, e é
+# exatamente por isso que aqui não há filtro nenhum: só `phone = any(...)`
+# com a lista de variações (`shared/phone.variacoes`) que
+# `_reivindicar_na_conexao` ainda não travou.
+#
+# `FOR UPDATE SKIP LOCKED` aqui também, não `FOR UPDATE` puro — e é isto,
+# não `ORDER BY`, que resolve o risco de deadlock entre duas transações
+# concorrentes disputando a MESMA identidade: com SKIP LOCKED nenhuma das
+# duas consultas desta função jamais ESPERA um lock alheio, então nenhuma
+# pode ser o lado que segura enquanto a outra segura o que ela quer — a
+# pré-condição de todo deadlock. O preço é aceitar que, sob disputa real,
+# uma transação pode não conseguir travar um irmão que a outra já tem —
+# `_elegivel_fresco` decide vencedor e avanço em cima do que foi
+# EFETIVAMENTE travado, nunca do que a consulta pediu. `ORDER BY phone`
+# ajuda a reduzir contenção entre execuções concorrentes desta MESMA
+# consulta, mas quem evita o deadlock é o SKIP LOCKED.
+#
+# Um desenho com a segunda consulta em `FOR UPDATE` bloqueante (a forma
+# mais óbvia de "travar o irmão até conseguir") foi cogitado e
+# descartado: duas transações concorrentes podem escolher vencedores
+# DIFERENTES do MESMO trio (cada uma via seu próprio SKIP LOCKED na
+# primeira consulta) e, na segunda, cada uma travar bloqueante exatamente
+# o telefone que a OUTRA já segura como vencedor — dependência circular
+# que nenhum `ORDER BY` desfaz, porque o vencedor de cada transação já foi
+# travado ANTES da segunda consulta sequer começar.
+_SQL_TRAVAR_IRMAOS = """
+select phone, name, followup_count, agent_active, followup_active, phase,
+       last_inbound_at
+from leads_crm
+where phone = any(%s)
+order by phone
+for update skip locked
+"""
+
+# Só o vencedor grava `last_interaction_at` — é o "instante do claim" que
+# `ainda_vale_enviar` usa. Gravá-lo num irmão que não recebeu mensagem
+# nenhuma forjaria uma interação que nunca aconteceu.
+_SQL_AVANCAR_VENCEDOR = """
 update leads_crm
 set followup_count = followup_count + 1,
     last_interaction_at = now()
 where phone = any(%s)
 returning phone, name, followup_count
+"""
+
+# Avança `followup_count` dos irmãos do vencedor — mesmo os que não
+# passaram no filtro de elegibilidade (pausados, fase terminal, fora da
+# janela). Sem isso, o vencedor avança e o irmão, que nunca avança, vira
+# candidato independente na rodada seguinte: duas mensagens em rodadas
+# diferentes em vez de uma só. Pior ainda com um irmão pausado sendo
+# religado depois — sem este avanço, ele reabre a escada do zero e as
+# DUAS metades do par mandam mensagem na MESMA rodada, indefinidamente.
+_SQL_AVANCAR_IRMAOS = """
+update leads_crm
+set followup_count = followup_count + 1
+where phone = any(%s)
 """
 
 _SQL_BLOQUEADOS_POR_JANELA = """
@@ -158,9 +204,61 @@ def _janela_minutos(janela_min: int) -> int:
     return _MINUTOS_POR_DIA - janela_min
 
 
-# Multiplicador de sobra na busca de candidatos — ver o comentário acima de
-# `_SQL_CANDIDATOS`.
+# Mesma lista de `_SQL_ELEGIVEIS_TRAVADOS`, em Python — usada por
+# `_elegivel_fresco` para revalidar linhas trazidas só por
+# `_SQL_TRAVAR_IRMAOS`, que nunca passaram pelo filtro SQL.
+_FASES_TERMINAIS = ("agendou_sessao", "desqualificado", "perdido", "qualificado")
+
+# Multiplicador de sobra na busca travada de `_SQL_ELEGIVEIS_TRAVADOS`.
+# Não é mais o que decide se um irmão é alcançado — isso agora é
+# `_SQL_TRAVAR_IRMAOS` via `variacoes()`, independente deste fator (ver
+# `_reivindicar_na_conexao`). O papel dele encolheu para throughput puro:
+# quantas identidades DIFERENTES (não duplicadas entre si) cabem no radar
+# de uma rodada.
 _FATOR_SOBRA_BUSCA = 5
+
+
+def _elegivel_fresco(
+    *,
+    agent_active: bool,
+    followup_active: bool,
+    phase: str,
+    followup_count: int,
+    last_inbound_at: datetime | None,
+    n1_min: int,
+    n2_min: int,
+    n3_min: int,
+    janela_min: int,
+    agora: datetime,
+) -> bool:
+    """Reaplica o predicado de `_SQL_ELEGIVEIS_TRAVADOS` sobre dados
+    FRESCOS (lidos dentro do `FOR UPDATE SKIP LOCKED` desta rodada), não
+    sobre um snapshot antigo.
+
+    Obrigatória para as linhas que chegam só por `_SQL_TRAVAR_IRMAOS` —
+    essas NUNCA passaram pelo filtro SQL de `_SQL_ELEGIVEIS_TRAVADOS`: sem
+    esta função, uma linha pausada ou fora da janela poderia virar
+    vencedora sem satisfazer degrau, janela, fase ou `agent_active`
+    nenhum. Reaplicada também às linhas que JÁ vieram filtradas, por
+    barateza e simetria — não muda o resultado delas (o SQL acabou de
+    provar a mesma coisa segundos antes).
+    """
+    if not agent_active or not followup_active:
+        return False
+    if phase in _FASES_TERMINAIS:
+        return False
+    if last_inbound_at is None:
+        return False
+
+    limite_degrau = {0: n1_min, 1: n2_min, 2: n3_min}.get(followup_count)
+    if limite_degrau is None:
+        return False
+    if not last_inbound_at < agora - timedelta(minutes=limite_degrau):
+        return False
+    if not last_inbound_at > agora - timedelta(minutes=_janela_minutos(janela_min)):
+        return False
+
+    return True
 
 
 async def _telefones_bloqueados(
@@ -222,15 +320,32 @@ async def _reivindicar_na_conexao(
     garante sobreposição, então sem essa barreira o teste passaria mesmo
     sem `for update skip locked`.
 
-    Duas consultas nesta MESMA transação, não uma: `_SQL_CANDIDATOS`
-    busca e trava (via `FOR UPDATE SKIP LOCKED`) uma sobra de candidatos
-    físicos; o agrupamento por identidade canônica e o corte em `limite`
-    identidades rodam aqui em Python; `_SQL_AVANCAR` escreve só as linhas
-    decididas. Linhas travadas mas não escolhidas (sobra além de `limite`
-    identidades, ou membro de um grupo não selecionado) simplesmente
-    liberam o lock no commit sem nunca serem escritas — o mesmo padrão de
-    "buscar mais do que processar" de qualquer fila baseada em SKIP
-    LOCKED.
+    **O grupo de uma identidade canônica não pode ser montado só com o que
+    o filtro de elegibilidade devolveu.** Qualquer predicado que admita um
+    irmão e não o outro — degrau, janela, `agent_active`,
+    `followup_active`, fase, ou o próprio corte de `limite` — deixa o
+    irmão fora do lote com o contador velho; na rodada seguinte ele vira
+    candidato independente e é enviado sozinho. Por isso o fluxo é em três
+    passos, não um:
+
+    1. `_SQL_ELEGIVEIS_TRAVADOS` — trava (via `FOR UPDATE SKIP LOCKED`)
+       até `limite * _FATOR_SOBRA_BUSCA` candidatos que já satisfazem o
+       predicado de elegibilidade inteiro. Decide prioridade (mais
+       urgente primeiro) e o corte em `limite` identidades.
+    2. Para cada identidade mantida, `variacoes(canonicalizar(...))`
+       calcula as duas formas físicas possíveis (com/sem o 9º dígito) —
+       **independente de qualquer predicado** — e `_SQL_TRAVAR_IRMAOS`
+       trava (também via `FOR UPDATE SKIP LOCKED`) as que ainda não
+       apareceram no passo 1. É este passo que alcança o irmão fora do
+       lote: pausado, com `last_inbound_at` alguns minutos mais novo, ou
+       cortado pelo `LIMIT` do passo 1.
+    3. Com os dados FRESCOS travados dos dois passos, `_elegivel_fresco`
+       decide, por identidade, quem ainda é elegível agora — o vencedor é
+       o mais urgente entre os elegíveis; TODOS os membros da identidade
+       com o mesmo `followup_count` do vencedor avançam junto
+       (`_SQL_AVANCAR_IRMAOS`), elegíveis ou não; só o vencedor recebe
+       `last_interaction_at` (`_SQL_AVANCAR_VENCEDOR`) e é devolvido para
+       envio.
     """
     if limite is None:
         limite = settings.followup_batch_size
@@ -250,48 +365,95 @@ async def _reivindicar_na_conexao(
         "janela": _janela_minutos(janela_min),
         "limite_busca": limite * _FATOR_SOBRA_BUSCA,
     }
-    cur = await conn.execute(_SQL_CANDIDATOS, params)
-    candidatos = await cur.fetchall()
-    if not candidatos:
+    cur = await conn.execute(_SQL_ELEGIVEIS_TRAVADOS, params)
+    travadas_iniciais = await cur.fetchall()
+    if not travadas_iniciais:
         return []
 
-    bloqueados = await _telefones_bloqueados(conn, {c[0] for c in candidatos})
-    candidatos = [c for c in candidatos if c[0] not in bloqueados]
-    if not candidatos:
-        return []
+    grupos_iniciais: dict[str, list[tuple[Any, ...]]] = {}
+    for linha in travadas_iniciais:
+        chave = canonicalizar(linha[0]) or linha[0]
+        grupos_iniciais.setdefault(chave, []).append(linha)
 
-    # Agrupa por (identidade canônica, degrau atual) — não só por
-    # identidade. Duas linhas do mesmo par só andam juntas quando estão no
-    # MESMO degrau: uma dupla que já divergiu (uma delas mais adiantada
-    # por algum motivo anterior a este fix) não pode ser empurrada para o
-    # degrau da mais adiantada só por compartilhar telefone — isso pularia
-    # um degrau legítimo da mais atrasada. `followup_count` no agrupamento
-    # é o que faz esse fix funcionar em qualquer degrau (1, 2 ou 3), não
-    # só no primeiro.
-    grupos: dict[tuple[str, int], list[tuple[str, str | None, int, Any]]] = {}
-    for phone, name, followup_count, last_inbound_at in candidatos:
-        chave = canonicalizar(phone) or phone
-        grupos.setdefault((chave, followup_count), []).append(
-            (phone, name, followup_count, last_inbound_at)
-        )
-
-    grupos_ordenados = sorted(
-        grupos.values(), key=lambda grupo: min(item[3] for item in grupo)
+    identidades_mantidas = sorted(
+        grupos_iniciais.items(), key=lambda item: min(m[6] for m in item[1])
     )[:limite]
 
-    telefones_a_avancar: list[str] = []
-    vencedores: set[str] = set()
-    for grupo in grupos_ordenados:
-        grupo_ordenado = sorted(grupo, key=lambda item: (item[3], item[0]))
-        vencedores.add(grupo_ordenado[0][0])
-        telefones_a_avancar.extend(item[0] for item in grupo_ordenado)
+    # Falta buscar: as variações que ainda não foram travadas pelo passo 1
+    # — é isso que alcança o irmão fora do lote.
+    ja_travados = {linha[0] for _, membros in identidades_mantidas for linha in membros}
+    faltam: set[str] = set()
+    for chave, _ in identidades_mantidas:
+        faltam.update(set(variacoes(chave)) - ja_travados)
 
-    if not telefones_a_avancar:
+    por_identidade: dict[str, list[tuple[Any, ...]]] = {
+        chave: list(membros) for chave, membros in identidades_mantidas
+    }
+
+    if faltam:
+        cur = await conn.execute(_SQL_TRAVAR_IRMAOS, (sorted(faltam),))
+        for linha in await cur.fetchall():
+            chave = canonicalizar(linha[0]) or linha[0]
+            # Só entra se a identidade sobreviveu ao corte de `limite` —
+            # `_SQL_TRAVAR_IRMAOS` pode devolver uma linha cuja identidade
+            # não está mais em `por_identidade` só se `variacoes()` bater
+            # por coincidência com outra identidade mantida (não deveria
+            # acontecer; guarda defensiva).
+            if chave in por_identidade:
+                por_identidade[chave].append(linha)
+
+    todos_os_telefones = {
+        linha[0] for membros in por_identidade.values() for linha in membros
+    }
+    bloqueados = await _telefones_bloqueados(conn, todos_os_telefones)
+    for chave in list(por_identidade):
+        por_identidade[chave] = [
+            linha for linha in por_identidade[chave] if linha[0] not in bloqueados
+        ]
+
+    agora = datetime.now(UTC)
+    vencedores: dict[str, tuple[Any, ...]] = {}
+    irmaos: list[str] = []
+
+    for membros in por_identidade.values():
+        elegiveis = [
+            linha
+            for linha in membros
+            if _elegivel_fresco(
+                agent_active=linha[3],
+                followup_active=linha[4],
+                phase=linha[5],
+                followup_count=linha[2],
+                last_inbound_at=linha[6],
+                n1_min=n1_min,
+                n2_min=n2_min,
+                n3_min=n3_min,
+                janela_min=janela_min,
+                agora=agora,
+            )
+        ]
+        if not elegiveis:
+            continue
+
+        vencedor = min(elegiveis, key=lambda linha: (linha[6], linha[0]))
+        vencedores[vencedor[0]] = vencedor
+        nivel_vencedor = vencedor[2]
+        irmaos.extend(
+            linha[0]
+            for linha in membros
+            if linha[2] == nivel_vencedor and linha[0] != vencedor[0]
+        )
+
+    if not vencedores:
         return []
 
-    cur = await conn.execute(_SQL_AVANCAR, (telefones_a_avancar,))
-    linhas = [linha for linha in await cur.fetchall() if linha[0] in vencedores]
-    return [LeadReivindicado(phone=p, name=n, nivel=c) for p, n, c in linhas]
+    cur = await conn.execute(_SQL_AVANCAR_VENCEDOR, (list(vencedores.keys()),))
+    linhas_vencedoras = await cur.fetchall()
+
+    if irmaos:
+        await conn.execute(_SQL_AVANCAR_IRMAOS, (irmaos,))
+
+    return [LeadReivindicado(phone=p, name=n, nivel=c) for p, n, c in linhas_vencedoras]
 
 
 async def reivindicar(
@@ -325,10 +487,12 @@ async def reivindicar(
 
     **Um telefone não é uma pessoa.** Duas ou mais linhas físicas
     compartilhando a mesma identidade canônica (com/sem o 9º dígito, ou
-    formas legadas malformadas) avançam `followup_count` juntas; só a
-    linha mais urgente do grupo é devolvida para envio. Ver o comentário
-    acima de `_SQL_AVANCAR` para o porquê. Telefones na `blocklist` (em
-    qualquer variação) nunca são devolvidos.
+    formas legadas malformadas) avançam `followup_count` juntas — mesmo a
+    que não passou no filtro de elegibilidade (pausada, fora da janela,
+    cortada pelo `limite`); só a mais urgente entre as que PASSAM é
+    devolvida para envio. Ver o docstring de `_reivindicar_na_conexao`
+    para o porquê. Telefones na `blocklist` (em qualquer variação) nunca
+    são devolvidos.
 
     Os degraus (`n1_min`, `n2_min`, `n3_min`) e a janela aceitam override
     explícito por chamada e, sem ele, caem no valor corrente de `settings`

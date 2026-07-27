@@ -332,13 +332,16 @@ async def test_par_duplicado_nao_manda_mensagem_de_novo_na_proxima_rodada(lead_f
     O fix: o claim avança `followup_count` de TODAS as linhas que
     compartilham a chave canônica, não só do vencedor — o par anda em
     bloco. Por isso este teste chama `rodada` duas vezes seguidas: nenhum
-    teste de uma rodada só prova isso.
+    teste de uma rodada só prova isso. `minutos_desde_inbound` DIFERENTE
+    nos dois lados de propósito — com o mesmo valor nos dois, o teste
+    passaria mesmo numa implementação que só sincroniza quando os
+    relógios batem exatamente.
     """
     sem_9 = await lead_factory(
         "551197755555", followup_count=0, minutos_desde_inbound=30
     )
     com_9 = await lead_factory(
-        "5511997755555", followup_count=0, minutos_desde_inbound=30
+        "5511997755555", followup_count=0, minutos_desde_inbound=33
     )
 
     enviados = []
@@ -367,12 +370,13 @@ async def test_par_duplicado_no_degrau_2_tambem_nao_duplica_entre_rodadas(lead_f
     """Mesma prova acima, mas partindo do degrau 2 (`followup_count=1`) —
     o brief da revisão mediu que uma mutação que restringe o avanço em
     bloco só ao degrau 1 (`and irmao.followup_count = 0`) sobrevive à
-    suíte inteira se nenhum teste exercitar outro degrau."""
+    suíte inteira se nenhum teste exercitar outro degrau. Timestamps
+    diferentes nos dois lados, mesmo motivo do teste acima."""
     sem_9 = await lead_factory(
         "551197712377", followup_count=1, minutos_desde_inbound=80
     )
     com_9 = await lead_factory(
-        "5511997712377", followup_count=1, minutos_desde_inbound=80
+        "5511997712377", followup_count=1, minutos_desde_inbound=76
     )
 
     enviados = []
@@ -426,6 +430,424 @@ async def test_trio_duplicado_incluindo_forma_legada_e_reivindicado_uma_vez(
         async with pool.connection() as conn:
             await conn.execute("delete from leads_crm where phone = %s", (c,))
             await conn.commit()
+
+
+async def test_repro1_dois_minutos_de_diferenca_sincroniza_em_uma_rodada(lead_factory):
+    """Reprodução 1 da revisão: par com 16 e 14 minutos desde o inbound,
+    nada mais — e isto é o DEFAULT, não a exceção: o caminho
+    `agente_desligado` do gate (`leads.py:367`) grava um único `now()` nas
+    duas linhas, mas fora dele os relógios de cada linha divergem
+    naturalmente por alguns minutos, sempre.
+
+    Com 16 min, o lado A já vence o degrau 1 (>15 min); com 14 min, o lado
+    B ainda não venceria SOZINHO. Sem o fix, B fica de fora do lote
+    (nunca passa no filtro de elegibilidade) e é reivindicado sozinho
+    cinco minutos depois, numa segunda rodada. Com o fix, B avança
+    `followup_count` junto com A NESTA rodada, mesmo sem ter vencido o
+    degrau por conta própria — porque agora ele é "irmão do vencedor",
+    não "candidato independente".
+    """
+    lado_a = await lead_factory(
+        "551197766001", followup_count=0, minutos_desde_inbound=16
+    )
+    lado_b = await lead_factory(
+        "5511997766001", followup_count=0, minutos_desde_inbound=14
+    )
+
+    enviados = []
+
+    class ClienteQueRegistra:
+        async def send_message(self, to, body, **kwargs):
+            enviados.append(to)
+            return "id"
+
+    resumo = await rodada(await get_pool(), ClienteQueRegistra())
+    assert resumo["enviados"] == 1
+    assert len(enviados) == 1
+
+    assert await _followup_count(lado_a) == 1
+    assert await _followup_count(lado_b) == 1, (
+        "o lado que não venceu o degrau sozinho (14 min < 15 min) tem que "
+        "avançar em bloco com o vencedor mesmo assim — senão ele fica "
+        "elegível sozinho na próxima rodada"
+    )
+
+
+async def test_repro2_lado_pausado_religado_nao_causa_envio_duplo(lead_factory):
+    """Reprodução 2 da revisão: rodada 1 manda para o lado ativo; o lado
+    pausado, que nunca passaria no filtro de elegibilidade
+    (`agent_active=False`), precisa MESMO ASSIM avançar `followup_count`
+    em bloco. Sem isso, quando alguém religar o lado pausado (ChatWoot,
+    `reativar_agentes`), ele reabre a escada do zero e as DUAS metades do
+    par mandam mensagem na MESMA rodada — e assim indefinidamente,
+    porque a divergência nunca se cura sozinha.
+    """
+    ativo = await lead_factory(
+        "551197766002", agent_active=True, followup_count=0, minutos_desde_inbound=20
+    )
+    pausado = await lead_factory(
+        "5511997766002", agent_active=False, followup_count=0, minutos_desde_inbound=20
+    )
+
+    enviados = []
+
+    class ClienteQueRegistra:
+        async def send_message(self, to, body, **kwargs):
+            enviados.append(to)
+            return "id"
+
+    resumo1 = await rodada(await get_pool(), ClienteQueRegistra())
+    assert resumo1["enviados"] == 1
+    assert len(enviados) == 1
+
+    assert await _followup_count(ativo) == 1
+    assert await _followup_count(pausado) == 1, (
+        "o lado pausado tem que avançar em bloco mesmo sem ser elegível — "
+        "senão, ao ser religado, ele reabre a escada do zero"
+    )
+
+    pool = await get_pool()
+    async with pool.connection() as conn:
+        await conn.execute(
+            "update leads_crm set agent_active = true where phone = %s", (pausado,)
+        )
+        await conn.commit()
+
+    resumo2 = await rodada(pool, ClienteQueRegistra())
+    assert resumo2["enviados"] == 0, (
+        "religar o lado pausado não pode causar envio nenhum agora — os "
+        "dois já estão no degrau 2 (followup_count=1), esperando 75 min"
+    )
+    assert len(enviados) == 1
+
+
+async def test_repro3_limit_cortando_o_par_ainda_sincroniza(lead_factory):
+    """Reprodução 3 da revisão: sem pausa, sem concorrência — só o `LIMIT`
+    da busca principal cortando o irmão fora do lote físico. O número de
+    leads de enchimento aqui é FIXO (não vem de `_FATOR_SOBRA_BUSCA`) de
+    propósito: um teste que se dimensiona pela própria constante se anula
+    como âncora dela — mutar a constante para 1, 2 ou 50 não pode mudar o
+    resultado deste teste.
+    """
+    lado_a = await lead_factory(
+        "551197766003", followup_count=0, minutos_desde_inbound=90
+    )
+    lado_b = await lead_factory(
+        "5511997766003", followup_count=0, minutos_desde_inbound=60
+    )
+    # 200 leads de enchimento, todos mais urgentes que lado_b (mas menos
+    # que lado_a) — empurra lado_b para fora de QUALQUER janela de busca
+    # razoável, sem depender do valor de _FATOR_SOBRA_BUSCA.
+    enchimento = [
+        await lead_factory(
+            f"551190002{i:04d}", followup_count=0, minutos_desde_inbound=70
+        )
+        for i in range(200)
+    ]
+
+    enviados = []
+
+    class ClienteQueRegistra:
+        async def send_message(self, to, body, **kwargs):
+            enviados.append(to)
+            return "id"
+
+    resumo = await rodada(await get_pool(), ClienteQueRegistra(), limite=1)
+    assert resumo["enviados"] == 1
+    assert enviados == [f"+{lado_a}"], (
+        "lado_a é o mais urgente de todo o lote (90 min), tem que ser o "
+        "vencedor mesmo com limite=1"
+    )
+
+    assert await _followup_count(lado_a) == 1
+    assert await _followup_count(lado_b) == 1, (
+        "lado_b foi empurrado para fora do LIMIT da busca principal por "
+        "200 leads de enchimento mais urgentes que ele — mesmo assim tem "
+        "que sincronizar com lado_a, porque a busca do irmão "
+        "(`_SQL_TRAVAR_IRMAOS`) não usa esse LIMIT"
+    )
+    for phone in enchimento:
+        assert await _followup_count(phone) == 0, (
+            "leads de enchimento não fazem parte do par e não podem avançar"
+        )
+
+
+async def test_irmao_nao_recebe_last_interaction_at_forjada(lead_factory):
+    """`_SQL_AVANCAR_IRMAOS` avança só `followup_count` — gravar
+    `last_interaction_at = now()` num irmão que não recebeu mensagem
+    nenhuma forjaria uma interação que nunca aconteceu.
+
+    O vencedor é o telefone MAIS urgente (`last_inbound_at` mais antigo) —
+    de propósito, o `minutos_desde_inbound` maior aqui é o do vencedor,
+    não o do irmão, senão o irmão vira vencedor e o teste prova o caso
+    errado.
+    """
+    vencedor = await lead_factory(
+        "551197766004", followup_count=0, minutos_desde_inbound=600
+    )
+    irmao = await lead_factory(
+        "5511997766004", followup_count=0, minutos_desde_inbound=30
+    )
+
+    pool = await get_pool()
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            "select last_interaction_at from leads_crm where phone = %s", (irmao,)
+        )
+        linha = await cur.fetchone()
+    assert linha is not None
+    last_interaction_antes = linha[0]
+
+    await _reivindicar()
+
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            "select last_interaction_at from leads_crm where phone = %s", (irmao,)
+        )
+        linha = await cur.fetchone()
+    assert linha is not None
+    assert linha[0] == last_interaction_antes, (
+        "o irmão avançou followup_count mas não pode ter last_interaction_at "
+        "tocado — ele não recebeu mensagem nenhuma"
+    )
+    assert await _followup_count(irmao) == 1
+    assert await _followup_count(vencedor) == 1
+
+
+async def test_irmao_em_degrau_diferente_nao_e_forcado_a_acompanhar(lead_factory):
+    """Um par já divergido ANTES deste fix (uma linha adiantada por algum
+    motivo anterior) não pode ser empurrado para o degrau da mais
+    adiantada só por compartilhar identidade — isso pularia um degrau
+    legítimo do lado atrasado. Só quem está no MESMO degrau do vencedor
+    avança junto.
+
+    `irmao` não é independentemente elegível (5 min não vence nem o
+    degrau 1 nem o degrau 2) — só aparece no grupo via
+    `_SQL_TRAVAR_IRMAOS`, com o degrau DELE (1), diferente do vencedor
+    (0). Isola a checagem de degrau da checagem de elegibilidade (que já
+    tem teste próprio nos repros 1 e 2).
+    """
+    vencedor = await lead_factory(
+        "551197766007", followup_count=0, minutos_desde_inbound=30
+    )
+    irmao = await lead_factory(
+        "5511997766007", followup_count=1, minutos_desde_inbound=5
+    )
+
+    await _reivindicar()
+
+    assert await _followup_count(vencedor) == 1
+    assert await _followup_count(irmao) == 1, (
+        "esta linha não deveria ter sido tocada — ela está no degrau 2 "
+        "(followup_count=1), não no degrau do vencedor (0)"
+    )
+
+
+async def test_irmao_em_fase_terminal_nunca_vira_vencedor(lead_factory):
+    """`_elegivel_fresco` reaplica a checagem de fase terminal — obrigatória
+    porque um irmão em fase terminal só é alcançado via `_SQL_TRAVAR_IRMAOS`,
+    que não tem filtro de fase nenhum (de propósito, ver o comentário do
+    módulo). Sem essa checagem em Python, o irmão em fase terminal (mais
+    urgente que o âncora aqui, de propósito) viraria vencedor e receberia
+    mensagem — o mesmo risco que excluir 'qualificado' do SQL protege, só
+    que pelo caminho do irmão em vez do caminho direto."""
+    ancora = await lead_factory(
+        "551197766008",
+        phase="iniciou_conversa",
+        followup_count=0,
+        minutos_desde_inbound=20,
+    )
+    terminal = await lead_factory(
+        "5511997766008",
+        phase="agendou_sessao",
+        followup_count=0,
+        minutos_desde_inbound=90,
+    )
+
+    enviados = []
+
+    class ClienteQueRegistra:
+        async def send_message(self, to, body, **kwargs):
+            enviados.append(to)
+            return "id"
+
+    resumo = await rodada(await get_pool(), ClienteQueRegistra())
+    assert resumo["enviados"] == 1
+    assert enviados == [f"+{ancora}"], (
+        "o vencedor tem que ser o âncora — o irmão em fase terminal "
+        f"({terminal}) não pode receber mensagem nenhuma"
+    )
+
+
+async def test_irmao_fora_da_janela_nunca_vira_vencedor(lead_factory):
+    """Mesmo raciocínio do teste de fase terminal, para a janela de 24h:
+    um irmão com a janela fechada só é alcançado via `_SQL_TRAVAR_IRMAOS`
+    (sem filtro de janela). Sem `_elegivel_fresco` reaplicar essa
+    checagem, ele viraria vencedor por ser "mais urgente" (mais tempo
+    parado) e receberia mensagem depois do corte da Cloud API."""
+    ancora = await lead_factory(
+        "551197766009", followup_count=0, minutos_desde_inbound=20
+    )
+    janela_fechada = await lead_factory(
+        "5511997766009", followup_count=0, minutos_desde_inbound=25 * 60
+    )
+
+    enviados = []
+
+    class ClienteQueRegistra:
+        async def send_message(self, to, body, **kwargs):
+            enviados.append(to)
+            return "id"
+
+    resumo = await rodada(await get_pool(), ClienteQueRegistra())
+    assert resumo["enviados"] == 1
+    assert enviados == [f"+{ancora}"], (
+        "o vencedor tem que ser o âncora — o irmão com a janela fechada "
+        f"({janela_fechada}) não pode receber mensagem nenhuma"
+    )
+
+
+async def test_irmao_que_nao_venceu_o_proprio_degrau_nunca_vira_vencedor(
+    lead_factory,
+):
+    """Mesmo raciocínio, para o timing do degrau: um irmão que não venceu
+    o PRÓPRIO degrau (aqui, 50 min não vence os 75 min do degrau 2) só é
+    alcançado via `_SQL_TRAVAR_IRMAOS`. `_elegivel_fresco` reaplica essa
+    checagem — sem ela, o irmão viraria vencedor por ter `last_inbound_at`
+    mais antigo que o âncora, mesmo sem ter esperado o tempo exigido pelo
+    PRÓPRIO degrau."""
+    ancora = await lead_factory(
+        "551197766010", followup_count=0, minutos_desde_inbound=20
+    )
+    nao_venceu_o_degrau = await lead_factory(
+        "5511997766010", followup_count=1, minutos_desde_inbound=50
+    )
+
+    enviados = []
+
+    class ClienteQueRegistra:
+        async def send_message(self, to, body, **kwargs):
+            enviados.append(to)
+            return "id"
+
+    resumo = await rodada(await get_pool(), ClienteQueRegistra())
+    assert resumo["enviados"] == 1
+    assert enviados == [f"+{ancora}"], (
+        "o vencedor tem que ser o âncora — o irmão que não venceu o "
+        f"próprio degrau ({nao_venceu_o_degrau}) não pode receber mensagem"
+    )
+
+
+async def test_travar_irmaos_nao_espera_lock_segurado_por_outra_transacao(
+    lead_factory,
+):
+    """Prova mais direta que o teste de concorrência geral: trava o irmão
+    manualmente numa conexão SEPARADA (simulando QUALQUER outra
+    transação concorrente — o gate, outra rodada, não precisa ser outra
+    chamada desta função) e mede que `_reivindicar` completa rápido mesmo
+    assim, sem sincronizar o irmão desta vez.
+
+    Com `_SQL_TRAVAR_IRMAOS` bloqueante em vez de `SKIP LOCKED`, esta
+    chamada ficaria presa esperando o lock externo, que só seria liberado
+    DEPOIS dela terminar — um impasse dentro do próprio teste. O
+    `asyncio.wait_for` transforma isso numa falha clara (`TimeoutError`),
+    não numa suíte inteira travada.
+    """
+    par_a = await lead_factory(
+        "551197766011", followup_count=0, minutos_desde_inbound=30
+    )
+    par_b = await lead_factory(
+        "5511997766011", followup_count=0, minutos_desde_inbound=30
+    )
+
+    segurando = asyncio.Event()
+    pode_soltar = asyncio.Event()
+
+    async def segura_par_b_direto():
+        pool = await get_pool()
+        async with pool.connection() as conn:
+            await conn.execute(
+                "select 1 from leads_crm where phone = %s for update", (par_b,)
+            )
+            segurando.set()
+            await pode_soltar.wait()
+            await conn.commit()
+
+    async def tenta_reivindicar():
+        await segurando.wait()
+        try:
+            return await _reivindicar(limite=1)
+        finally:
+            pode_soltar.set()
+
+    _, resultado = await asyncio.wait_for(
+        asyncio.gather(segura_par_b_direto(), tenta_reivindicar()), timeout=10
+    )
+    assert [r.phone for r in resultado] == [par_a]
+    # par_b não foi sincronizado nesta rodada — o lock externo bloqueou
+    # `_SQL_TRAVAR_IRMAOS`, que pulou (não esperou) e seguiu sem ele.
+    assert await _followup_count(par_b) == 0
+
+
+async def test_duas_transacoes_concorrentes_com_par_duplicado_nao_travam(
+    lead_factory,
+):
+    """`_SQL_TRAVAR_IRMAOS` usa `FOR UPDATE SKIP LOCKED`, não `FOR UPDATE`
+    bloqueante, exatamente para nunca poder ser o lado de um deadlock —
+    nenhuma das duas consultas desta função espera lock alheio, então
+    nenhuma pode ficar presa enquanto a outra transação segura o que ela
+    quer.
+
+    Mesmo mecanismo do teste de concorrência original (sobreposição real
+    via `asyncio.Event`, não `asyncio.gather` cru), mas com um par
+    duplicado misturado no meio do lote — e todo o `gather` envolto num
+    `asyncio.wait_for` com timeout duro: a mutação que remove `for update
+    skip locked` já provou que este banco reage a deadlock de verdade, um
+    timeout aqui é uma falha real do desenho, não um artefato de teste
+    lento.
+    """
+    limite = 3
+    limite_busca = limite * _FATOR_SOBRA_BUSCA
+    total_avulsos = limite_busca + limite + 5
+    for i in range(total_avulsos):
+        await lead_factory(
+            f"5511900011{i:03d}", followup_count=0, minutos_desde_inbound=30
+        )
+    par_a = await lead_factory(
+        "551197766006", followup_count=0, minutos_desde_inbound=31
+    )
+    par_b = await lead_factory(
+        "5511997766006", followup_count=0, minutos_desde_inbound=29
+    )
+
+    segurando = asyncio.Event()
+    pode_soltar = asyncio.Event()
+
+    async def primeira():
+        pool = await get_pool()
+        async with pool.connection() as conn:
+            resultado = await _reivindicar_na_conexao(conn, limite=limite)
+            segurando.set()
+            await pode_soltar.wait()  # segura a transação aberta
+            await conn.commit()
+        return resultado
+
+    async def segunda():
+        await segurando.wait()  # só entra com a primeira ainda aberta
+        try:
+            return await _reivindicar(limite=limite)
+        finally:
+            pode_soltar.set()
+
+    a, b = await asyncio.wait_for(asyncio.gather(primeira(), segunda()), timeout=10)
+    telefones = [r.phone for r in a] + [r.phone for r in b]
+    assert len(telefones) == len(set(telefones)), "o mesmo lead saiu duas vezes"
+
+    # se o par foi processado por qualquer uma das duas transações, os
+    # dois lados têm que estar sincronizados — a disputa concorrente não
+    # pode deixar metade do par para trás.
+    if await _followup_count(par_a) == 1 or await _followup_count(par_b) == 1:
+        assert await _followup_count(par_a) == await _followup_count(par_b) == 1
 
 
 async def test_telefone_na_blocklist_nao_e_reivindicado(lead_factory, bloquear):
