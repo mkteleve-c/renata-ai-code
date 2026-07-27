@@ -104,6 +104,16 @@ class Settings(BaseSettings):
     # a rota passa a exigi-lo. Vazio = rota aberta (default de dev).
     evolution_webhook_secret: str = ""
 
+    # --- Google Calendar (agenda de agendamento do SDR) ---
+    # OAuth 2.0 por refresh token, de uma conta com permissão de escrita na
+    # agenda. GOOGLE_CALENDAR_ID é o e-mail do calendário.
+    # Rotacionar o OAuth Client no Google Cloud Console invalida o refresh
+    # token e derruba o agendamento até que alguém reautorize.
+    google_client_id: str = ""
+    google_client_secret: str = ""
+    google_refresh_token: str = ""
+    google_calendar_id: str = ""
+
     # --- Rate Limit ---
     rate_limit_per_hour: int = 30
 
