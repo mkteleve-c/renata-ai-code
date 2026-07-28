@@ -1,5 +1,6 @@
 """Testes das validacoes de configuracao por ambiente."""
 
+import pydantic
 import pytest
 
 from whatsapp_langchain.shared.config import (
@@ -119,3 +120,55 @@ class TestChannelStatus:
         )
         # Twilio completo, Meta e uazapi intocados — não erra.
         s.validate_runtime_settings()
+
+
+class TestFollowupEnabledParsing:
+    """FOLLOWUP_ENABLED aceita true/false nativo e as formas em português.
+
+    Sem o validador, um valor como 'nao' (erro de digitação plausível num
+    projeto pt-BR) ou ' false ' (espaço vazando de um .env copiado) derruba
+    `Settings()` inteiro com `ValidationError` — API e Worker caem os
+    dois, antes até de `run_migrations`.
+    """
+
+    @pytest.mark.parametrize(
+        "valor",
+        ["true", "True", "TRUE", "1", "yes", "on", "sim", "SIM", "verdadeiro"],
+    )
+    def test_formas_verdadeiras(self, valor):
+        s = Settings(internal_service_token="token-local", followup_enabled=valor)
+        assert s.followup_enabled is True
+
+    @pytest.mark.parametrize(
+        "valor",
+        [
+            "false",
+            "False",
+            "FALSE",
+            "0",
+            "no",
+            "off",
+            "nao",
+            "não",
+            "NÃO",
+            "falso",
+            " false ",
+        ],
+    )
+    def test_formas_falsas(self, valor):
+        s = Settings(internal_service_token="token-local", followup_enabled=valor)
+        assert s.followup_enabled is False
+
+    def test_bool_nativo_continua_funcionando(self):
+        s = Settings(internal_service_token="token-local", followup_enabled=True)
+        assert s.followup_enabled is True
+
+    def test_valor_nao_reconhecido_falha_com_mensagem_legivel(self):
+        # `model_validate` (não o construtor) porque o campo é tipado `bool` —
+        # o construtor rejeitaria `str` estaticamente antes mesmo de chegar
+        # ao validador, que é justamente o caminho real (env var chega como
+        # string) que este teste precisa exercitar.
+        with pytest.raises(pydantic.ValidationError, match="FOLLOWUP_ENABLED"):
+            Settings.model_validate(
+                {"internal_service_token": "token-local", "followup_enabled": "talvez"}
+            )

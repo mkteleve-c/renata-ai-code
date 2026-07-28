@@ -13,12 +13,19 @@ A maior parte das configurações tem defaults sensatos para desenvolvimento loc
 Segredos compartilhados do painel/admin devem ser preenchidos explicitamente.
 """
 
-from pydantic import SecretStr
+from pydantic import SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from whatsapp_langchain.shared.phone import canonicalizar
 
 MIN_PRODUCTION_SECRET_LENGTH = 32
+
+# Formas aceitas para FOLLOWUP_ENABLED além do `true`/`false` nativo do
+# pydantic — o valor nativo já rejeita até `" false "` com espaço (ver
+# `_parse_followup_enabled`), e um projeto em português tem `nao`/`sim`
+# como erro de digitação plausível para quem preenche o .env.
+_FOLLOWUP_ENABLED_VERDADEIRO = {"true", "1", "yes", "on", "sim", "verdadeiro"}
+_FOLLOWUP_ENABLED_FALSO = {"false", "0", "no", "off", "nao", "não", "falso"}
 
 
 class Settings(BaseSettings):
@@ -201,6 +208,33 @@ class Settings(BaseSettings):
     embedding_model: str = "openai/text-embedding-3-small"
     embedding_dims: int = 1536
     memory_search_limit: int = 5
+
+    @field_validator("followup_enabled", mode="before")
+    @classmethod
+    def _parse_followup_enabled(cls, valor: object) -> object:
+        """Aceita `true`/`false` nativo do pydantic e as formas em português.
+
+        Sem isto, `FOLLOWUP_ENABLED=nao` (erro de digitação plausível num
+        projeto em português — o resto do repo é `pt-BR`) ou
+        `FOLLOWUP_ENABLED=" false "` (espaço vazando de um copy-paste do
+        .env) derrubam `Settings()` com `ValidationError` — API e Worker
+        caem os dois, antes até de `run_migrations` rodar, exatamente o
+        modo de falha que "sem fail-fast do follow-up" queria evitar (ver
+        `iniciar_followup` em `worker/main.py`). Qualquer outra string
+        continua sendo rejeitada, com mensagem que já indica os valores
+        aceitos.
+        """
+        if isinstance(valor, str):
+            normalizado = valor.strip().lower()
+            if normalizado in _FOLLOWUP_ENABLED_VERDADEIRO:
+                return True
+            if normalizado in _FOLLOWUP_ENABLED_FALSO:
+                return False
+            raise ValueError(
+                f"FOLLOWUP_ENABLED={valor!r} não reconhecido — use "
+                "true/false, sim/não ou 1/0."
+            )
+        return valor
 
     @property
     def resolved_outbound_mode(self) -> str:
