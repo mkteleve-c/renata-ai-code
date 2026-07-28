@@ -882,6 +882,80 @@ async def test_excecao_numa_rodada_nao_derruba_o_loop(monkeypatch):
     assert len(chamadas) >= 3, "o loop tem que sobreviver à primeira exceção"
 
 
+async def test_cancel_durante_rodada_bloqueada_mata_a_task_de_verdade(monkeypatch):
+    """`_loop_followup` precisa usar `except Exception`, não `except BaseException`.
+
+    `asyncio.CancelledError` herda de `BaseException`, não de `Exception`
+    (desde Python 3.8). Se o `except` do laço fosse ampliado para
+    `BaseException`, um `cancel()` que chega enquanto a task está DENTRO de
+    `rodada` (bloqueada em banco ou numa chamada HTTP para o canal) seria
+    engolido pelo `except` igual a qualquer outro erro — o loop logaria
+    `followup_rodada_falhou` e voltaria para `asyncio.sleep`, sem nunca
+    morrer. `_parar_followup` ficaria preso para sempre em `await task`, e o
+    shutdown do worker travaria.
+
+    `test_parar_followup_cancela_task_pendurada` (abaixo) cancela um laço
+    LOCAL simples — não pega essa mutação porque nunca está "dentro de
+    `rodada`" quando o cancel chega. Este teste simula exatamente esse
+    ponto: uma `rodada` fake presa em `asyncio.Event().wait()`, um ponto de
+    espera cancelável de verdade, igual a uma query de banco ou um HTTP em
+    andamento.
+    """
+    dentro_da_rodada = asyncio.Event()
+    nunca_libera = asyncio.Event()
+
+    async def rodada_bloqueada(pool, cliente):
+        dentro_da_rodada.set()
+        await nunca_libera.wait()
+        return {"enviados": 0, "falhas": 0, "abortados": 0, "bloqueados_por_janela": 0}
+
+    monkeypatch.setattr("whatsapp_langchain.worker.main.rodada", rodada_bloqueada)
+    monkeypatch.setattr(settings, "followup_enabled", True)
+    monkeypatch.setattr(settings, "followup_interval_seconds", 60)
+
+    pool = await get_pool()
+    tarefa = iniciar_followup(
+        pool, outbounds={MessagingChannel.EVOLUTION: _ClienteMudo()}
+    )
+    assert tarefa is not None
+    parar_task: asyncio.Task[None] | None = None
+
+    try:
+        await asyncio.wait_for(dentro_da_rodada.wait(), timeout=2)
+
+        # `_parar_followup` roda como task separada e o teste faz polling
+        # curto e limitado — mesma razão do `test_parar_followup_cancela_
+        # task_pendurada` abaixo: não envolver a chamada num `wait_for` que
+        # cancele por fora, para não vazar cancelamento para dentro de
+        # `tarefa` por um caminho que não seja o `task.cancel()` de produção.
+        parar_task = asyncio.create_task(_parar_followup(tarefa))
+        for _ in range(300):
+            if parar_task.done():
+                break
+            await asyncio.sleep(0.01)
+
+        assert parar_task.done(), (
+            "_parar_followup nunca retornou — a task de follow-up ficou "
+            "presa dentro de rodada() sem morrer ao cancel() (parou? "
+            f"{parar_task.done()} | task morreu? {tarefa.done()})"
+        )
+        assert tarefa.cancelled(), (
+            "a task de follow-up sobreviveu ao cancel() recebido dentro de "
+            "rodada() — o except do loop engoliu o CancelledError"
+        )
+    finally:
+        nunca_libera.set()
+        for t in (parar_task, tarefa):
+            if t is not None and not t.done():
+                t.cancel()
+        for t in (parar_task, tarefa):
+            if t is not None:
+                try:
+                    await t
+                except BaseException:
+                    pass
+
+
 async def test_parar_followup_cancela_task_pendurada():
     """Task de background esquecida no shutdown polui as rodadas seguintes
     da suíte (e, em produção, segue rodando depois do processo achar que já
