@@ -1009,3 +1009,130 @@ async def test_parar_followup_cancela_task_pendurada():
 
 async def test_parar_followup_com_none_nao_faz_nada():
     await _parar_followup(None)
+
+
+# --- main(): wiring real da régua no processo do worker (Dívida 1) --------
+#
+# Os testes acima provam que `iniciar_followup`/`_parar_followup` funcionam
+# isolados — mas `main()` é o ÚNICO ponto do sistema que de fato os chama.
+# `followup_task = iniciar_followup(pool, outbounds)` virando
+# `followup_task = None`, ou `await _parar_followup(followup_task)` sumindo
+# do `finally`, passam 100% verde sem este teste: nenhum outro código do
+# processo invoca essas duas funções, então nada mais percebe a ausência.
+
+
+class _PararLoopDeConsumo(Exception):
+    """Interrompe o `while True` de consumo de `main()` sem passar por
+    `KeyboardInterrupt` — mesmo caminho (`finally` sem o `except` tratar a
+    exceção) que um erro real de produção tomaria."""
+
+
+async def test_main_liga_e_desliga_a_regua_de_verdade(monkeypatch):
+    """Chama `main()` de ponta a ponta (com DB, checkpointer e store
+    substituídos por dublês) só para provar que ELE — não o teste — chama
+    `iniciar_followup` na subida e `_parar_followup` no `finally`.
+
+    `iniciar_followup`/`_parar_followup` em si não são mockados: o teste
+    embrulha as versões reais para capturar a task e observar quando o
+    desligamento acontece, sem reimplementar a lógica deles.
+    """
+    from whatsapp_langchain.worker import main as worker_main
+
+    capturado: dict[str, asyncio.Task[None] | None] = {}
+    parou = asyncio.Event()
+
+    iniciar_original = worker_main.iniciar_followup
+    parar_original = worker_main._parar_followup
+
+    def _iniciar_e_capturar(pool, outbounds):
+        task = iniciar_original(pool, outbounds)
+        capturado["task"] = task
+        return task
+
+    async def _parar_e_marcar(task):
+        await parar_original(task)
+        parou.set()
+
+    async def _rodada_estavel(pool, cliente):
+        return {"enviados": 0, "falhas": 0, "abortados": 0, "bloqueados_por_janela": 0}
+
+    class _StackFalso:
+        async def aclose(self):
+            return None
+
+    async def _pool_falso():
+        return object()
+
+    async def _sem_migracao(pool):
+        return None
+
+    async def _sem_bootstrap():
+        return None
+
+    async def _checkpointer_falso():
+        return _StackFalso(), object()
+
+    async def _store_falso():
+        return None, None
+
+    async def _sem_pendentes(pool):
+        return {}
+
+    async def _fecha_pool_falso():
+        return None
+
+    async def _claim_e_interrompe(pool, lease_seconds):
+        raise _PararLoopDeConsumo()
+
+    def _sem_setup_logging(log_level, json_output):
+        # `setup_logging` real chama `structlog.configure(...)` — global,
+        # processo inteiro. Chamado aqui, ele sobrevive ao teste e quebra
+        # `structlog.testing.capture_logs()` de QUALQUER teste que rodar
+        # depois (nesta suíte ou em outro arquivo), porque capture_logs()
+        # depende do `PrintLoggerFactory` default nunca ter sido substituído.
+        return None
+
+    monkeypatch.setattr(worker_main, "setup_logging", _sem_setup_logging)
+    monkeypatch.setattr(worker_main, "iniciar_followup", _iniciar_e_capturar)
+    monkeypatch.setattr(worker_main, "_parar_followup", _parar_e_marcar)
+    monkeypatch.setattr(worker_main, "rodada", _rodada_estavel)
+    monkeypatch.setattr(worker_main, "get_pool", _pool_falso)
+    monkeypatch.setattr(worker_main, "run_migrations", _sem_migracao)
+    monkeypatch.setattr(worker_main, "bootstrap_langgraph_schema", _sem_bootstrap)
+    monkeypatch.setattr(worker_main, "open_checkpointer", _checkpointer_falso)
+    monkeypatch.setattr(worker_main, "open_store", _store_falso)
+    monkeypatch.setattr(worker_main, "contar_pendentes_por_canal", _sem_pendentes)
+    monkeypatch.setattr(worker_main, "close_pool", _fecha_pool_falso)
+    monkeypatch.setattr(worker_main, "claim_next_message", _claim_e_interrompe)
+    monkeypatch.setattr(settings, "followup_enabled", True)
+    monkeypatch.setattr(settings, "followup_interval_seconds", 60)
+    monkeypatch.setattr(settings, "outbound_mode", "mock")
+
+    try:
+        with pytest.raises(_PararLoopDeConsumo):
+            await worker_main.main()
+
+        assert "task" in capturado and capturado["task"] is not None, (
+            "main() nunca chamou iniciar_followup — a régua não sobe de "
+            "verdade quando o worker inicia em produção"
+        )
+
+        await asyncio.wait_for(parou.wait(), timeout=2)
+        tarefa = capturado["task"]
+        assert tarefa is not None
+        assert tarefa.done() and tarefa.cancelled(), (
+            "main() não desligou a task de follow-up no finally — ela fica "
+            "pendurada rodando depois do worker achar que já parou"
+        )
+    finally:
+        # Rede de segurança independente da mutação: se `main()` não
+        # desligou a task de follow-up (ex.: mutação removeu o
+        # `_parar_followup` do finally), ela não pode vazar rodando para os
+        # testes seguintes da suíte.
+        tarefa = capturado.get("task")
+        if tarefa is not None and not tarefa.done():
+            tarefa.cancel()
+            try:
+                await tarefa
+            except BaseException:
+                pass
