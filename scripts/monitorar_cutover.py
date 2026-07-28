@@ -9,7 +9,9 @@ voltar ao n8n agora?".
 
 Cada chamada deste script é uma fotografia de um instante, não um processo
 contínuo -- rode em intervalos (o roteiro de cutover sugere a cada 5-10
-minutos) durante a primeira hora de tráfego real.
+minutos) durante a primeira hora de tráfego real. Exige
+`--linha-de-base-handover N` em toda chamada -- ver `medir_handover_absoluto`
+e a seção abaixo.
 
 ## Por que a maioria das medições recebe `desde`/`agora` explícitos
 
@@ -31,13 +33,24 @@ horário de início do compromisso. Por isso esta medição consulta
 início (cobrindo agendamentos futuros, não só o passado recente) e filtra o
 resultado pelo campo `created` de cada evento -- não pela janela de busca em
 si.
+
+## Handover também é a exceção -- não usa `desde`/`agora`, usa uma linha de base
+
+`medir_handover_absoluto` não escopa por tempo -- compara um `count(*)`
+absoluto contra `linha_de_base_handover`, obrigatório em toda chamada. Ver o
+docstring da função para o motivo: `leads_crm` não tem coluna nenhuma que
+diga "quando `agent_active` virou `false`", e escopar por `created_at` (a
+versão original desta medição) media população vazia por construção logo
+após uma migração que preserva `created_at` do Supabase.
 """
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import json
 import sys
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
@@ -63,12 +76,13 @@ FILA_PARADA_MINUTOS = 5
 # Falhas com tentativas esgotadas na janela. 5 ou mais = reverter; 1-4 = atenção.
 FALHAS_REVERTER = 5
 
-# Taxa de leads recém-criados que já nascem com agent_active=false
-# (handover disparando). Amostra mínima evita que 1 lead pausado em 2 vire
-# "50%" e dispare reversão por ruído estatístico.
-HANDOVER_TAXA_REVERTER = 0.5
-HANDOVER_TAXA_ATENCAO = 0.2
-HANDOVER_AMOSTRA_MINIMA = 3
+# Handover acumulado desde a linha de base do passo 6 -- delta de count(*)
+# absoluto de agent_active=false em leads_crm (ver medir_handover_absoluto).
+# Mesma ordem de grandeza de FALHAS_REVERTER: alguns handovers isolados
+# acontecem (lead pede humano, etc.); vários acumulados na mesma janela é
+# padrão, não acaso -- mesmo raciocínio de medir_falhas_max_attempts.
+HANDOVER_DELTA_ATENCAO = 1
+HANDOVER_DELTA_REVERTER = 5
 
 # Taxa de respostas do elevec_sdr fora do schema de balões esperado.
 FALLBACK_TAXA_REVERTER = 0.3
@@ -260,51 +274,67 @@ async def medir_leads_criados(
     return Metrica(nome, "ok", str(total), "dentro do esperado")
 
 
-# --- 4. Handover entre leads novos ------------------------------------------
+# --- 4. Handover acumulado desde a linha de base ----------------------------
 
 
-async def medir_handover_leads_novos(
+async def medir_handover_absoluto(
     conn: AsyncConnection,
     *,
-    desde: datetime,
+    linha_de_base: int,
 ) -> Metrica:
-    """Entre os leads criados na janela, fração com `agent_active=false`.
+    """`count(*)` ABSOLUTO de `agent_active=false` em `leads_crm`, comparado
+    contra `linha_de_base` -- o mesmo `count(*)` medido logo após
+    `migrar_supabase.py --executar` terminar (impresso por aquele script,
+    anotado pelo operador -- ver `docs/CUTOVER.md`, passo 6). `delta = atual
+    - linha_de_base` é a contagem de handovers novos desde então.
 
-    Handover disparando muito entre leads que acabaram de chegar é sinal de
-    a Renata travando (erro de tool, saída fora do SOP) e caindo no caminho
-    de desligamento.
+    Substitui a versão original desta medição (Fase 5, Task 5), que escopava
+    por `created_at` na janela -- e por isso media uma população VAZIA POR
+    CONSTRUÇÃO logo depois de um cutover: os leads importados vêm com
+    `created_at` PRESERVADO do Supabase (o mais antigo entre linhas
+    fundidas, nunca `now()` -- ver `migrar_supabase.py`, `_SQL_UPSERT_LEAD`),
+    então nenhum lead migrado tem `created_at` "na última hora" logo após a
+    migração. `leads_crm` também não tem `updated_at` para escopar por
+    "quando `agent_active` mudou", e `human_handover` deixa
+    `agent_reactivate_at` `NULL` de propósito (ver
+    `agents/catalog/elevec_sdr/tools/handover.py`) -- não há NENHUMA coluna
+    de auditoria de transição para escopar essa medição por tempo. Provado
+    com 40 leads inseridos com `created_at` preservado (como a migração
+    grava) e `agent_active=false`: a versão antiga devolvia
+    `ok, 0/0, "nenhum lead novo na janela"` -- verde, porque a janela
+    filtrada por `created_at` nunca continha nenhum deles.
+
+    A comparação absoluta entre duas leituras do MESMO `count(*)` não
+    depende de nenhuma coluna de auditoria -- só do valor em si, medido duas
+    vezes. `FOLLOWUP_ENABLED=false` no dia do cutover (ver `docs/CUTOVER.md`,
+    "O que NÃO ligar no dia") garante que nada religa `agent_active`
+    automaticamente nessa janela -- a régua de follow-up é o único código
+    que escreve `agent_active=true` de volta (`worker/followup.py`), e ela
+    não roda desligada. Por isso o delta só deveria CRESCER no dia do
+    cutover; uma queda seria, ela mesma, sinal de alguém reativando um lead
+    manualmente via pgweb -- não um bug desta medição.
     """
-    nome = "Handover entre leads novos"
-    cur = await conn.execute(
-        """
-        SELECT COUNT(*) FILTER (WHERE NOT agent_active), COUNT(*)
-        FROM leads_crm
-        WHERE created_at >= %s
-        """,
-        (desde,),
-    )
+    nome = "Handover acumulado desde a linha de base"
+    cur = await conn.execute("SELECT COUNT(*) FROM leads_crm WHERE NOT agent_active")
     linha = await cur.fetchone()
     assert linha is not None
-    pausados, total = int(linha[0]), int(linha[1])
+    atual = int(linha[0])
+    delta = atual - linha_de_base
+    resumo = f"{atual} (base {linha_de_base}, delta {delta:+d})"
 
-    if total == 0:
-        return Metrica(nome, "ok", "0/0", "nenhum lead novo na janela")
-
-    taxa = pausados / total
-    resumo = f"{pausados}/{total} ({taxa:.0%})"
-
-    if total >= HANDOVER_AMOSTRA_MINIMA and taxa >= HANDOVER_TAXA_REVERTER:
+    if delta >= HANDOVER_DELTA_REVERTER:
         return Metrica(
             nome,
             "reverter",
             resumo,
-            f"{resumo} dos leads novos já pausados -- limiar de reversão é "
-            f"{HANDOVER_TAXA_REVERTER:.0%} com amostra >= "
-            f"{HANDOVER_AMOSTRA_MINIMA}.",
+            f"{delta} handover(s) novo(s) desde a linha de base do passo 6 "
+            f"-- limiar de reversão é {HANDOVER_DELTA_REVERTER}.",
         )
-    if taxa > HANDOVER_TAXA_ATENCAO:
-        return Metrica(nome, "atencao", resumo, f"{resumo} pausados -- investigar")
-    return Metrica(nome, "ok", resumo, "dentro do esperado")
+    if delta >= HANDOVER_DELTA_ATENCAO:
+        return Metrica(
+            nome, "atencao", resumo, f"{delta} handover(s) novo(s) -- investigar"
+        )
+    return Metrica(nome, "ok", resumo, "nenhum handover novo desde a linha de base")
 
 
 # --- 5. Taxa de fallback de balão único -------------------------------------
@@ -471,11 +501,20 @@ async def rodar_monitoramento(
     *,
     pool: AsyncConnectionPool,
     settings: Settings,
+    linha_de_base_handover: int,
     desde: datetime | None = None,
     agora: datetime | None = None,
     transportes: Transportes | None = None,
 ) -> Relatorio:
-    """Roda as seis medições. `desde` default: última hora a partir de `agora`."""
+    """Roda as seis medições. `desde` default: última hora a partir de `agora`.
+
+    `linha_de_base_handover` é obrigatório de propósito -- sem default,
+    porque não existe um valor seguro para "não sei a linha de base": ver
+    `medir_handover_absoluto`. É o `count(*) where not agent_active` que
+    `migrar_supabase.py --executar` imprime ao final do passo 6 do roteiro
+    de cutover; o operador anota e passa em toda chamada deste script
+    (`--linha-de-base-handover N`).
+    """
     transportes = transportes or Transportes()
     agora = agora or datetime.now(UTC)
     desde = desde or (agora - timedelta(hours=1))
@@ -486,7 +525,7 @@ async def rodar_monitoramento(
             await medir_fila_parada(conn, agora=agora),
             await medir_falhas_max_attempts(conn, desde=desde),
             await medir_leads_criados(conn, desde=desde),
-            await medir_handover_leads_novos(conn, desde=desde),
+            await medir_handover_absoluto(conn, linha_de_base=linha_de_base_handover),
             await medir_fallback_baloes(conn, desde=desde),
         ]
 
@@ -525,21 +564,59 @@ def _imprimir(relatorio: Relatorio) -> None:
         print("Nenhum limiar de reversão cruzado.")
 
 
-async def _rodar_e_imprimir(pool: AsyncConnectionPool, settings: Settings) -> int:
-    relatorio = await rodar_monitoramento(pool=pool, settings=settings)
+async def _rodar_e_imprimir(
+    pool: AsyncConnectionPool, settings: Settings, *, linha_de_base_handover: int
+) -> int:
+    relatorio = await rodar_monitoramento(
+        pool=pool, settings=settings, linha_de_base_handover=linha_de_base_handover
+    )
     _imprimir(relatorio)
     return 1 if motivos_reversao(relatorio) else 0
 
 
-def main() -> int:
-    """Ponto de entrada do CLI. Uso: ``python scripts/monitorar_cutover.py``."""
+def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    """`--linha-de-base-handover` é obrigatório -- sem ele, o script não sabe
+    contra o quê comparar `count(*) where not agent_active` (ver
+    `medir_handover_absoluto`), e não existe um default seguro para "não
+    informado" que não arrisque mascarar handovers reais como zero.
+    """
+    parser = argparse.ArgumentParser(
+        prog="monitorar_cutover",
+        description=(
+            "Monitoramento da primeira hora do cutover -- seis medições "
+            "contra o Postgres/Google Calendar de produção."
+        ),
+        allow_abbrev=False,
+    )
+    parser.add_argument(
+        "--linha-de-base-handover",
+        type=int,
+        required=True,
+        metavar="N",
+        help=(
+            "count(*) where not agent_active em leads_crm, impresso por "
+            "`migrar_supabase.py --executar` ao final do passo 6 do "
+            "roteiro de cutover -- anote esse número e passe aqui."
+        ),
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Ponto de entrada do CLI.
+
+    Uso: ``python scripts/monitorar_cutover.py --linha-de-base-handover N``.
+    """
+    args = _parse_args(argv)
     settings = Settings()
-    return asyncio.run(_main_com_settings(settings))
+    return asyncio.run(_main_com_settings(settings, args.linha_de_base_handover))
 
 
-async def _main_com_settings(settings: Settings) -> int:
+async def _main_com_settings(settings: Settings, linha_de_base_handover: int) -> int:
     pool = await get_pool()
-    return await _rodar_e_imprimir(pool, settings)
+    return await _rodar_e_imprimir(
+        pool, settings, linha_de_base_handover=linha_de_base_handover
+    )
 
 
 if __name__ == "__main__":

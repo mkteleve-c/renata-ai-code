@@ -28,6 +28,7 @@ tabela impressa.
 from __future__ import annotations
 
 import asyncio
+import re
 import sys
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -97,9 +98,24 @@ async def checar_migracoes(conn: AsyncConnection) -> Checagem:
     (`MIGRATIONS_DIR`, `shared/db.py`) em vez de hardcodar "001..015" --
     hoje são exatamente esses quinze arquivos, e a checagem continua
     correta se um 016 for acrescentado antes do próximo cutover.
+
+    `esperadas` vazio -- `MIGRATIONS_DIR` inexistente, apagado, ou apontando
+    para o lugar errado -- FALHA explicitamente em vez de passar vacuamente.
+    Sem esta guarda, `faltando = []` (nada esperado, nada pode faltar) e a
+    checagem reporta `True :: 0/0 aplicadas`, verde, exatamente no cenário em
+    que ela é incapaz de confirmar que a 015 (ou qualquer outra) foi
+    aplicada -- a única das doze checagens do pré-voo que cobre a 015.
     """
     nome = "Migrações aplicadas"
     esperadas = sorted(p.name for p in MIGRATIONS_DIR.glob("*.sql"))
+    if not esperadas:
+        return Checagem(
+            nome,
+            False,
+            f"nenhum arquivo .sql encontrado em {MIGRATIONS_DIR} -- "
+            "MIGRATIONS_DIR errado ou vazio, checagem não pode confirmar nada",
+        )
+
     cur = await conn.execute("select name from _migrations")
     aplicadas = {row[0] for row in await cur.fetchall()}
 
@@ -109,14 +125,32 @@ async def checar_migracoes(conn: AsyncConnection) -> Checagem:
     return Checagem(nome, True, f"{len(esperadas)}/{len(esperadas)} aplicadas")
 
 
+def _clausula_nega_com_padrao(definicao: str, padrao: str) -> bool:
+    """`True` só se `padrao` aparece dentro de um literal negado (`!~ '...'`).
+
+    Checagem por SUBSTRING pura (`padrao in definicao`) casaria igual se
+    alguém trocasse `!~` por `~` na constraint viva -- o padrão em si (o
+    texto da regex) não muda quando o operador é invertido, só o
+    comportamento (aceita em vez de rejeitar). Essa troca inverteria a
+    constraint inteira (passa a EXIGIR o formato que deveria PROIBIR) e a
+    checagem antiga ficaria verde do mesmo jeito. Aqui, o operador `!~`
+    precisa aparecer imediatamente antes da aspa que abre o literal que
+    contém `padrao` -- é o que amarra "negado" a "este padrão específico",
+    não só "negado em algum lugar da definição".
+    """
+    regex = r"!~\s*'[^']*" + re.escape(padrao) + r"[^']*'"
+    return re.search(regex, definicao) is not None
+
+
 async def checar_check_constraint(conn: AsyncConnection) -> Checagem:
-    """O CHECK da 014 está presente e com as três cláusulas -- lido do banco.
+    """O CHECK da 014 está presente, com as três cláusulas, e as três NEGADAS
+    (`!~`, não `~`) -- lido do banco.
 
     `pg_get_constraintdef`, nunca o texto do arquivo de migração: é
     exatamente o modo de falha que a Fase 3 documentou -- um teste (ou uma
     checagem) que lê o arquivo fica verde contra uma constraint velha.
     """
-    nome = "CHECK de leads_crm.phone com as três cláusulas"
+    nome = "CHECK de leads_crm.phone com as três cláusulas negadas"
     cur = await conn.execute(
         "select pg_get_constraintdef(oid) from pg_constraint "
         "where conname = %s and conrelid = 'leads_crm'::regclass",
@@ -132,7 +166,20 @@ async def checar_check_constraint(conn: AsyncConnection) -> Checagem:
         return Checagem(
             nome, False, f"CHECK sem a(s) cláusula(s): {', '.join(faltando)}"
         )
-    return Checagem(nome, True, "as três cláusulas presentes no CHECK vivo")
+
+    nao_negadas = [
+        c for c in _CLAUSULAS_ESPERADAS if not _clausula_nega_com_padrao(definicao, c)
+    ]
+    if nao_negadas:
+        return Checagem(
+            nome,
+            False,
+            f"cláusula(s) presente(s) mas não negada(s) com '!~' -- "
+            f"constraint pode estar invertida (aceita em vez de proibir): "
+            f"{', '.join(nao_negadas)}",
+        )
+
+    return Checagem(nome, True, "as três cláusulas presentes e negadas no CHECK vivo")
 
 
 async def checar_leads_crm_vazia(conn: AsyncConnection) -> Checagem:

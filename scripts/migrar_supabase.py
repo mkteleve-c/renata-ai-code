@@ -712,6 +712,23 @@ def _montar_destaques(
     return linhas
 
 
+def max_last_interaction_at(fundidas: dict[str, LinhaFundida]) -> datetime | None:
+    """O maior `last_interaction_at` entre os leads fundidos que esta
+    migração está prestes a gravar (ou já gravou).
+
+    Existe para o passo 7 do roteiro de cutover (`docs/CUTOVER.md`) ter algo
+    concreto para comparar: o roteiro manda conferir que
+    `max(last_interaction_at)` em `leads_crm`, depois de `--executar`, bate
+    com "o que o relatório registrou" -- sem este valor sendo IMPRESSO em
+    algum lugar (aqui, e em `_imprimir_resumo`), essa comparação não tinha
+    segundo lado para existir.
+    """
+    valores = [
+        f.last_interaction_at for f in fundidas.values() if f.last_interaction_at
+    ]
+    return max(valores) if valores else None
+
+
 def gerar_relatorio(
     total_origem: int,
     grupos: dict[str, list[LinhaOrigem]],
@@ -756,6 +773,8 @@ def gerar_relatorio(
         f"{migrados + total_descartes} == {total_origem} (fecha)",
         f"- Leads finais após fusão: **{len(grupos)}** "
         f"({len(grupos_multiplos)} grupo(s) com mais de uma linha física)",
+        f"- max(last_interaction_at) entre os leads migrados: "
+        f"**{max_last_interaction_at(fundidas)}**",
         "",
         "## Decisão humana necessária",
         "",
@@ -1659,6 +1678,21 @@ _TABELA_HISTORICO = "n8n_chat_histories"
 # soma final contra o `Content-Range` que o próprio Supabase devolveu.
 _TAMANHO_PAGINA = 1000
 
+# Piso mínimo de linhas esperadas por tabela -- defesa contra um
+# `Content-Range` que subdeclara o total de forma CONSISTENTE (cada página
+# alega um total menor que o real, e o servidor de fato só serve até esse
+# total menor). Esse caso passa incólume pela validação final de
+# `_buscar_paginado`, porque ela compara a contagem lida contra a PRÓPRIA
+# alegação do servidor -- é autorreferencial, não uma fonte independente.
+# Medido via MCP do Supabase em 27/07/2026: 3.388 leads, 8.944 mensagens de
+# histórico. Os pisos abaixo ficam abaixo disso de propósito (a base é viva
+# e cresce) -- servem só para pegar uma leitura grosseiramente truncada
+# (ex.: parar em 1.000 por causa do corte padrão do PostgREST), não para
+# validar a contagem exata. Atualize se a base encolher de verdade abaixo
+# do piso por um motivo legítimo (nunca só para fazer o abort sumir).
+_LEADS_MINIMO_ESPERADO = 3000
+_HISTORICO_MINIMO_ESPERADO = 8000
+
 _TIMEOUT_HTTP = httpx.Timeout(30.0)
 
 _RELATORIO_NOME = "relatorio_migracao.md"
@@ -1743,6 +1777,7 @@ async def _buscar_paginado(
     *,
     order_by: str,
     tamanho_pagina: int = _TAMANHO_PAGINA,
+    minimo_esperado: int = 0,
 ) -> list[dict[str, Any]]:
     """Lê `tabela` inteira via REST do Supabase, paginando pelo par de
     headers `Range-Unit`/`Range` do PostgREST.
@@ -1767,6 +1802,17 @@ async def _buscar_paginado(
     truncada não tem como coincidir com ele por acaso, a menos que a
     própria origem tenha só uma página -- caso em que não há nada para
     truncar.
+
+    Isso NÃO cobre o servidor que subdeclara o total de forma consistente
+    (todo `Content-Range` alega, digamos, 1.000, e o servidor de fato só
+    serve 1.000 -- a leitura "fecha" porque a única fonte de verdade é a
+    própria alegação do servidor). `minimo_esperado` é o piso independente
+    para esse caso: `0` (o default) não aplica piso nenhum -- quem chama
+    sem saber um piso plausível (ex.: os testes deste módulo, que usam
+    tabelas pequenas de propósito) continua funcionando sem precisar
+    inventar um número. `ler_leads_supabase`/`ler_historico_supabase`
+    passam os pisos reais (`_LEADS_MINIMO_ESPERADO`/
+    `_HISTORICO_MINIMO_ESPERADO`).
     """
     linhas: list[dict[str, Any]] = []
     total_esperado: int | None = None
@@ -1787,9 +1833,13 @@ async def _buscar_paginado(
             response = await client.get(
                 url, params={"select": "*", "order": order_by}, headers=headers
             )
-        except httpx.RequestError as exc:
-            # Nunca `str(exc)` nem `exc.request` -- os dois podem carregar a
-            # credencial que foi para os headers da requisição que falhou.
+        except (httpx.RequestError, httpx.InvalidURL) as exc:
+            # `httpx.InvalidURL` NÃO herda de `RequestError` (verificado
+            # contra httpx 0.28.1) -- sem o segundo ramo, um `SUPABASE_URL`
+            # malformado propagava um traceback cru em vez do `ERRO:`
+            # legível de sempre. Nunca `str(exc)` nem `exc.request` -- os
+            # dois podem carregar a credencial que foi para os headers da
+            # requisição que falhou.
             raise MigracaoAbortada(
                 f"falha de transporte lendo {tabela!r} do Supabase "
                 f"({type(exc).__name__}) -- abortando antes de qualquer "
@@ -1828,6 +1878,21 @@ async def _buscar_paginado(
             f"paginação de {tabela!r} não fechou: Content-Range disse "
             f"{total_esperado}, vieram {len(linhas)} -- abortando antes de "
             "qualquer escrita"
+        )
+
+    # Piso independente -- pega o caso em que o servidor subdeclara o total
+    # de forma consistente (a checagem acima bate porque compara contra a
+    # PRÓPRIA alegação dele). `minimo_esperado=0` (default) nunca aborta
+    # aqui.
+    if len(linhas) < minimo_esperado:
+        raise MigracaoAbortada(
+            f"paginação de {tabela!r} trouxe {len(linhas)} linha(s), abaixo "
+            f"do piso mínimo conhecido ({minimo_esperado}) -- Content-Range "
+            "pode estar subdeclarando o total de forma consistente com o "
+            "que o servidor realmente serviu. Abortando antes de qualquer "
+            "escrita. Se a base encolheu de verdade abaixo do piso, "
+            "confirme por outro caminho (ex.: MCP do Supabase) antes de "
+            "reduzir a constante do piso."
         )
 
     return linhas
@@ -1882,9 +1947,15 @@ async def ler_leads_supabase(
     client: httpx.AsyncClient, base_url: str, chave: str
 ) -> list[LinhaOrigem]:
     """Lê `leads_crm` inteira do Supabase legado, paginada e validada contra
-    `Content-Range` (ver `_buscar_paginado`)."""
+    `Content-Range` (ver `_buscar_paginado`), com o piso mínimo real
+    (`_LEADS_MINIMO_ESPERADO`) contra subdeclaração consistente."""
     brutos = await _buscar_paginado(
-        client, base_url, chave, _TABELA_LEADS, order_by="phone"
+        client,
+        base_url,
+        chave,
+        _TABELA_LEADS,
+        order_by="phone",
+        minimo_esperado=_LEADS_MINIMO_ESPERADO,
     )
     return [_linha_origem_de_registro(b) for b in brutos]
 
@@ -1893,10 +1964,16 @@ async def ler_historico_supabase(
     client: httpx.AsyncClient, base_url: str, chave: str
 ) -> list[LinhaHistoricoOrigem]:
     """Lê `n8n_chat_histories` inteira do Supabase legado, paginada e
-    validada. `order_by="id"` -- é a única ordem cronológica disponível
-    nessa tabela (ver o docstring de `LinhaHistoricoOrigem`)."""
+    validada, com o piso mínimo real (`_HISTORICO_MINIMO_ESPERADO`).
+    `order_by="id"` -- é a única ordem cronológica disponível nessa tabela
+    (ver o docstring de `LinhaHistoricoOrigem`)."""
     brutos = await _buscar_paginado(
-        client, base_url, chave, _TABELA_HISTORICO, order_by="id"
+        client,
+        base_url,
+        chave,
+        _TABELA_HISTORICO,
+        order_by="id",
+        minimo_esperado=_HISTORICO_MINIMO_ESPERADO,
     )
     return [_linha_historico_de_registro(b) for b in brutos]
 
@@ -1932,6 +2009,10 @@ def _imprimir_resumo(
     for motivo, quantidade in sorted(_contagem_descartes_por_motivo(descartes).items()):
         print(f"  - {motivo}: {quantidade}")
     print(f"Pendências de decisão humana: {len(destaques)}")
+    print(
+        f"max(last_interaction_at) entre os leads migrados: "
+        f"{max_last_interaction_at(fundidas)}"
+    )
     print(f"Relatório completo escrito em: {caminho_relatorio}")
 
 
@@ -1990,6 +2071,26 @@ async def executar_migracao(
 
     if caminho_relatorio is None:
         caminho_relatorio = Path(__file__).resolve().parents[1] / _RELATORIO_NOME
+
+    # `--executar` roda DEPOIS do portão humano do passo 5 do roteiro de
+    # cutover, que aprova exatamente o `relatorio_migracao.md` que o
+    # `--dry-run` anterior escreveu. Sobrescrever esse arquivo aqui, sem
+    # preservar o que foi aprovado, destrói a única evidência em disco do
+    # que o humano revisou -- se a origem mudou entre as duas rodadas (o
+    # Supabase continua vivo até o passo 3 desligar o n8n), não sobra como
+    # provar o que era diferente. Preserva o arquivo pré-existente com um
+    # sufixo ANTES de escrever o novo, só quando `executar=True` -- o
+    # dry-run em si pode sobrescrever seu próprio relatório à vontade
+    # (rodar de novo pra revisar de novo é o fluxo normal do passo 4).
+    if executar and caminho_relatorio.exists():
+        backup = caminho_relatorio.with_name(
+            caminho_relatorio.stem
+            + ".aprovado-antes-de-executar"
+            + caminho_relatorio.suffix
+        )
+        caminho_relatorio.replace(backup)
+        print(f"Relatório aprovado preservado em: {backup}")
+
     caminho_relatorio.write_text(relatorio, encoding="utf-8")
 
     destaques = _montar_destaques(grupos, fundidas, descartes)
@@ -2030,6 +2131,30 @@ async def executar_migracao(
         f"{resultado.reunioes_legadas_marcadas} reunião(ões) legada(s) "
         f"marcada(s), {total_turnos} turno(s) de histórico gravado(s)."
     )
+
+    # Linha de base para `scripts/monitorar_cutover.py` (passo 11 do roteiro
+    # de cutover): `leads_crm` não tem coluna de auditoria de transição
+    # (nenhum `updated_at`, e `human_handover` deixa `agent_reactivate_at`
+    # NULL de propósito -- ver `agents/catalog/elevec_sdr/tools/handover.py`),
+    # então não existe jeito de medir "handovers na última hora" escopando
+    # por tempo depois desta migração (os leads importados vêm com
+    # `created_at` PRESERVADO do Supabase, não `now()`). A defesa é medir
+    # este `count(*)` absoluto AGORA, logo após a escrita, e comparar contra
+    # a mesma contagem em cada rodada do monitoramento -- ver
+    # `medir_handover_absoluto` em `scripts/monitorar_cutover.py`.
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            "select count(*) from leads_crm where not agent_active"
+        )
+        linha = await cur.fetchone()
+    linha_de_base_handover = int(linha[0]) if linha is not None else 0
+    print(
+        f"\nLinha de base para o monitoramento da primeira hora (passo 11): "
+        f"{linha_de_base_handover} lead(s) com agent_active=false agora. "
+        "ANOTE este número -- "
+        "`scripts/monitorar_cutover.py --linha-de-base-handover "
+        f"{linha_de_base_handover}` precisa dele."
+    )
     return 0
 
 
@@ -2046,6 +2171,14 @@ def _parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "Migra leads e histórico do Supabase legado para leads_crm/ "
             "legacy_chat_history. Sem argumento, roda em modo --dry-run."
         ),
+        # Sem isto, argparse resolve qualquer prefixo não-ambíguo --
+        # `--e` já basta para identificar `--executar` sozinho (nenhuma
+        # outra flag começa com "e"), e resolve silenciosamente para ela.
+        # Um typo digitando "--e" em vez de "--executar" por engano (ou
+        # querendo `--environment` numa versão futura deste CLI) grava em
+        # produção em vez de cair no --dry-run padrão. `allow_abbrev=False`
+        # exige o nome completo da flag, sempre.
+        allow_abbrev=False,
     )
     modo = parser.add_mutually_exclusive_group()
     modo.add_argument(
