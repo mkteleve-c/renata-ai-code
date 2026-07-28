@@ -20,10 +20,18 @@ começar a fazer.
 - [ ] Você tem acesso ao painel do n8n (para desligar os 6 workflows)
 - [ ] Você tem acesso ao painel da Evolution API (para repontar o webhook)
 - [ ] Você tem acesso ao Railway (dashboard e/ou `railway` CLI logada)
-- [ ] Você tem o `.env` da API/Worker do Railway disponível para rodar os
-      scripts localmente contra o banco de produção (`DATABASE_URL`,
-      `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, credenciais de Evolution/
-      Google/Pipedrive) — ou terminal via `railway run --service worker`
+- [ ] O TCP Proxy do serviço `db` está habilitado (`docs/RAILWAY.md`, seção
+      "Como alcançar o Postgres de produção de fora do Railway") — **sem
+      isto, os passos 2, 4 e 6 não conseguem se conectar ao Postgres de
+      produção a partir do seu laptop.** `DATABASE_URL` (a reference
+      variable interna) só resolve dentro da rede privada do Railway;
+      `railway run` executa os scripts NA SUA MÁQUINA, não dentro do
+      Railway, e injetaria essa mesma `DATABASE_URL` interna se você não
+      seguir a seção acima
+- [ ] Você tem `SUPABASE_URL`/`SUPABASE_SERVICE_ROLE_KEY` e as credenciais
+      de Evolution/Google/Pipedrive do serviço `worker` disponíveis (via
+      `railway variable list --service worker --kv` ou o dashboard) para
+      rodar os scripts localmente
 - [ ] Você sabe qual horário isto está acontecendo e por quê (fora do horário
       comercial reduz o número de leads em trânsito durante a janela)
 - [ ] Você leu a seção "Plano de volta" deste documento
@@ -91,27 +99,55 @@ Duas coisas, nesta ordem:
 1. **Backup do volume do Postgres do Railway** (`docs/RAILWAY.md`, seção
    "Backup do volume do Postgres antes do cutover") — mesmo ele estando
    praticamente vazio agora (o cutover é a primeira carga), backup antes de
-   qualquer escrita é rotina, não exceção.
+   qualquer escrita é rotina, não exceção. Essa seção já exige TCP Proxy
+   habilitado (`docs/RAILWAY.md`, "Como alcançar o Postgres de produção de
+   fora do Railway") e prova, com contagem de linhas, que o dump veio do
+   banco certo — não basta o arquivo `.sql.gz` existir.
 2. **Confira que o Supabase está intacto** — rode uma leitura qualquer
-   (contagem de linhas em `leads` e `messages`, ou o próprio dry-run do passo
-   4 adiantado) e anote os números. É a referência para comparar depois, e é
-   a prova de que a origem — seu caminho de volta — está onde deveria.
+   contra as tabelas de origem (`leads_crm` e `n8n_chat_histories` — **não**
+   `leads`/`messages`, esses nomes não existem no Supabase deste projeto; os
+   dois nomes certos são os mesmos que `scripts/migrar_supabase.py` lê, ver
+   `_TABELA_LEADS`/`_TABELA_HISTORICO`) e anote:
+   - contagem de linhas das duas tabelas;
+   - `max(last_interaction_at)` de `leads_crm` (ex.: `select
+     max(last_interaction_at) from leads_crm;` direto no Supabase, via SQL
+     Editor do painel ou `psql`).
+
+   O próprio dry-run do passo 4, adiantado, também serve — ele já imprime
+   `max(last_interaction_at) entre os leads migrados` no resumo. É a
+   referência para o passo 7 comparar depois, e é a prova de que a origem —
+   seu caminho de volta — está onde deveria.
 
 **Como saber que deu certo:** você tem um arquivo `.sql.gz` de backup fora do
-Railway, e uma contagem anotada do Supabase.
+Railway **com a contagem de `leads_crm` do dump conferida contra o banco**
+(não só o arquivo existindo — ver o critério da própria seção de backup em
+`docs/RAILWAY.md`), e uma contagem de linhas **e** um `max(last_interaction_
+at)` anotados do Supabase.
 
 **Se der errado:** não prossiga. Backup falho não é motivo para pular —
 resolva antes de continuar.
 
 ### Passo 2 — `preflight_cutover.py`
 
+Roda contra o ambiente que vai virar produção. **`railway run --service
+worker uv run python scripts/preflight_cutover.py`, sozinho, NÃO funciona**
+— `railway run` executa o comando na SUA máquina, só injetando as variáveis
+do serviço `worker`, e `DATABASE_URL` entre elas é a reference variable
+interna (`...@db.railway.internal:5432/...`), que só resolve dentro da rede
+privada do Railway. "Copiar o `.env` localmente" tem o mesmo defeito: o
+valor copiado é esse mesmo host interno. Sem corrigir isso, este passo trava
+até dar timeout de conexão — com o n8n já potencialmente desligado (se você
+pulou a ordem e já fez o passo 3), essa é a pior hora para descobrir isso.
+
+Siga `docs/RAILWAY.md`, seção "Como alcançar o Postgres de produção de fora
+do Railway", **antes** de rodar este passo — ela monta a `DATABASE_URL`
+pública via TCP Proxy. Com isso feito:
+
 ```bash
-uv run python scripts/preflight_cutover.py
+railway run --service worker env DATABASE_URL="$DATABASE_URL_PUBLICA" \
+  uv run python scripts/preflight_cutover.py
 ```
 
-Roda contra o ambiente que vai virar produção (aponte `DATABASE_URL` e as
-demais variáveis para o Railway — via `railway run --service worker uv run
-python scripts/preflight_cutover.py`, ou copiando o `.env` localmente).
 Imprime uma tabela com as doze checagens e termina com código de saída `0`
 só se todas passarem.
 
@@ -154,8 +190,16 @@ contra dado parado". Resolva o desligamento primeiro.
 
 ### Passo 4 — `migrar_supabase.py` (dry-run)
 
+Mesma ressalva de alcance do passo 2: rode com a `DATABASE_URL` pública já
+montada (`docs/RAILWAY.md`, "Como alcançar o Postgres de produção de fora do
+Railway") — `migrar_supabase.py` também abre um pool contra `DATABASE_URL`
+para gravar em modo `--executar` (passo 6) e, mesmo em dry-run, precisa de
+`SUPABASE_URL`/`SUPABASE_SERVICE_ROLE_KEY` (do serviço `worker`) para ler a
+origem:
+
 ```bash
-uv run python scripts/migrar_supabase.py
+railway run --service worker env DATABASE_URL="$DATABASE_URL_PUBLICA" \
+  uv run python scripts/migrar_supabase.py
 ```
 
 Sem argumento = `--dry-run`, o padrão. Lê o Supabase inteiro (paginado,
@@ -171,7 +215,10 @@ o passo 5 resolve.
 `--dry-run (padrão): nada foi gravado. Revise o relatório e rode de novo com
 --executar quando estiver pronto.` Os totais no relatório fazem sentido
 (ordem de grandeza esperada: ~3.373 leads, ~8.920 mensagens de histórico,
-salvo o que mudou desde a última vez que esse número foi medido).
+salvo o que mudou desde a última vez que esse número foi medido). O resumo
+(stdout e `relatorio_migracao.md`) também imprime `max(last_interaction_at)
+entre os leads migrados` — anote esse valor junto com o que você já anotou
+no passo 1: é o segundo lado da comparação do passo 7.
 
 **Se der errado:** erro de rede/paginação sai com `ERRO:` no stderr e nunca
 vaza a credencial do Supabase — corrija e rode de novo, é só leitura. Se os
@@ -222,8 +269,12 @@ não deixar passar batido.
 
 ### Passo 6 — `migrar_supabase.py --executar`
 
+Mesma `DATABASE_URL` pública do passo 4/2 (ela precisa ser a mesma sessão de
+terminal, ou re-monte com a receita de `docs/RAILWAY.md`):
+
 ```bash
-uv run python scripts/migrar_supabase.py --executar
+railway run --service worker env DATABASE_URL="$DATABASE_URL_PUBLICA" \
+  uv run python scripts/migrar_supabase.py --executar
 ```
 
 Roda a migração de verdade: grava em `leads_crm` e `legacy_chat_history`. As
@@ -235,6 +286,15 @@ algo não fechar — ver `MigracaoAbortada` no script.
 relatório do passo 4 (descontadas fusões — grupos fundidos viram uma linha
 só). Código de saída `0`.
 
+Logo em seguida, o processo imprime uma linha própria: `Linha de base para o
+monitoramento da primeira hora (passo 11): M lead(s) com agent_active=false
+agora.` **ANOTE esse número M** — é o argumento obrigatório
+(`--linha-de-base-handover M`) que `scripts/monitorar_cutover.py` (passo 11)
+precisa para medir quantos handovers novos acontecem depois do cutover (ver
+"Monitoramento da primeira hora" abaixo, item 4 — a métrica não tem como
+funcionar sem esse número, e não existe um default seguro para "esqueci de
+anotar").
+
 **Se der errado:** uma validação que aborta sai com `ERRO:` e **nenhuma
 linha foi gravada** — o script foi desenhado para isso ser tudo-ou-nada.
 Volte ao passo 5, entenda o que a validação apontou, ajuste e rode de novo.
@@ -242,14 +302,31 @@ Não force uma segunda tentativa sem entender por que a primeira abortou.
 
 ### Passo 7 — Conferir `max(last_interaction_at)`
 
-```sql
-select max(last_interaction_at) from leads_crm;
+Com a `DATABASE_URL` pública ainda ativa na sessão (passo 2), rode via
+`psql`:
+
+```bash
+railway run --service db bash -c '
+  psql -h "$RAILWAY_TCP_PROXY_DOMAIN" -p "$RAILWAY_TCP_PROXY_PORT" \
+    -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
+    -tAc "select max(last_interaction_at) from leads_crm;"
+'
 ```
 
-Compare com o `max(last_interaction_at)` que você tinha anotado do Supabase
-(passo 1) e com o que o relatório do passo 4 registrou. Os dois precisam
-bater — é a evidência de que a migração pegou o dado mais recente, e não uma
-foto velha por algum problema de paginação ou cache.
+Compare o resultado com **os dois lados** que já existem neste ponto do
+roteiro:
+
+1. **O que você anotou no passo 1** — o `max(last_interaction_at)` que você
+   leu direto do Supabase (`leads_crm`) antes de qualquer coisa, ou o do
+   dry-run adiantado do passo 4.
+2. **O que o passo 4/6 registrou** — o resumo de `migrar_supabase.py`
+   (stdout e `relatorio_migracao.md`) imprime `max(last_interaction_at)
+   entre os leads migrados`; é o mesmo valor calculado em memória, ANTES da
+   escrita.
+
+Os três (Postgres agora, passo 1, passo 4/6) precisam bater — é a evidência
+de que a migração pegou o dado mais recente, e não uma foto velha por algum
+problema de paginação ou cache.
 
 **Como saber que deu certo:** o valor bate (mesmo timestamp, ou diferença
 explicável pelo tempo que passou entre a medição do passo 1 e agora).
@@ -280,9 +357,13 @@ Confirme os eventos habilitados incluem o de mensagem recebida (`messages.
 upsert` ou variação do nome — ver `docs/EVOLUTION.md`).
 
 **Como saber que deu certo:** mande uma mensagem de teste (de um número que
-não seja lead real) e confira em `message_queue` (via pgweb ou psql) que uma
-linha nova apareceu com `channel = 'evolution'`. Ainda não precisa
-responder — isso é o passo 10.
+não seja lead real) e confira em `message_queue` que uma linha nova
+apareceu com `channel = 'evolution'` — via `/queue` do admin panel
+(`https://<frontend>/queue`, não precisa de TCP Proxy nem `psql`) ou via
+`psql` direto (TCP Proxy — ver `docs/RAILWAY.md`; **não pgweb** — este
+projeto não roda pgweb no Railway, é exclusivo do deploy self-hosted em
+VPS/Traefik, ver `deploy/README.md`). Ainda não precisa responder — isso é o
+passo 10.
 
 **Se der errado:** se a mensagem não aparece na fila, confira primeiro se o
 webhook está mesmo salvo (alguns painéis da Evolution não persistem a
@@ -313,7 +394,9 @@ Até esta task ser desbloqueada e implementada:
 - **Combine com quem atende pelo ChatWoot** que a etiqueta `pausar_agente`
   não tem efeito nenhum hoje — o desligamento manual do agente, se
   necessário, precisa ser feito por outro caminho (ex: `agent_active=false`
-  direto no banco via pgweb, para um lead específico, até o webhook existir).
+  direto no banco via `psql`, TCP Proxy — ver `docs/RAILWAY.md`; este
+  projeto não roda pgweb no Railway — para um lead específico, até o
+  webhook existir).
 - Não anuncie a etiqueta como funcional para a equipe de atendimento antes
   da Task 5 da Fase 3 estar concluída e testada.
 
@@ -356,9 +439,17 @@ para o passo 11 com o teste de fumaça vermelho.
 ### Passo 11 — Monitorar a primeira hora
 
 Ver `scripts/monitorar_cutover.py` e a seção "Monitoramento da primeira
-hora" abaixo. Mantenha a fila à vista — literalmente, um terminal rodando o
-script em intervalos, ou a aba SQL do pgweb aberta — durante pelo menos a
-primeira hora de tráfego real.
+hora" abaixo. Exige `--linha-de-base-handover M`, o número que o passo 6
+mandou anotar — mesma `DATABASE_URL` pública das etapas anteriores:
+
+```bash
+railway run --service worker env DATABASE_URL="$DATABASE_URL_PUBLICA" \
+  uv run python scripts/monitorar_cutover.py --linha-de-base-handover M
+```
+
+Mantenha a fila à vista — literalmente, um terminal rodando o script em
+intervalos, ou `psql` aberto contra a `DATABASE_URL` pública (TCP Proxy) —
+durante pelo menos a primeira hora de tráfego real.
 
 ### Passo 12 — `FOLLOWUP_ENABLED` — decisão separada, não hoje
 
@@ -407,10 +498,13 @@ Quando alguém decidir ligar `FOLLOWUP_ENABLED=true`:
 
 ## Monitoramento da primeira hora
 
-Ver `scripts/monitorar_cutover.py` para as métricas automatizadas. Rode:
+Ver `scripts/monitorar_cutover.py` para as métricas automatizadas. Rode (com
+a `DATABASE_URL` pública das etapas anteriores, e `M` = o número que o passo
+6 mandou anotar):
 
 ```bash
-uv run python scripts/monitorar_cutover.py
+railway run --service worker env DATABASE_URL="$DATABASE_URL_PUBLICA" \
+  uv run python scripts/monitorar_cutover.py --linha-de-base-handover M
 ```
 
 Ele imprime uma tabela com seis medições e, ao final, se algum limiar de
@@ -464,19 +558,38 @@ verdade (uma campanha ativa, por exemplo) é bom sinal de negócio, não de
 sistema quebrado. Tratar como alerta para investigar, cruzando com a métrica
 5 (taxa de fallback) e a 4 (handover) antes de decidir.
 
-### 4. `agent_active = false` entre os leads criados na última hora
+### 4. Handover acumulado desde a linha de base do passo 6
 
-O que é: dos leads com `created_at` na última hora (métrica 3), quantos já
-têm `agent_active = false`.
+O que é: `count(*) where not agent_active` em `leads_crm` **agora**, menos
+`--linha-de-base-handover M` (o mesmo `count(*)`, medido e impresso por
+`migrar_supabase.py --executar` logo após gravar). O delta é a contagem de
+handovers novos desde o cutover.
 
-**O que deveria ser:** próximo de zero. Um lead recém-chegado sendo
-desligado do agente quase imediatamente é sinal de handover disparando
-demais — a Renata travando em algo (erro de tool, resposta fora do SOP) e
-caindo no caminho de desligamento como consequência.
+**Por que não é "entre os leads criados na última hora" (a versão original
+desta métrica):** `leads_crm` não tem `updated_at` — nenhuma coluna diz
+"quando `agent_active` virou `false`" — e `human_handover` deixa
+`agent_reactivate_at` `NULL` de propósito (não é um timestamp substituto).
+Escopar por `created_at`, como a primeira versão desta métrica fazia, mede
+uma população **vazia por construção** depois de uma migração: os leads
+importados vêm com `created_at` **preservado** do Supabase (o mais antigo
+entre linhas fundidas, nunca `now()`), então nenhum lead migrado tem
+`created_at` "na última hora" — a métrica ficava sempre `ok, 0/0` mesmo com
+dezenas de leads pausados, cega bem na janela em que mais importa (a
+primeira hora). Comparar dois `count(*)` absolutos, sem depender de nenhuma
+coluna de tempo, é o que resolve isso.
 
-**Motivo para reverter:** taxa de 50% ou mais entre os leads novos da
-janela, com pelo menos 3 leads novos na amostra (amostra menor que isso é
-ruído, não padrão).
+**O que deveria ser:** delta próximo de zero. Um salto no número de leads
+pausados logo depois do cutover é sinal de handover disparando demais — a
+Renata travando em algo (erro de tool, resposta fora do SOP) e caindo no
+caminho de desligamento como consequência. `FOLLOWUP_ENABLED=false` no dia
+(ver "O que NÃO ligar no dia" acima) garante que nada religa `agent_active`
+sozinho nessa janela, então o delta só deveria crescer — uma queda seria
+sinal de alguém reativando um lead manualmente via `psql`, não um bug desta
+métrica.
+
+**Motivo para reverter:** delta de 5 ou mais handovers novos desde a linha
+de base. 1 a 4 fica em atenção (um handover isolado — lead pedindo humano,
+por exemplo — é esperado e não é sozinho motivo de reversão).
 
 ### 5. Taxa de fallback de balão único
 

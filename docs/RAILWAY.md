@@ -343,22 +343,133 @@ o cutover precisar ser desfeito, o Supabase continua exatamente como estava,
 e o caminho de volta é religar o n8n contra ele (ver `docs/CUTOVER.md`,
 "Plano de volta").
 
+### Como alcançar o Postgres de produção de fora do Railway
+
+Todo comando deste documento e de `docs/CUTOVER.md` que precisa falar com o
+Postgres de produção **a partir do seu laptop** — `preflight_cutover.py`,
+`migrar_supabase.py`, `monitorar_cutover.py`, `pg_dump`/`psql` do backup —
+esbarra no mesmo problema se você não ler esta seção primeiro.
+
+**O problema:** `DATABASE_URL` (a reference variable da seção "Rede Interna"
+acima) resolve para `postgresql://...@db.railway.internal:5432/...` —
+`db.railway.internal` só existe dentro da rede privada do Railway, entre os
+serviços do próprio projeto. `railway run --service <x> <comando>` **executa
+o `<comando>` NA SUA MÁQUINA**, só injetando as variáveis de ambiente do
+serviço `<x>` — inclusive a `DATABASE_URL` privada. O resultado, rodando um
+script que lê `DATABASE_URL` desse jeito no seu laptop: a conexão trava até
+dar timeout (o host não resolve fora da rede do Railway), não um erro óbvio
+de "host errado".
+
+**O mecanismo certo é o TCP Proxy**, não `railway run` sozinho nem `railway
+connect` (este último abre um shell **interativo** — ótimo para cutucar o
+banco na mão com `psql`, inútil para os scripts Python deste projeto ou para
+`pg_dump`/`psql` num pipe não-interativo):
+
+1. **Habilite o TCP Proxy no serviço `db`, uma vez** (fica permanente —
+   dashboard: Service `db` → Settings → Networking → TCP Proxy → porta
+   `5432`; ou via CLI):
+
+   ```bash
+   railway tcp-proxy create --port 5432 --service db
+   ```
+
+   Isso expõe três variáveis novas no **próprio serviço `db`**:
+   `RAILWAY_TCP_PROXY_DOMAIN` (algo como `roundhouse.proxy.rlwy.net`),
+   `RAILWAY_TCP_PROXY_PORT` (uma porta externa, não `5432`) e
+   `RAILWAY_TCP_PROXY_APPLICATION_PORT`. **Não confunda com
+   `DATABASE_PUBLIC_URL`** — essa variável é gerada automaticamente só para
+   os plugins de Postgres *gerenciados* pelo Railway (ex.: "PostgreSQL HA");
+   `db` aqui é um serviço customizado (`Dockerfile.db`), então a URL pública
+   não existe pronta — você monta com as três variáveis acima mais as
+   credenciais que já existem (`POSTGRES_USER`/`POSTGRES_PASSWORD`/
+   `POSTGRES_DB`).
+
+2. **Monte a `DATABASE_URL` pública** — `railway run --service db` injeta
+   as credenciais do banco **e**, com o proxy do passo 1 já criado, as três
+   variáveis do TCP Proxy, tudo como env vars locais no comando que você
+   passar a ele:
+
+   ```bash
+   export DATABASE_URL_PUBLICA=$(railway run --service db bash -c '
+     echo "postgresql://$POSTGRES_USER:$POSTGRES_PASSWORD@$RAILWAY_TCP_PROXY_DOMAIN:$RAILWAY_TCP_PROXY_PORT/$POSTGRES_DB"
+   ')
+   ```
+
+   `$DATABASE_URL_PUBLICA` fica exportada na sua sessão de terminal — é o
+   valor que `preflight_cutover.py`/`migrar_supabase.py`/
+   `monitorar_cutover.py` precisam em `DATABASE_URL` para rodar do laptop.
+   Vale só para essa sessão de shell; se abrir um terminal novo, rode este
+   passo de novo.
+
+3. **Rode os scripts sobrescrevendo `DATABASE_URL`** — as demais variáveis
+   (Evolution, Google, Pipedrive, OpenRouter, `HANDOVER_NOTIFY_PHONE`...)
+   continuam vindo do serviço `worker`; só `DATABASE_URL` precisa ser a
+   pública, não a privada que `railway run --service worker` injetaria por
+   padrão:
+
+   ```bash
+   railway run --service worker env DATABASE_URL="$DATABASE_URL_PUBLICA" \
+     uv run python scripts/preflight_cutover.py
+   ```
+
+   `env VAR=valor comando` sobrescreve `VAR` só para aquele `comando`
+   específico — mesmo o `railway run` já tendo exportado a `DATABASE_URL`
+   privada do `worker` antes disso, o `env` na frente do comando final vence
+   para esse processo.
+
+Isso vale para os **três** scripts de cutover (`preflight_cutover.py`
+roda no passo 2 do roteiro, `migrar_supabase.py` nos passos 4 e 6,
+`monitorar_cutover.py` no passo 11) e para `pg_dump`/`psql` do backup
+abaixo — nenhum deles alcança produção sem essa URL pública.
+
 ### Backup do volume do Postgres antes do cutover
 
 O volume do serviço `db` no Railway é o dado real depois do cutover — trate
-como trataria qualquer banco de produção. Duas formas, use as duas:
+como trataria qualquer banco de produção. Duas formas, use as duas.
 
-**1. Backup lógico (`pg_dump`), antes de rodar a migração:**
+**1. Backup lógico (`pg_dump`), antes de rodar a migração** — com o TCP
+Proxy já habilitado (seção acima). `railway run --service db` roda o
+`pg_dump`/`psql` **na sua máquina**, não dentro do Railway, e a Railway
+**não injeta `PGHOST`/`PGPORT`** — sem `-h`/`-p` explícitos, o comando ou
+falha em conectar, ou, se você tiver um Postgres local escutando na 5432,
+**dumpa esse banco local em silêncio**, sem erro nenhum, produzindo um
+`.sql.gz` que parece válido mas não é o de produção. Os dois `-h`/`-p`
+abaixo fecham essa lacuna — e, como defesa adicional, o passo conta linhas
+de `leads_crm` ANTES do dump e confere que o dump carrega a mesma contagem,
+porque um arquivo `.sql.gz` existir não prova, sozinho, que veio do banco
+certo:
 
 ```bash
-railway run --service db pg_dump \
-  -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
-  | gzip > "backup-pre-cutover-$(date +%Y%m%d-%H%M).sql.gz"
+ARQUIVO="backup-pre-cutover-$(date +%Y%m%d-%H%M).sql.gz"
+
+railway run --service db bash -c '
+  set -euo pipefail
+  CONTAGEM_ANTES=$(psql -h "$RAILWAY_TCP_PROXY_DOMAIN" -p "$RAILWAY_TCP_PROXY_PORT" \
+    -U "$POSTGRES_USER" -d "$POSTGRES_DB" -tAc "select count(*) from leads_crm")
+  echo "leads_crm no banco: $CONTAGEM_ANTES linha(s)"
+
+  pg_dump -h "$RAILWAY_TCP_PROXY_DOMAIN" -p "$RAILWAY_TCP_PROXY_PORT" \
+    -U "$POSTGRES_USER" -d "$POSTGRES_DB" | gzip > "'"$ARQUIVO"'"
+
+  CONTAGEM_NO_DUMP=$(gunzip -c "'"$ARQUIVO"'" \
+    | awk "/^COPY public\.leads_crm /{c=1;next} \$0==\"\\\\.\"{c=0} c{n++} END{print n+0}")
+  echo "leads_crm no dump: $CONTAGEM_NO_DUMP linha(s)"
+
+  [ "$CONTAGEM_ANTES" = "$CONTAGEM_NO_DUMP" ] || {
+    echo "ERRO: contagem não bate ($CONTAGEM_ANTES no banco, $CONTAGEM_NO_DUMP no dump)"
+    echo "-- o dump pode ter vindo do banco errado. NÃO trate como backup válido."
+    exit 1
+  }
+'
 ```
 
 Guarde esse arquivo fora do Railway (download local, ou upload pra storage
 externo) — um backup que só existe dentro do mesmo projeto que você está
 prestes a mexer não protege contra um erro de operação no próprio Railway.
+
+**Como saber que deu certo:** você tem um `.sql.gz` fora do Railway **e** a
+mensagem confirma que a contagem de `leads_crm` no dump bate com a do banco
+no momento do backup — não só que o arquivo existe.
 
 **2. Snapshot do volume**, pelo dashboard do Railway (Service `db` →
 Volume → Backups/Snapshots, se o plano contratado oferecer). Cheque a
@@ -366,11 +477,14 @@ disponibilidade dessa opção no plano atual antes do cutover — nem todo plano
 Railway oferece snapshot de volume; se o seu não oferecer, o `pg_dump` acima
 é o único backup e precisa ser tratado como tal (testado, restaurável).
 
-Restore do `pg_dump`:
+Restore do `pg_dump` — mesma correção de `-h`/`-p` explícitos:
 
 ```bash
 gunzip -c backup-pre-cutover-XXXX.sql.gz | \
-  railway run --service db psql -U "$POSTGRES_USER" -d "$POSTGRES_DB"
+  railway run --service db bash -c '
+    psql -h "$RAILWAY_TCP_PROXY_DOMAIN" -p "$RAILWAY_TCP_PROXY_PORT" \
+      -U "$POSTGRES_USER" -d "$POSTGRES_DB"
+  '
 ```
 
 ---
@@ -611,8 +725,9 @@ Opcional em ambientes compartilhados:
 14. Testar health check: `GET https://api-*.up.railway.app/health`
 15. Definir `ADMIN_EMAIL` e `ADMIN_PASSWORD` no serviço `frontend`
 16. Acessar `/login`, validar o bootstrap automático do primeiro admin e trocar a senha
-17. Backup do volume do `db` (seção acima) — **antes** de qualquer coisa que toque produção
-18. Seguir `docs/CUTOVER.md` para o roteiro completo de corte (rodar `preflight_cutover.py`, desligar n8n, migrar dados, repontar webhook)
+17. Habilitar o TCP Proxy no serviço `db` (`railway tcp-proxy create --port 5432 --service db` — ver "Como alcançar o Postgres de produção de fora do Railway" acima) — pré-requisito para o passo 18 e para o roteiro de cutover conseguirem falar com o Postgres a partir de um laptop
+18. Backup do volume do `db` (seção acima) — **antes** de qualquer coisa que toque produção
+19. Seguir `docs/CUTOVER.md` para o roteiro completo de corte (rodar `preflight_cutover.py`, desligar n8n, migrar dados, repontar webhook)
 
 > Este checklist cobre o **deploy da infraestrutura**. O corte de fato — desligar
 > o n8n, migrar os dados do Supabase, repontar o webhook e monitorar a
