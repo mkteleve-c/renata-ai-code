@@ -1,0 +1,441 @@
+"""Cliente outbound da Evolution API.
+
+A instância desta conta roda integração WHATSAPP-BUSINESS — por baixo é a
+Meta Cloud API oficial, com a Evolution fazendo de proxy. A superfície REST
+é a mesma da integração Baileys. Por rodar sobre a Cloud API oficial, o teto
+de 4096 caracteres por mensagem de texto é confirmado (não uma estimativa
+prática como na uazapi) — mensagens acima disso são quebradas em partes.
+
+Não há "digitando…" neste canal, e isso é uma limitação da integração, não
+uma escolha nossa. Na integração Baileys o `delay` do sendText emite
+presença `composing` durante a espera; na WHATSAPP-BUSINESS o serviço
+equivalente (`whatsapp.business.service.ts`) recebe `{delay, presence}` dos
+callers e **descarta os dois** — `sendMessageWithTyping` posta direto em
+`/messages` — e `sendPresence()` lança
+`BadRequestException('Method not available on WhatsApp Business API')`.
+
+Por isso send_typing é no-op: chamar o endpoint de presença renderia HTTP
+400 por mensagem, e passar `delay` não produziria indicador nenhum. O
+parâmetro `delay_ms` continua exposto porque funciona em instâncias Baileys.
+
+Mídia recebida nesta integração NÃO vem criptografada: a `url` do payload
+aponta para `lookaside.fbsbx.com` e responde a um GET com a apikey da
+instância em `Authorization: Bearer` (ver `worker/media.py`). Quem baixa é
+o `download_media`, não este cliente. `baixar_midia` continua aqui como
+caminho de instância Baileys — ver a docstring do método.
+
+Suporta `delivery_mode="mock"` para simular envio sem consumir a API real.
+"""
+
+import base64
+import binascii
+from typing import Any
+
+import httpx
+import structlog
+
+logger = structlog.get_logger()
+
+TIMEOUT = httpx.Timeout(30.0)
+
+# A integração WHATSAPP-BUSINESS é proxy direto da Cloud API oficial da Meta,
+# que tem teto confirmado de 4096 caracteres por mensagem de texto.
+EVOLUTION_TEXT_BODY_LIMIT = 4096
+
+
+class EvolutionSendError(Exception):
+    """Erro ao enviar mensagem ou baixar mídia via Evolution API."""
+
+    def __init__(self, status_code: int, detail: str):
+        self.status_code = status_code
+        self.detail = detail
+        super().__init__(f"Evolution respondeu {status_code}: {detail}")
+
+
+class EvolutionClient:
+    """Cliente assíncrono para envio via Evolution API.
+
+    Args:
+        base_url: URL base da instância Evolution (ex: https://evolution.host).
+        api_key: apikey da instância — autentica envio e download de mídia.
+        instance: nome da instância (fixa por deploy).
+        delivery_mode: "real" (envia) ou "mock" (simula).
+    """
+
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str,
+        instance: str,
+        delivery_mode: str = "real",
+    ):
+        if delivery_mode not in {"real", "mock"}:
+            raise ValueError(
+                f"delivery_mode deve ser 'real' ou 'mock', recebido: {delivery_mode}"
+            )
+
+        if delivery_mode == "real" and not (base_url and api_key and instance):
+            raise ValueError(
+                "base_url, api_key e instance são obrigatórios em modo real"
+            )
+
+        self.base_url = base_url.rstrip("/")
+        self.api_key = api_key
+        self.instance = instance
+        self.delivery_mode = delivery_mode
+        self._transport: httpx.AsyncBaseTransport | None = None
+
+    def _headers(self) -> dict[str, str]:
+        return {"apikey": self.api_key, "Content-Type": "application/json"}
+
+    async def send_message(
+        self,
+        to: str,
+        body: str,
+        token: str | None = None,
+        delay_ms: int = 0,
+    ) -> str | None:
+        """Envia mensagem de texto via /message/sendText. Retorna o id, se houver.
+
+        Mensagens acima de `EVOLUTION_TEXT_BODY_LIMIT` são quebradas em
+        partes e enviadas em sequência, preservando a ordem. O retorno é o
+        `id` da última parte enviada — mesmo precedente do `last_id` em
+        `uazapi_client.send_message`.
+
+        Resposta 2xx sem id reconhecível devolve `None`, não exceção: a
+        mensagem já saiu, e falhar aqui faria o processor reenviar tudo.
+
+        `token` é ignorado — a Evolution autentica pela apikey da instância,
+        não por um token entregue por mensagem como a uazapi. O parâmetro
+        existe só para manter a assinatura compatível com os outros clientes
+        outbound (duck typing no processor).
+
+        `delay_ms` vai no payload quando maior que zero, mas só tem efeito em
+        instâncias Baileys — a integração WHATSAPP-BUSINESS descarta o campo
+        (ver docstring do módulo). O processor não o passa hoje.
+        """
+        if self.delivery_mode == "mock":
+            logger.info("evolution_mock_send", to=to, body=body[:80])
+            return None
+
+        chunks = split_message_body(body, limit=EVOLUTION_TEXT_BODY_LIMIT)
+        chunk_count = len(chunks)
+
+        if chunk_count > 1:
+            logger.info(
+                "evolution_message_chunked",
+                to=to,
+                original_length=len(body),
+                chunk_count=chunk_count,
+            )
+
+        normalized_to = to.lstrip("+")
+        last_id: str | None = None
+
+        async with httpx.AsyncClient(
+            transport=self._transport, timeout=TIMEOUT
+        ) as client:
+            for idx, chunk in enumerate(chunks, start=1):
+                payload: dict[str, Any] = {"number": normalized_to, "text": chunk}
+                if delay_ms:
+                    payload["delay"] = delay_ms
+
+                response = await client.post(
+                    f"{self.base_url}/message/sendText/{self.instance}",
+                    headers=self._headers(),
+                    json=payload,
+                )
+
+                if response.status_code >= 400:
+                    detail = response.text[:500]
+                    logger.error(
+                        "evolution_send_failed",
+                        to=normalized_to,
+                        status_code=response.status_code,
+                        detail=detail,
+                        chunk_index=idx,
+                        chunk_count=chunk_count,
+                    )
+                    raise EvolutionSendError(response.status_code, detail)
+
+                # 2xx é entrega feita. Levantar aqui derrubava o processor no
+                # `except Exception` genérico → mark_failed → retry → o lead
+                # recebia a mesma mensagem de novo, já tendo recebido a
+                # primeira. O `id` não é consumido por ninguém (o processor
+                # descarta o retorno), então corpo irreconhecível é warning,
+                # não erro.
+                last_id = _extract_message_id(_safe_json(response))
+                if last_id is None:
+                    logger.warning(
+                        "evolution_send_sem_id",
+                        to=normalized_to,
+                        status_code=response.status_code,
+                        body=response.text[:500],
+                        chunk_index=idx,
+                        chunk_count=chunk_count,
+                    )
+
+                logger.info(
+                    "evolution_message_sent",
+                    to=normalized_to,
+                    id=last_id,
+                    chunk_index=idx,
+                    chunk_count=chunk_count,
+                )
+
+        return last_id
+
+    async def send_template(
+        self,
+        to: str,
+        template: str,
+        parametro_header: str | None = None,
+        language: str = "pt_BR",
+    ) -> str | None:
+        """Envia template aprovado via /message/sendTemplate. Retorna o id, se houver.
+
+        Texto livre (`send_message`) só alcança quem escreveu nas últimas 24h
+        — fora dessa janela a Meta rejeita o envio, não atrasa. Um lead vindo
+        de formulário nunca abriu essa janela, e é o template que a abre.
+
+        **Sem chamador nesta fase, de propósito.** O cutover que troca o
+        follow-up de texto livre por template depende de o cliente aprovar
+        na Meta um template de retomada — hoje só existem dois de boas-vindas.
+        Quem vai chamar é o fluxo de follow-up da Fase 5, quando esse
+        template existir.
+
+        `parametro_header` vira o parâmetro de texto do componente `header`
+        do template. Quando `None`, `components` sai como lista vazia — não
+        se inventa um placeholder para um template que não pediu variável.
+
+        Mesma precedência de `send_message`: 2xx sem id reconhecível devolve
+        `None`; não-2xx levanta `EvolutionSendError`.
+        """
+        if self.delivery_mode == "mock":
+            logger.info("evolution_mock_send_template", to=to, template=template)
+            return None
+
+        normalized_to = to.lstrip("+")
+        components: list[dict[str, Any]] = []
+        if parametro_header is not None:
+            components.append(
+                {
+                    "type": "header",
+                    "parameters": [{"type": "text", "text": parametro_header}],
+                }
+            )
+
+        payload = {
+            "number": normalized_to,
+            "language": language,
+            "name": template,
+            "components": components,
+        }
+
+        async with httpx.AsyncClient(
+            transport=self._transport, timeout=TIMEOUT
+        ) as client:
+            response = await client.post(
+                f"{self.base_url}/message/sendTemplate/{self.instance}",
+                headers=self._headers(),
+                json=payload,
+            )
+
+        if response.status_code >= 400:
+            detail = response.text[:500]
+            logger.error(
+                "evolution_send_template_failed",
+                to=normalized_to,
+                template=template,
+                status_code=response.status_code,
+                detail=detail,
+            )
+            raise EvolutionSendError(response.status_code, detail)
+
+        msg_id = _extract_message_id(_safe_json(response))
+        if msg_id is None:
+            logger.warning(
+                "evolution_send_template_sem_id",
+                to=normalized_to,
+                template=template,
+                status_code=response.status_code,
+                body=response.text[:500],
+            )
+
+        logger.info(
+            "evolution_template_sent", to=normalized_to, template=template, id=msg_id
+        )
+        return msg_id
+
+    async def send_typing(
+        self,
+        to: str,
+        message_id: str | None = None,
+        token: str | None = None,
+    ) -> bool:
+        """No-op deliberado: a integração WHATSAPP-BUSINESS não tem presença.
+
+        `/chat/sendPresence` lança "Method not available on WhatsApp Business
+        API" nessa integração, então uma chamada real seria HTTP 400 por
+        mensagem. Retorna False (nada enviado) sem tocar a rede — o processor
+        trata typing como best-effort e segue para o envio.
+        """
+        return False
+
+    async def baixar_midia(self, message_key: dict[str, Any]) -> bytes:
+        """Baixa e decifra mídia via /chat/getBase64FromMediaMessage.
+
+        **Sem chamador neste deploy, de propósito.** Numa instância Baileys
+        a URL do payload aponta para mídia criptografada em
+        `mmg.whatsapp.net` e este endpoint é a única via — ele decifra com a
+        `mediaKey` que a Evolution guardou. Na integração WHATSAPP-BUSINESS
+        desta conta nada disso existe: a URL é aberta e `download_media` faz
+        um GET nela.
+
+        Fica no cliente porque este repositório é um template herdado por
+        clientes que rodam Baileys: para eles, o conserto é trocar o ramo da
+        Evolution em `download_media` por uma chamada a este método, com a
+        `provider_message_key` que a fila já persiste. Removê-lo obrigaria a
+        reescrever (e re-verificar) o parsing de base64 e o tratamento de
+        erro que já estão testados aqui.
+
+        Em `delivery_mode="mock"` não há o que simular: o download é uma
+        chamada real à Evolution, e devolver bytes falsos levaria a uma
+        chamada multimodal ao LLM. Levanta em vez de sair pela rede.
+        """
+        if self.delivery_mode == "mock":
+            logger.info("evolution_mock_download", message_key=message_key)
+            raise RuntimeError(
+                "download de mídia da Evolution não acontece em "
+                "delivery_mode=mock — rode com OUTBOUND_MODE=real para "
+                "exercitar getBase64FromMediaMessage"
+            )
+
+        async with httpx.AsyncClient(
+            transport=self._transport, timeout=TIMEOUT
+        ) as client:
+            response = await client.post(
+                f"{self.base_url}/chat/getBase64FromMediaMessage/{self.instance}",
+                headers=self._headers(),
+                json={"message": {"key": message_key}, "convertToMp4": False},
+            )
+
+        if response.status_code >= 400:
+            detail = response.text[:500]
+            logger.error(
+                "evolution_download_failed",
+                status_code=response.status_code,
+                detail=detail,
+            )
+            raise EvolutionSendError(response.status_code, detail)
+
+        dados = _safe_json(response)
+        if not isinstance(dados, dict):
+            detail = f"corpo inesperado (não é objeto JSON): {response.text[:500]!r}"
+            logger.error(
+                "evolution_download_invalid_response",
+                status_code=response.status_code,
+                detail=detail,
+            )
+            raise EvolutionSendError(response.status_code, detail)
+
+        b64 = dados.get("base64")
+        if not isinstance(b64, str) or not b64:
+            detail = f"resposta sem campo base64: {response.text[:500]!r}"
+            logger.error(
+                "evolution_download_missing_base64",
+                status_code=response.status_code,
+                detail=detail,
+            )
+            raise EvolutionSendError(response.status_code, detail)
+
+        try:
+            return base64.b64decode(b64, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            detail = f"base64 inválido: {exc}"
+            logger.error(
+                "evolution_download_invalid_base64",
+                status_code=response.status_code,
+                detail=detail,
+            )
+            raise EvolutionSendError(response.status_code, detail) from exc
+
+
+def _safe_json(response: httpx.Response) -> dict[str, Any] | list[Any] | None:
+    try:
+        return response.json()
+    except Exception:
+        return None
+
+
+def _extract_message_id(dados: Any, profundidade: int = 3) -> str | None:
+    """Id da mensagem em qualquer um dos shapes plausíveis da resposta.
+
+    O `POST /message/sendText` nunca foi exercitado contra o servidor real, e
+    na integração WHATSAPP-BUSINESS a Evolution faz proxy da Cloud API, cuja
+    resposta nativa é `{"messages":[{"id":"wamid..."}]}`. O wrapper pode
+    repassar esse shape, devolver o shape Baileys (`{"key":{"id":...}}`), ou
+    aninhar qualquer um dos dois em `data`. Extrair o id de todos é melhor
+    que devolver None — e nenhum deles é motivo para falhar o envio.
+    """
+    if profundidade <= 0 or not isinstance(dados, dict):
+        return None
+
+    key = dados.get("key")
+    if isinstance(key, dict):
+        msg_id = key.get("id")
+        if isinstance(msg_id, str) and msg_id:
+            return msg_id
+
+    mensagens = dados.get("messages")
+    if isinstance(mensagens, list):
+        for item in mensagens:
+            if isinstance(item, dict):
+                msg_id = item.get("id")
+                if isinstance(msg_id, str) and msg_id:
+                    return msg_id
+
+    interno = dados.get("data")
+    candidatos = interno if isinstance(interno, list) else [interno]
+    for candidato in candidatos:
+        achado = _extract_message_id(candidato, profundidade - 1)
+        if achado:
+            return achado
+
+    return None
+
+
+def split_message_body(body: str, limit: int = EVOLUTION_TEXT_BODY_LIMIT) -> list[str]:
+    """Divide mensagens longas para respeitar o limite da Cloud API (4096 chars)."""
+    if limit <= 0:
+        raise ValueError("limit deve ser maior que zero")
+
+    if len(body) <= limit:
+        return [body]
+
+    chunks: list[str] = []
+    remaining = body
+
+    while remaining:
+        if len(remaining) <= limit:
+            chunks.append(remaining)
+            break
+
+        split_at = -1
+        for sep in ("\n\n", "\n", " "):
+            idx = remaining.rfind(sep, 0, limit + 1)
+            if idx > 0:
+                split_at = idx
+                break
+
+        if split_at <= 0:
+            split_at = limit
+
+        chunk = remaining[:split_at].rstrip()
+        if not chunk:
+            chunk = remaining[:limit]
+
+        chunks.append(chunk)
+        remaining = remaining[len(chunk) :].lstrip()
+
+    return chunks

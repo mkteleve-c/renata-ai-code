@@ -130,6 +130,49 @@ async def verify_service_token(request: Request) -> None:
     logger.debug("service_token_valid", path=str(request.url.path))
 
 
+EVOLUTION_SECRET_HEADERS = ("X-Evolution-Webhook-Secret", "apikey")
+
+
+async def verify_evolution_webhook_secret(request: Request) -> None:
+    """Verifica o segredo do webhook da Evolution, quando configurado.
+
+    A Evolution não assina o body — não há HMAC para conferir como em
+    Twilio/Meta. O que existe é o header estático que o operador configura
+    no webhook da instância. Sem isso, qualquer POST com `fromMe: true`
+    desliga o agente para o telefone que quiser.
+
+    Opcional só em dev: `EVOLUTION_WEBHOOK_SECRET` vazio deixa a rota
+    aberta. Em produção com o canal Evolution configurado, a ausência (ou
+    um valor fraco) derruba o boot em `settings.validate_runtime_settings()`
+    — a rota nunca chega a subir aberta em produção.
+
+    Aceita o valor em `X-Evolution-Webhook-Secret` ou em `apikey` (o nome
+    que a própria Evolution usa nos headers dela).
+
+    Comparação em bytes: `hmac.compare_digest` sobre `str` levanta TypeError
+    se algum lado tem caractere fora de ASCII, e um header com acento viraria
+    500 — justamente a resposta que faz a Evolution reentregar em loop.
+
+    Raises:
+        HTTPException 401: Se o segredo está configurado e o header não bate.
+    """
+    esperado = settings.evolution_webhook_secret.strip()
+    if not esperado:
+        return
+
+    esperado_bytes = esperado.encode("utf-8")
+    for header in EVOLUTION_SECRET_HEADERS:
+        recebido = request.headers.get(header)
+        if recebido and hmac.compare_digest(
+            recebido.strip().encode("utf-8"), esperado_bytes
+        ):
+            logger.debug("evolution_webhook_secret_valido", header=header)
+            return
+
+    logger.warning("evolution_webhook_secret_invalido", path=str(request.url.path))
+    raise HTTPException(status_code=401, detail="Invalid Evolution webhook secret")
+
+
 async def check_rate_limit(phone_number: str) -> None:
     """Verifica rate limit por número de telefone.
 

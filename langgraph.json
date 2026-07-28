@@ -2,7 +2,8 @@
   "dependencies": ["."],
   "graphs": {
     "rhawk_assistant": "./src/whatsapp_langchain/agents/catalog/rhawk_assistant/graph.py:graph",
-    "illumi_assistant": "./src/whatsapp_langchain/agents/catalog/illumi_assistant/graph.py:graph"
+    "illumi_assistant": "./src/whatsapp_langchain/agents/catalog/illumi_assistant/graph.py:graph",
+    "elevec_sdr": "./src/whatsapp_langchain/agents/catalog/elevec_sdr/graph.py:graph"
   },
   "env": ".env"
 }

@@ -47,7 +47,38 @@ O PostgreSQL guarda três blocos de dados:
 
 ### `_migrations`
 
-Controle das migrações SQL locais (`db/migrations/*.sql`).
+Controle das migrações SQL locais (`db/migrations/*.sql`). O runner
+(`shared/db.py` e `db/migrate.py`) pula migração pelo **nome do arquivo** e não
+guarda checksum: editar uma migração já aplicada não tem efeito nenhum em banco
+existente. Migração aplicada é imutável — correção é arquivo novo.
+
+#### Migração que troca índice de `ON CONFLICT` exige parada, não rolling deploy
+
+As migrações rodam no **startup da API**. Uma migração que troca a chave de
+deduplicação da `message_queue` cria o índice novo e **dropa o antigo** — e o
+alvo do `ON CONFLICT` é resolvido no *planejamento* da query, não na colisão.
+Enquanto um container com o código **antigo** ainda estiver servindo depois de
+as migrações terem rodado, todo INSERT de `enqueue_or_buffer` falha com:
+
+```
+ERROR: there is no unique or exclusion constraint matching the
+       ON CONFLICT specification
+```
+
+Não é degradação de um canal: é **parada total de ingestão** em Twilio, Meta,
+uazapi e Evolution ao mesmo tempo, e a Evolution reentrega o que falha, então a
+janela vira fila de retentativa. Migrações nessa categoria até hoje:
+
+| Migração | Chave que passou a valer |
+|---|---|
+| `009_message_id_unico_por_canal` | `(channel, message_id)` |
+| `010_message_id_unico_por_agente` | `(channel, agent_id, message_id)` |
+| `012_dedupe_por_telefone_e_absorvidos` | `(channel, agent_id, phone_number, message_id)` |
+
+Ao subir uma versão que inclua uma dessas (ou qualquer nova que mexa no índice
+de dedupe): **derrube a API antiga antes de subir a nova**, em vez de deixar as
+duas conviverem. `deploy/scripts/deploy.sh` recria os containers, mas confira
+que nenhuma réplica antiga sobreviveu antes de considerar o deploy concluído.
 
 ### `message_queue`
 
@@ -66,7 +97,11 @@ Campos principais:
 - `status`: `queued | processing | done | failed`
 - `response`, `error`, `attempts`, `max_attempts`, `process_after`, `lease_until`
 
-Índices relevantes: `idx_queue_polling` (`status, process_after, created_at`), `idx_queue_phone_agent`, `idx_message_queue_channel`.
+- `message_ids_absorvidos`: ids que entraram na linha por debounce — o `UPDATE`
+  do debounce concatena texto e não grava `message_id`, então sem isto só a
+  primeira mensagem de uma rajada ficava protegida contra reentrega (mig 012)
+
+Índices relevantes: `idx_queue_polling` (`status, process_after, created_at`), `idx_queue_phone_agent`, `idx_message_queue_channel` e `idx_message_queue_dedupe` (único parcial em `channel, agent_id, phone_number, message_id` — ver o aviso de deploy em `_migrations`).
 
 ### `conversations`
 

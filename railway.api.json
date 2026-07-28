@@ -1,0 +1,21 @@
+{
+  "$schema": "https://railway.com/railway.schema.json",
+  "build": {
+    "builder": "DOCKERFILE",
+    "dockerfilePath": "Dockerfile.api",
+    "watchPatterns": [
+      "src/whatsapp_langchain/server/**",
+      "src/whatsapp_langchain/shared/**",
+      "pyproject.toml",
+      "uv.lock",
+      "Dockerfile.api"
+    ]
+  },
+  "deploy": {
+    "numReplicas": 1,
+    "healthcheckPath": "/health",
+    "healthcheckTimeout": 30,
+    "restartPolicyType": "ON_FAILURE",
+    "restartPolicyMaxRetries": 5
+  }
+}

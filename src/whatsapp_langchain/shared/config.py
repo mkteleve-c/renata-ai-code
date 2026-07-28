@@ -13,10 +13,19 @@ A maior parte das configurações tem defaults sensatos para desenvolvimento loc
 Segredos compartilhados do painel/admin devem ser preenchidos explicitamente.
 """
 
-from pydantic import SecretStr
+from pydantic import SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from whatsapp_langchain.shared.phone import canonicalizar
+
 MIN_PRODUCTION_SECRET_LENGTH = 32
+
+# Formas aceitas para FOLLOWUP_ENABLED além do `true`/`false` nativo do
+# pydantic — o valor nativo já rejeita até `" false "` com espaço (ver
+# `_parse_followup_enabled`), e um projeto em português tem `nao`/`sim`
+# como erro de digitação plausível para quem preenche o .env.
+_FOLLOWUP_ENABLED_VERDADEIRO = {"true", "1", "yes", "on", "sim", "verdadeiro"}
+_FOLLOWUP_ENABLED_FALSO = {"false", "0", "no", "off", "nao", "não", "falso"}
 
 
 class Settings(BaseSettings):
@@ -93,6 +102,41 @@ class Settings(BaseSettings):
     uazapi_base_url: str = ""
     uazapi_instance_token: str = ""
 
+    # --- Evolution API (integração WHATSAPP-BUSINESS: Meta Cloud API por baixo) ---
+    # A instância é fixa por deploy; o apikey autentica tanto o envio quanto o
+    # download de mídia decifrada.
+    evolution_base_url: str = ""
+    evolution_api_key: str = ""
+    evolution_instance: str = ""
+    # Segredo opcional do webhook inbound. A Evolution não assina o body;
+    # se preenchido aqui e configurado como header no webhook da instância,
+    # a rota passa a exigi-lo. Vazio = rota aberta (default de dev).
+    evolution_webhook_secret: str = ""
+
+    # --- Google Calendar (agenda de agendamento do SDR) ---
+    # OAuth 2.0 por refresh token, de uma conta com permissão de escrita na
+    # agenda. GOOGLE_CALENDAR_ID é o e-mail do calendário.
+    # Rotacionar o OAuth Client no Google Cloud Console invalida o refresh
+    # token e derruba o agendamento até que alguém reautorize.
+    google_client_id: str = ""
+    google_client_secret: str = ""
+    google_refresh_token: str = ""
+    google_calendar_id: str = ""
+
+    # --- Pipedrive (funil comercial do SDR) ---
+    # Os stage_id vieram do workflow `#4 CRM Control` do n8n e são do
+    # pipeline comercial em produção. `desqualificado` não move card — só
+    # atualiza o banco —, por isso não tem stage aqui.
+    pipedrive_api_token: str = ""
+    pipedrive_stage_qualificado: int = 12
+    pipedrive_stage_agendado: int = 13
+
+    # --- Handover ---
+    # Número (E.164 ou só dígitos) que recebe o aviso quando `human_handover`
+    # desliga o agente. Vazio = ninguém é avisado; o desligamento acontece
+    # do mesmo jeito.
+    handover_notify_phone: str = ""
+
     # --- Rate Limit ---
     rate_limit_per_hour: int = 30
 
@@ -116,6 +160,32 @@ class Settings(BaseSettings):
     lease_seconds: int = 60
     max_attempts: int = 3
 
+    # --- Follow-up (régua de reengajamento do SDR) ---
+    # Desligada por padrão: um deploy que herda este template e esquece de
+    # decidir não pode sair mandando WhatsApp de follow-up para leads reais.
+    followup_enabled: bool = False
+    followup_interval_seconds: int = 300
+    followup_batch_size: int = 10
+    # Os três degraus ancoram em last_inbound_at (o último inbound DO lead),
+    # não em last_interaction_at — ver worker/followup.py.
+    followup_nivel1_minutos: int = 15
+    followup_nivel2_minutos: int = 75
+    followup_nivel3_minutos: int = 1380
+    # Corte da janela de 24h da Cloud API, com folga. janela efetiva =
+    # 24*60 - esta margem.
+    followup_janela_margem_minutos: int = 30
+
+    # --- Balões (resposta em múltiplas mensagens, hoje só elevec_sdr) ---
+    # Espaçamento entre balões enviados em sequência. Não é indicador de
+    # "digitando" — é puramente temporal (o delay_ms do EvolutionClient não
+    # produz efeito nenhum na integração WHATSAPP-BUSINESS desta conta).
+    balao_delay_ms: int = 700
+    # Teto de balões por resposta — acima disso, extrair_baloes concatena o
+    # resto no último balão. Protege lease_seconds: sem teto, uma resposta
+    # com dezenas de itens soma segundos de sleep suficientes para estourar
+    # o lease e, com mais de um worker, duplicar o envio.
+    balao_max_count: int = 10
+
     # --- Media ---
     media_image_enabled: bool = True
     media_audio_enabled: bool = True
@@ -138,6 +208,33 @@ class Settings(BaseSettings):
     embedding_model: str = "openai/text-embedding-3-small"
     embedding_dims: int = 1536
     memory_search_limit: int = 5
+
+    @field_validator("followup_enabled", mode="before")
+    @classmethod
+    def _parse_followup_enabled(cls, valor: object) -> object:
+        """Aceita `true`/`false` nativo do pydantic e as formas em português.
+
+        Sem isto, `FOLLOWUP_ENABLED=nao` (erro de digitação plausível num
+        projeto em português — o resto do repo é `pt-BR`) ou
+        `FOLLOWUP_ENABLED=" false "` (espaço vazando de um copy-paste do
+        .env) derrubam `Settings()` com `ValidationError` — API e Worker
+        caem os dois, antes até de `run_migrations` rodar, exatamente o
+        modo de falha que "sem fail-fast do follow-up" queria evitar (ver
+        `iniciar_followup` em `worker/main.py`). Qualquer outra string
+        continua sendo rejeitada, com mensagem que já indica os valores
+        aceitos.
+        """
+        if isinstance(valor, str):
+            normalizado = valor.strip().lower()
+            if normalizado in _FOLLOWUP_ENABLED_VERDADEIRO:
+                return True
+            if normalizado in _FOLLOWUP_ENABLED_FALSO:
+                return False
+            raise ValueError(
+                f"FOLLOWUP_ENABLED={valor!r} não reconhecido — use "
+                "true/false, sim/não ou 1/0."
+            )
+        return valor
 
     @property
     def resolved_outbound_mode(self) -> str:
@@ -223,6 +320,80 @@ class Settings(BaseSettings):
             missing.append("UAZAPI_BASE_URL")
         return touched, missing
 
+    def _evolution_credentials_status(self) -> tuple[bool, list[str]]:
+        """Retorna (touched, missing) para o canal Evolution em modo real."""
+        # A instância é fixa por deploy e a apikey autentica envio e download
+        # de mídia — os três campos são obrigatórios quando o canal foi tocado.
+        touched = (
+            bool(self.evolution_base_url)
+            or bool(self.evolution_api_key)
+            or bool(self.evolution_instance)
+        )
+        missing: list[str] = []
+        if not self.evolution_base_url:
+            missing.append("EVOLUTION_BASE_URL")
+        if not self.evolution_api_key:
+            missing.append("EVOLUTION_API_KEY")
+        if not self.evolution_instance:
+            missing.append("EVOLUTION_INSTANCE")
+        return touched, missing
+
+    def _sdr_credentials_status(self) -> tuple[bool, list[str]]:
+        """Retorna (touched, missing) para o agente SDR em modo real.
+
+        Mesma doutrina de "toque parcial" dos canais, e pelo mesmo motivo: o
+        que está no grupo só funciona inteiro.
+
+        - **Google Calendar** ausente → a Renata não consulta nem marca nada.
+        - **`HANDOVER_NOTIFY_PHONE`** ausente → o pior caso: `human_handover`
+          desliga o agente, o lead fica em silêncio esperando, e **nenhuma
+          pessoa é acionada**. O único sinal é uma frase que só o modelo lê.
+          É a única falha desta task cujo sintoma não aparece em lugar
+          nenhum, e por isso é boot em vez de checklist.
+
+        **`PIPEDRIVE_API_TOKEN` ficou de fora, de propósito.** Ele é o único
+        do conjunto cuja ausência tem um comportamento definido e desejável:
+        a fase continua sendo gravada no banco, o card não se move, e
+        `mover_card` registra `crm_pipedrive_nao_configurado` sem devolver
+        aviso ao agente. Exigi-lo aqui contradizia o próprio código, que diz
+        que rodar sem Pipedrive é escolha válida, e travava o caso concreto
+        de staging em modo real sem sandbox de CRM. O funil interno é quem
+        alimenta a régua de follow-up e o gate de ingestão; o Pipedrive é
+        espelho para o time comercial.
+
+        Deploys que não usam `elevec_sdr` (illumi, rhawk) não tocam nenhuma
+        das cinco variáveis e continuam subindo normalmente — é o que o
+        `touched` garante.
+        """
+        campos = (
+            ("GOOGLE_CLIENT_ID", self.google_client_id),
+            ("GOOGLE_CLIENT_SECRET", self.google_client_secret),
+            ("GOOGLE_REFRESH_TOKEN", self.google_refresh_token),
+            ("GOOGLE_CALENDAR_ID", self.google_calendar_id),
+            ("HANDOVER_NOTIFY_PHONE", self.handover_notify_phone),
+        )
+
+        touched = any(valor.strip() for _, valor in campos)
+        missing = [nome for nome, valor in campos if not valor.strip()]
+        return touched, missing
+
+    def _handover_phone_errors(self) -> list[str]:
+        """`HANDOVER_NOTIFY_PHONE` preenchido precisa ser um telefone real.
+
+        Um valor formatado como `"11 97777-6666"` passa em qualquer checagem
+        de "está preenchido" e só falha no envio, dentro do `except` que o
+        handover usa para não derrubar o desligamento — ou seja, handover
+        silencioso **com a variável preenchida**, que é pior que vazia
+        porque ninguém suspeita da configuração.
+        """
+        bruto = self.handover_notify_phone.strip()
+        if not bruto or canonicalizar(bruto):
+            return []
+        return [
+            "HANDOVER_NOTIFY_PHONE não é um telefone reconhecível — use "
+            "E.164 (+5511999998888) ou só dígitos com DDI e DDD."
+        ]
+
     def channel_status(self) -> dict[str, dict[str, object]]:
         """Diagnóstico por canal: touched, complete, missing.
 
@@ -233,6 +404,7 @@ class Settings(BaseSettings):
         twilio_touched, twilio_missing = self._twilio_credentials_status()
         meta_touched, meta_missing = self._meta_credentials_status()
         uazapi_touched, uazapi_missing = self._uazapi_credentials_status()
+        evolution_touched, evolution_missing = self._evolution_credentials_status()
 
         is_mock = self.resolved_outbound_mode == "mock"
         return {
@@ -251,7 +423,52 @@ class Settings(BaseSettings):
                 "missing": [] if is_mock else uazapi_missing,
                 "complete": is_mock or not uazapi_missing,
             },
+            "evolution": {
+                "touched": evolution_touched,
+                "missing": [] if is_mock else evolution_missing,
+                "complete": is_mock or not evolution_missing,
+            },
         }
+
+    def _evolution_webhook_secret_errors(self) -> list[str]:
+        """Exige segredo no webhook inbound da Evolution em produção.
+
+        A Evolution não assina o body — o único gate do inbound é o header
+        estático. Com `EVOLUTION_WEBHOOK_SECRET` vazia a rota aceita
+        qualquer POST: texto arbitrário e `remoteJid` escolhido pelo
+        atacante viram lead, fila, agente e **mensagem de WhatsApp saindo
+        pelo número oficial Meta do cliente** para o telefone que ele
+        quiser. Custo de LLM, `leads_crm` envenenado e risco de ban do
+        número. A URL é adivinhável: os ids de agente são públicos no
+        repositório template.
+
+        Vale independente do modo outbound: quem abre a porta é a rota
+        inbound, que não olha `OUTBOUND_MODE`.
+        """
+        if not self.is_production:
+            return []
+
+        touched, _ = self._evolution_credentials_status()
+        if not touched:
+            return []
+
+        secret = self.evolution_webhook_secret.strip()
+        if not secret:
+            return [
+                "Canal 'evolution' configurado em produção exige "
+                "EVOLUTION_WEBHOOK_SECRET — sem ele /webhook/evolution aceita "
+                "qualquer POST e um terceiro dispara mensagem pelo número "
+                "oficial do cliente. Gere com: openssl rand -base64 32"
+            ]
+
+        if len(secret) < MIN_PRODUCTION_SECRET_LENGTH:
+            return [
+                "Production requer valor forte para EVOLUTION_WEBHOOK_SECRET "
+                f"(mínimo {MIN_PRODUCTION_SECRET_LENGTH} caracteres). "
+                "Gere com: openssl rand -base64 32"
+            ]
+
+        return []
 
     def validate_runtime_settings(self) -> None:
         """Valida configuração mínima e hardening por ambiente.
@@ -260,6 +477,10 @@ class Settings(BaseSettings):
         - tocado parcialmente em modo real → ValueError (fail-fast)
         - intocado → desabilitado (worker não instancia o cliente)
         - completo → habilitado
+
+        O agente SDR (`elevec_sdr`) segue a mesma doutrina, como um grupo só:
+        Google Calendar + telefone de handover. `PIPEDRIVE_API_TOKEN` fica
+        fora — ver `_sdr_credentials_status`.
         """
         token = self.internal_service_token.strip()
         if not token:
@@ -273,19 +494,33 @@ class Settings(BaseSettings):
                 "Atualize as env vars antes do deploy."
             )
 
-        # Em modo mock, credenciais são opcionais — o cliente simula envio.
-        if self.resolved_outbound_mode == "mock":
-            return
-
         errors: list[str] = []
-        for channel, status in self.channel_status().items():
-            if status["touched"] and status["missing"]:
-                missing_list = ", ".join(status["missing"])  # type: ignore[arg-type]
+
+        # Em modo mock, credenciais outbound são opcionais — o cliente simula
+        # envio. O segredo do webhook inbound não entra nessa isenção.
+        if self.resolved_outbound_mode != "mock":
+            for channel, status in self.channel_status().items():
+                if status["touched"] and status["missing"]:
+                    missing_list = ", ".join(status["missing"])  # type: ignore[arg-type]
+                    errors.append(
+                        f"Canal '{channel}' está parcialmente configurado em "
+                        f"modo real — preencha: {missing_list} (ou zere todas as "
+                        f"credenciais do canal para desabilitá-lo)."
+                    )
+
+            sdr_touched, sdr_missing = self._sdr_credentials_status()
+            if sdr_touched and sdr_missing:
                 errors.append(
-                    f"Canal '{channel}' está parcialmente configurado em "
-                    f"modo real — preencha: {missing_list} (ou zere todas as "
-                    f"credenciais do canal para desabilitá-lo)."
+                    "Agente SDR está parcialmente configurado em modo real — "
+                    f"preencha: {', '.join(sdr_missing)} (ou zere todas as cinco "
+                    "variáveis para desabilitá-lo). Sem HANDOVER_NOTIFY_PHONE o "
+                    "human_handover desliga o agente sem avisar ninguém."
                 )
+
+            errors.extend(self._handover_phone_errors())
+
+        errors.extend(self._evolution_webhook_secret_errors())
+
         if errors:
             raise ValueError(" | ".join(errors))
 

@@ -1,0 +1,36 @@
+{
+  "audioMessage": {
+    "messageType": "audioMessage",
+    "key": {
+      "remoteJid": "55DDXXXXXXXX@s.whatsapp.net",
+      "fromMe": false,
+      "id": "wamid.<redigido>"
+    },
+    "message": {
+      "audioMessage": {
+        "mime_type": "audio/ogg; codecs=opus",
+        "sha256": "<sha256_redigido>",
+        "id": "<id_redigido>",
+        "url": "https://lookaside.fbsbx.com/whatsapp_business/attachments/?<QUERY_COM_TOKEN_ASSINADO_REDIGIDA>",
+        "voice": true,
+        "ptt": true
+      }
+    }
+  },
+  "imageMessage": {
+    "messageType": "imageMessage",
+    "key": {
+      "remoteJid": "55DDXXXXXXXX@s.whatsapp.net",
+      "fromMe": false,
+      "id": "wamid.<redigido>"
+    },
+    "message": {
+      "imageMessage": {
+        "mime_type": "image/jpeg",
+        "sha256": "<sha256_redigido>",
+        "id": "<id_redigido>",
+        "url": "https://lookaside.fbsbx.com/whatsapp_business/attachments/?<QUERY_COM_TOKEN_ASSINADO_REDIGIDA>"
+      }
+    }
+  }
+}

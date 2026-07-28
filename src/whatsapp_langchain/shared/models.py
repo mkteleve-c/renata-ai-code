@@ -11,6 +11,7 @@ Uso:
 
 from datetime import UTC, datetime
 from enum import Enum
+from typing import Any
 
 from pydantic import BaseModel, Field
 
@@ -37,6 +38,7 @@ class MessagingChannel(str, Enum):
     TWILIO = "twilio"
     META = "meta"
     UAZAPI = "uazapi"
+    EVOLUTION = "evolution"
 
 
 class MessageQueue(BaseModel):
@@ -63,7 +65,7 @@ class MessageQueue(BaseModel):
         default=MessagingChannel.TWILIO,
         description=(
             "Canal de origem da mensagem. Define qual cliente outbound o "
-            "worker usa para responder (twilio, meta ou uazapi)."
+            "worker usa para responder (twilio, meta, uazapi ou evolution)."
         ),
     )
     process_after: datetime | None = None
@@ -77,6 +79,14 @@ class MessageQueue(BaseModel):
         description=(
             "Token outbound dinâmico (uazapi). Vem do payload do webhook "
             "e é usado pelo worker para autenticar o envio de resposta."
+        ),
+    )
+    provider_message_key: dict[str, Any] | None = Field(
+        default=None,
+        description=(
+            "Key completa da mensagem no provedor (ex: data.key da Evolution). "
+            "Necessária quando o download de mídia exige mais que o id, "
+            "como getBase64FromMediaMessage."
         ),
     )
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
@@ -123,11 +133,19 @@ class TwilioWebhookPayload(BaseModel):
 class EnqueueResult(BaseModel):
     """Resultado de uma operação de enqueue.
 
-    Indica se a mensagem foi inserida na fila ou buffered (debounce).
+    Indica se a mensagem foi inserida na fila, buffered (debounce) ou
+    descartada por já existir (reentrega do provedor).
     """
 
     message_id: int
     is_buffered: bool = Field(
         default=False,
         description="True se a mensagem foi concatenada a uma existente (debounce)",
+    )
+    is_duplicate: bool = Field(
+        default=False,
+        description=(
+            "True se o message_id do provedor já estava na fila — nada foi "
+            "inserido nem concatenado, message_id aponta para a linha original"
+        ),
     )

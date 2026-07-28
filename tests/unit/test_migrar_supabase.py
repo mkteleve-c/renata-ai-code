@@ -1,0 +1,1328 @@
+"""Testes de `normalizar_telefone` -- puro, sem I/O, sem rede.
+
+`test_saida_sempre_satisfaz_o_check_do_banco` é o mais importante do
+arquivo: amarra a saída do script ao CHECK real de `leads_crm.phone`,
+extraído do texto das migrações 007 e 014 -- nunca copiado à mão -- para
+que este teste acompanhe se a constraint mudar de novo.
+"""
+
+import re
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+
+import pytest
+
+from scripts.migrar_supabase import (
+    Descarte,
+    LinhaFundida,
+    LinhaHistoricoOrigem,
+    LinhaOrigem,
+    MigracaoAbortada,
+    Normalizado,
+    _contagem_cumulativa_por_rank,
+    _desaninhar_output,
+    agrupar_por_canonico,
+    extrair_turno_de_conversa,
+    fundir_grupo,
+    fundir_todos,
+    gerar_relatorio,
+    marcar_reunioes_legadas,
+    max_last_interaction_at,
+    montar_historico_por_sessao,
+    normalizar_telefone,
+    validar_canonicos_no_check,
+    validar_fases_nao_retrocederam,
+    validar_session_ids_historico,
+    validar_soma_fecha,
+)
+
+_RAIZ = Path(__file__).resolve().parents[2]
+_MIGRACAO_007 = _RAIZ / "db" / "migrations" / "007_elevec.sql"
+_MIGRACAO_014 = _RAIZ / "db" / "migrations" / "014_uma_linha_por_pessoa.sql"
+
+
+def _regras_do_check_leads_crm() -> list[tuple[re.Pattern[str], bool]]:
+    """Extrai as regras do CHECK de `leads_crm.phone` direto das migrações.
+
+    Não copia a regex para o teste: lê o SQL real de 007 (a regra de
+    base, `phone ~ '^[0-9]{8,15}$'`) e de 014 (as três regras que travam a
+    forma canônica) e monta os predicados a partir do texto. Se a
+    constraint mudar de novo -- ela já levou quatro rodadas de revisão --
+    este teste acompanha sem precisar ser editado à mão.
+    """
+    predicados: list[tuple[re.Pattern[str], bool]] = []
+
+    texto_007 = _MIGRACAO_007.read_text()
+    bloco_leads_crm = re.search(
+        r"CREATE TABLE IF NOT EXISTS leads_crm \((.*?)\n\);", texto_007, re.DOTALL
+    )
+    assert bloco_leads_crm, "não achei a definição de leads_crm em 007_elevec.sql"
+
+    texto_014 = _MIGRACAO_014.read_text()
+    bloco_check = re.search(
+        r"ADD CONSTRAINT leads_crm_phone_canonico_check\s*CHECK \((.*?)\);",
+        texto_014,
+        re.DOTALL,
+    )
+    assert bloco_check, "não achei o CHECK novo em 014_uma_linha_por_pessoa.sql"
+
+    for bloco in (bloco_leads_crm.group(1), bloco_check.group(1)):
+        for operador, regex in re.findall(r"phone\s*(!?~)\s*'([^']+)'", bloco):
+            predicados.append((re.compile(regex), operador == "~"))
+
+    # Guarda contra extração silenciosamente vazia: se a migração mudar de
+    # forma (menos ou mais cláusulas), o teste tem que acusar em vez de
+    # passar trivialmente com uma lista vazia de predicados.
+    assert len(predicados) == 4, (
+        f"esperava 4 predicados (1 de 007 + 3 de 014), achei {len(predicados)} "
+        "-- o CHECK mudou e este teste precisa de atenção, não só passar"
+    )
+    return predicados
+
+
+def _satisfaz_check_do_banco(valor: str) -> bool:
+    return all(
+        bool(regex.search(valor)) == deve_casar
+        for regex, deve_casar in _regras_do_check_leads_crm()
+    )
+
+
+def test_o_extrator_do_check_bate_com_exemplos_conhecidos():
+    """Sanity check do extrator em si, antes de usá-lo contra o script."""
+    assert _satisfaz_check_do_banco("551187654321")  # BR canônico
+    assert _satisfaz_check_do_banco("258864038352")  # Moçambique, 12 dígitos
+    assert not _satisfaz_check_do_banco("5511987654321")  # com o 9º dígito
+    assert not _satisfaz_check_do_banco("55011987654321")  # zero de tronco
+    assert not _satisfaz_check_do_banco("14242123771")  # 11 dígitos -- colide
+    assert not _satisfaz_check_do_banco("1234567890")  # 10 dígitos -- colide
+    assert not _satisfaz_check_do_banco("1234567")  # 7 dígitos -- curto demais
+
+
+@pytest.mark.parametrize(
+    "bruto,esperado",
+    [
+        ("+5511987654321", "551187654321"),  # BR com 9 e com +
+        ("5511987654321", "551187654321"),
+        ("551187654321", "551187654321"),  # já canônico
+        ("11987654321", "551187654321"),  # local com 9
+        ("1187654321", "551187654321"),  # local sem 9
+        ("55011987654321", "551187654321"),  # zero de tronco
+        ("(11) 98765-4321", "551187654321"),  # máscara
+    ],
+)
+def test_formas_brasileiras_convergem(bruto, esperado):
+    resultado = normalizar_telefone(bruto)
+    assert resultado.canonico == esperado
+    assert resultado.motivo is None
+
+
+@pytest.mark.parametrize(
+    "bruto,motivo",
+    [
+        ("null", "telefone_ausente"),
+        ("", "telefone_ausente"),
+        (None, "telefone_ausente"),
+        ("NULL", "telefone_ausente"),  # variação de caixa
+        ("   ", "telefone_ausente"),  # só espaços
+        ("+14242123771", "colide_com_forma_local_br"),  # EUA, 11 dígitos
+        ("519985344", "digitos_insuficientes"),
+        ("5511666666665", "sequencia_implausivel"),
+        ("5511988887777@lid", "endereco_sem_telefone"),  # LinkedID do WhatsApp
+        ("120363012345678901@g.us", "endereco_sem_telefone"),  # grupo
+    ],
+)
+def test_descartes_tem_motivo_nomeado(bruto, motivo):
+    resultado = normalizar_telefone(bruto)
+    assert resultado.canonico is None
+    assert resultado.motivo == motivo
+
+
+def test_estrangeiro_de_12_digitos_passa_intacto():
+    """Moçambique e Portugal cabem no CHECK; EUA não, por colisão de tamanho."""
+    assert normalizar_telefone("258864038352").canonico == "258864038352"
+    assert normalizar_telefone("351914355881").canonico == "351914355881"
+
+
+def test_lid_e_grupo_nao_caem_no_rotulo_de_digito_implausivel():
+    """Fix round 1: antes desta correção, `@lid`/`@g.us` saíam rotulados
+    `sequencia_implausivel` -- que sugere lixo de digitação, não "isto
+    nunca foi um telefone". O motivo importa porque `leads_descartados`
+    guarda o rótulo para revisão humana, e os dois convites a ações
+    diferentes: `sequencia_implausivel` pede olhar o dígito; `endereco_sem_
+    telefone` diz "não perca tempo, não tem telefone nenhum aqui".
+    """
+    lid = normalizar_telefone("5511988887777@lid")
+    grupo = normalizar_telefone("120363012345678901@g.us")
+
+    assert lid.motivo == "endereco_sem_telefone"
+    assert lid.motivo != "sequencia_implausivel"
+    assert grupo.motivo == "endereco_sem_telefone"
+
+
+def test_forma_local_br_de_10_e_11_digitos_e_descartada():
+    """Sem DDI, 10 ou 11 dígitos é ambíguo -- e o CHECK bane os dois."""
+    assert normalizar_telefone("1187654321").canonico == "551187654321"  # sem 9: BR
+    # Um "sem DDI" de 11 dígitos que TAMBÉM não bate o padrão LOCAL_COM_9
+    # (9 fora da posição certa) não converge para BR -- e cai exatamente
+    # no comprimento que colide com estrangeiro.
+    r = normalizar_telefone("12345678901")
+    assert r.canonico is None
+    assert r.motivo == "colide_com_forma_local_br"
+
+
+@pytest.mark.parametrize(
+    "bruto",
+    [
+        None,
+        "",
+        "   ",
+        "null",
+        "NULL",
+        "519985344",
+        "5511666666665",
+        "12345",
+        "+14242123771",
+        "1234567890",
+    ],
+)
+def test_descarte_nunca_preenche_os_dois_campos(bruto):
+    """`canonico is None` sse `motivo` está preenchido -- nunca os dois juntos."""
+    resultado = normalizar_telefone(bruto)
+    assert isinstance(resultado, Normalizado)
+    assert (resultado.canonico is None) != (resultado.motivo is None)
+
+
+# Amostra representativa das formas medidas na base legada em 27/07/2026
+# (não são as 3.373 linhas reais -- a credencial do Supabase é segredo e
+# esta suíte não usa rede -- mas cobre cada categoria da tabela do plano:
+# BR com/sem 9º dígito, zero de tronco, local sem DDI, máscara, os três
+# estrangeiros achados em produção, ausência e lixo implausível).
+_FORMAS_REAIS_REPRESENTATIVAS = [
+    "+5511987654321",
+    "5511987654321",
+    "551187654321",
+    "11987654321",
+    "1187654321",
+    "55011987654321",
+    "(11) 98765-4321",
+    "+5521998887766",
+    "5521987654321",
+    "552199988776",
+    "21987654321",
+    "5531988776655",
+    "553187654321",
+    "5541987654321",
+    "554187654321",
+    "+5561999998888",
+    "5561988776655",
+    "556187654321",
+    "55031987654321",  # zero de tronco, outro DDD
+    "05531987654321",  # zero de tronco em outra forma
+    "3187654321",  # local sem DDI, sem 9
+    "8532165498",  # local sem DDI, sem 9, outro DDD
+    "258864038352",  # Moçambique -- qualificado, ativo
+    "351914355881",  # Portugal -- follow-up ativo
+    "+14242123771",  # EUA -- colide com forma local BR
+    None,
+    "",
+    "   ",
+    "null",
+    "NULL",
+    "519985344",
+    "5511666666665",
+    "12345",
+    "1234567890",
+    "12345678901",
+]
+
+
+def test_saida_sempre_satisfaz_o_check_do_banco():
+    """Qualquer canônico devolvido tem que poder ser inserido em leads_crm.
+
+    Este é o teste que importa mais: se `normalizar_telefone` devolver
+    algo que o CHECK recusa, a importação real quebra no meio, com parte
+    dos 3.373 leads dentro e parte fora.
+    """
+    algum_canonico_produzido = False
+    for bruto in _FORMAS_REAIS_REPRESENTATIVAS:
+        resultado = normalizar_telefone(bruto)
+        if resultado.canonico is None:
+            continue
+        algum_canonico_produzido = True
+        assert _satisfaz_check_do_banco(resultado.canonico), (
+            f"{bruto!r} normalizou para {resultado.canonico!r}, "
+            "que o CHECK de leads_crm.phone recusaria"
+        )
+
+    # Guarda contra um bug que descartasse tudo silenciosamente e fizesse
+    # o loop acima nunca exercitar a asserção de verdade.
+    assert algum_canonico_produzido
+
+
+# =============================================================================
+# Fusão de duplicatas e relatório (Task 3)
+# =============================================================================
+#
+# Timestamps NUNCA idênticos entre linhas do mesmo grupo -- duas tasks da
+# Fase 3 produziram testes autoconfirmatórios exatamente com timestamp
+# igual entre linhas do mesmo grupo, e os dois vícios só foram pegos por
+# revisão humana, nunca pela suíte. `_t()` sempre desloca por um número
+# diferente de minutos a partir de uma base fixa.
+
+_BASE = datetime(2026, 7, 20, 12, 0, tzinfo=UTC)
+
+
+def _t(minutos: int) -> datetime:
+    return _BASE + timedelta(minutes=minutos)
+
+
+def _linha(
+    phone: str | None,
+    *,
+    phase: str | None = None,
+    created_at: datetime | None = None,
+    last_interaction_at: datetime | None = None,
+    pipedriveid: str | None = None,
+    email: str | None = None,
+    name: str | None = None,
+    username: str | None = None,
+    source: str | None = None,
+    followup_count: int | None = 0,
+    agent_active: bool | None = True,
+    followup_active: bool | None = True,
+    agent_reactivate_at: datetime | None = None,
+    metadata: dict | None = None,
+) -> LinhaOrigem:
+    return LinhaOrigem(
+        phone=phone,
+        phase=phase,
+        created_at=created_at,
+        last_interaction_at=last_interaction_at,
+        pipedriveid=pipedriveid,
+        email=email,
+        name=name,
+        username=username,
+        source=source,
+        followup_count=followup_count,
+        agent_active=agent_active,
+        followup_active=followup_active,
+        agent_reactivate_at=agent_reactivate_at,
+        metadata=metadata,
+    )
+
+
+def _secao(texto: str, titulo: str) -> str:
+    """Extrai o corpo de uma seção `## {titulo}` até o próximo `## ` (ou o fim)."""
+    marcador = f"## {titulo}"
+    inicio = texto.index(marcador) + len(marcador)
+    resto = texto[inicio:]
+    fim = resto.find("\n## ")
+    return resto if fim == -1 else resto[:fim]
+
+
+# --- fundir_grupo -----------------------------------------------------------
+
+
+def test_par_campo_coalescivel_vence_por_recencia_nao_por_fase():
+    """Divergência resolvida conscientemente (ver docstring de `fundir_grupo`):
+    o plano descreve "priorizando a fase mais avançada" para os campos
+    coalescíveis, mas `shared/leads.py::_fundir` e a etapa 2 da 014 (as
+    duas cópias que já rodam em produção/consolidação) usam RECÊNCIA, não
+    rank de fase. Este teste amarra o comportamento à recência: a linha
+    mais antiga tem fase mais avançada, mas seu `pipedriveid` perde para o
+    da linha mais recente.
+    """
+    antiga = _linha(
+        "551187654321",
+        last_interaction_at=_t(0),
+        phase="qualificado",
+        pipedriveid="ANTIGO",
+    )
+    recente = _linha(
+        "5511987654321",
+        last_interaction_at=_t(10),
+        phase="iniciou_conversa",
+        pipedriveid="NOVO",
+    )
+    fundida = fundir_grupo("551187654321", [antiga, recente])
+
+    assert fundida.pipedriveid == "NOVO"
+    assert fundida.origem_por_campo["pipedriveid"] == "5511987654321"
+    # phase continua sendo a mais avançada -- essa regra não muda.
+    assert fundida.phase == "qualificado"
+
+
+def test_campo_coalescivel_cai_para_a_linha_mais_antiga_quando_a_recente_e_nula():
+    """Importante 2 do fix round 1: nenhum teste cobria o caso em que a
+    linha MAIS RECENTE traz o campo nulo -- que é justamente o cenário em
+    que o fallback "cai pra trás até achar um não-nulo" precisa entrar em
+    ação. Uma mutação que trocasse `if valor is not None` por atribuição
+    incondicional (`valores[campo] = valor` sempre) faria a linha recente
+    nula APAGAR o `email` da linha antiga -- e nenhum teste existente até
+    aqui derrubava isso, porque todos tinham valor não-nulo dos dois
+    lados.
+    """
+    antiga = _linha(
+        "551187654321",
+        last_interaction_at=_t(0),
+        email="ana@exemplo.com",
+        pipedriveid="DEAL-1",
+    )
+    recente = _linha(
+        "5511987654321",
+        last_interaction_at=_t(10),
+        email=None,
+        pipedriveid=None,
+    )
+
+    fundida = fundir_grupo("551187654321", [antiga, recente])
+
+    assert fundida.email == "ana@exemplo.com"
+    assert fundida.origem_por_campo["email"] == "551187654321"
+    assert fundida.pipedriveid == "DEAL-1"
+    assert fundida.origem_por_campo["pipedriveid"] == "551187654321"
+
+
+def test_trio_followup_count_pega_o_maior_nao_o_menor():
+    """A escada de follow-up já percorrida não pode ser esquecida."""
+    l1 = _linha(
+        "p1", last_interaction_at=_t(0), phase="formulario_preenchido", followup_count=1
+    )
+    l2 = _linha("p2", last_interaction_at=_t(5), phase="qualificado", followup_count=5)
+    l3 = _linha(
+        "p3", last_interaction_at=_t(10), phase="iniciou_conversa", followup_count=2
+    )
+
+    fundida = fundir_grupo("canonico", [l1, l2, l3])
+
+    assert fundida.followup_count == 5
+    assert fundida.followup_count != min(1, 5, 2)
+    assert fundida.origem_por_campo["followup_count"] == "p2"
+    assert fundida.phase == "qualificado"
+    assert set(fundida.telefones_origem) == {"p1", "p2", "p3"}
+
+
+def test_grupo_com_um_lado_pausado_false_vence_mesmo_sendo_mais_antigo():
+    """`False` vence sempre -- errar pra não mandar mensagem é recuperável."""
+    antiga_pausada = _linha(
+        "p1",
+        last_interaction_at=_t(0),
+        agent_active=False,
+        followup_active=False,
+    )
+    recente_ativa = _linha(
+        "p2",
+        last_interaction_at=_t(100),
+        agent_active=True,
+        followup_active=True,
+    )
+
+    fundida = fundir_grupo("canonico", [antiga_pausada, recente_ativa])
+
+    assert fundida.agent_active is False
+    assert fundida.followup_active is False
+    assert fundida.origem_por_campo["agent_active"] == "p1"
+
+
+def test_agent_reactivate_at_da_linha_perdedora_nao_ressuscita():
+    """`agent_reactivate_at` está FORA do coalesce -- acompanha só quem ganhou
+    `agent_active`. Mesmo a linha perdedora (ativa, mais recente) tendo uma
+    data de reativação, ela não pode vazar pro resultado: o vencedor é a
+    linha pausada, e ela não tem reativação agendada (`None`).
+    """
+    antiga_pausada = _linha(
+        "p1",
+        last_interaction_at=_t(0),
+        agent_active=False,
+        followup_active=False,
+        agent_reactivate_at=None,
+    )
+    recente_ativa_com_reativacao = _linha(
+        "p2",
+        last_interaction_at=_t(100),
+        agent_active=True,
+        followup_active=True,
+        agent_reactivate_at=_t(200),
+    )
+
+    fundida = fundir_grupo("canonico", [antiga_pausada, recente_ativa_com_reativacao])
+
+    assert fundida.agent_reactivate_at is None
+
+
+def test_agent_reactivate_at_do_vencedor_nao_e_sobrescrito_pelo_perdedor():
+    """O inverso do teste acima: o vencedor (pausado) TEM reativação agendada
+    -- o coalesce não pode substituí-la pelo valor (diferente) da linha
+    perdedora, mesmo que a perdedora seja mais recente.
+    """
+    antiga_pausada_com_reativacao = _linha(
+        "p1",
+        last_interaction_at=_t(0),
+        agent_active=False,
+        followup_active=False,
+        agent_reactivate_at=_t(300),
+    )
+    recente_ativa = _linha(
+        "p2",
+        last_interaction_at=_t(100),
+        agent_active=True,
+        followup_active=True,
+        agent_reactivate_at=_t(5),
+    )
+
+    fundida = fundir_grupo("canonico", [antiga_pausada_com_reativacao, recente_ativa])
+
+    assert fundida.agent_reactivate_at == _t(300)
+    assert fundida.origem_por_campo["agent_reactivate_at"] == "p1"
+
+
+def test_fase_mais_avancada_na_linha_mais_antiga_nao_e_enterrada():
+    """`agendou_sessao` vence `perdido` mesmo `perdido` sendo a linha mais
+    recente -- reunião marcada é fato verificável, perdido é julgamento.
+    """
+    antigo_agendou = _linha("p1", last_interaction_at=_t(0), phase="agendou_sessao")
+    recente_perdido = _linha("p2", last_interaction_at=_t(500), phase="perdido")
+
+    fundida = fundir_grupo("canonico", [antigo_agendou, recente_perdido])
+
+    assert fundida.phase == "agendou_sessao"
+    assert fundida.origem_por_campo["phase"] == "p1"
+    assert fundida.mudou_phase is True
+
+
+def test_fase_vencedora_e_por_rank_nao_pela_linha_mais_recente():
+    """Guarda de mutação: se `_fase_vencedora` fosse trocada por "pega a
+    fase da linha mais recente", este teste cai -- a linha mais recente
+    (`perdido`, rank 4) perderia pra `agendou_sessao` (rank 5), que é a
+    mais antiga do grupo.
+    """
+    antiga = _linha("p1", last_interaction_at=_t(0), phase="agendou_sessao")
+    meio = _linha("p2", last_interaction_at=_t(10), phase="qualificado")
+    nova = _linha("p3", last_interaction_at=_t(20), phase="perdido")
+
+    fundida = fundir_grupo("canonico", [antiga, meio, nova])
+
+    assert fundida.phase == "agendou_sessao"
+
+
+def test_empate_de_rank_desqualificado_perdido_desempata_por_recencia():
+    l1 = _linha("p1", last_interaction_at=_t(0), phase="desqualificado")
+    l2 = _linha("p2", last_interaction_at=_t(10), phase="perdido")
+
+    fundida = fundir_grupo("canonico", [l1, l2])
+
+    assert fundida.phase == "perdido"
+
+
+def test_created_at_minimo_e_last_interaction_at_maximo_com_procedencia():
+    l1 = _linha("p1", created_at=_t(-100), last_interaction_at=_t(0))
+    l2 = _linha("p2", created_at=_t(-50), last_interaction_at=_t(30))
+
+    fundida = fundir_grupo("canonico", [l1, l2])
+
+    assert fundida.created_at == _t(-100)
+    assert fundida.origem_por_campo["created_at"] == "p1"
+    assert fundida.last_interaction_at == _t(30)
+    assert fundida.origem_por_campo["last_interaction_at"] == "p2"
+
+
+def test_metadata_mescla_chave_a_chave_e_registra_linhas_fundidas():
+    l1 = _linha("p1", last_interaction_at=_t(0), metadata={"a": 1, "b": 1})
+    l2 = _linha("p2", last_interaction_at=_t(10), metadata={"b": 2, "c": 3})
+
+    fundida = fundir_grupo("canonico", [l1, l2])
+
+    assert fundida.metadata["a"] == 1
+    assert fundida.metadata["b"] == 2  # mais recente vence em conflito de chave
+    assert fundida.metadata["c"] == 3
+    assert fundida.metadata["linhas_fundidas"] == ["p1", "p2"]
+
+
+def test_grupo_vazio_levanta_erro():
+    with pytest.raises(ValueError):
+        fundir_grupo("canonico", [])
+
+
+def test_singleton_passa_intacto_e_nao_marca_mudanca():
+    linha = _linha(
+        "551187654321", last_interaction_at=_t(0), phase="qualificado", pipedriveid="X"
+    )
+
+    fundida = fundir_grupo("551187654321", [linha])
+
+    assert fundida.phase == "qualificado"
+    assert fundida.pipedriveid == "X"
+    assert fundida.telefones_origem == ("551187654321",)
+    assert fundida.mudou_phase is False
+    assert fundida.mudou_agent_active is False
+
+
+# --- agrupar_por_canonico / fundir_todos ------------------------------------
+
+
+def test_agrupar_por_canonico_junta_duplicatas_e_descarta_o_resto():
+    linhas = [
+        _linha("+5511987654321", last_interaction_at=_t(0)),
+        _linha("11987654321", last_interaction_at=_t(10)),
+        _linha("5521987654321", last_interaction_at=_t(0)),
+        _linha("null"),
+        _linha("+14242123771"),
+    ]
+
+    grupos, descartes = agrupar_por_canonico(linhas)
+
+    assert set(grupos.keys()) == {"551187654321", "552187654321"}
+    assert len(grupos["551187654321"]) == 2
+    assert len(grupos["552187654321"]) == 1
+    assert len(descartes) == 2
+    assert {d.motivo for d in descartes} == {
+        "telefone_ausente",
+        "colide_com_forma_local_br",
+    }
+    assert all(isinstance(d, Descarte) for d in descartes)
+
+
+def test_fundir_todos_aplica_fundir_grupo_em_cada_grupo():
+    grupos = {
+        "551187654321": [_linha("551187654321", last_interaction_at=_t(0))],
+        "552187654321": [
+            _linha("552187654321", last_interaction_at=_t(0), pipedriveid="A"),
+            _linha("5521987654321", last_interaction_at=_t(10), pipedriveid="B"),
+        ],
+    }
+
+    fundidas = fundir_todos(grupos)
+
+    assert set(fundidas.keys()) == {"551187654321", "552187654321"}
+    assert all(isinstance(f, LinhaFundida) for f in fundidas.values())
+    assert fundidas["552187654321"].pipedriveid == "B"
+
+
+# --- gerar_relatorio ---------------------------------------------------------
+
+
+def _cenario_relatorio():
+    """Cenário completo: dois grupos fundidos (um que muda estado, um que não
+    muda nada), um lead estrangeiro migrado, um lead comum e dois descartes
+    (um deles o clássico "colide com forma local BR"). Passa pelo pipeline
+    real (`agrupar_por_canonico` -> `fundir_todos`), não fabrica
+    `LinhaFundida` à mão -- assim o teste do relatório também exercita a
+    integração entre as duas etapas.
+    """
+    linhas = [
+        # grupo fundido comum -- não muda phase nem agent_active
+        _linha(
+            "551187654321", last_interaction_at=_t(0), phase="formulario_preenchido"
+        ),
+        _linha(
+            "5511987654321", last_interaction_at=_t(10), phase="formulario_preenchido"
+        ),
+        # grupo fundido cuja fusão muda phase E agent_active
+        _linha(
+            "552187654321",
+            last_interaction_at=_t(0),
+            phase="agendou_sessao",
+            agent_active=False,
+            followup_active=False,
+        ),
+        _linha(
+            "5521987654321",
+            last_interaction_at=_t(50),
+            phase="perdido",
+            agent_active=True,
+            followup_active=True,
+        ),
+        # lead estrangeiro, singleton, qualificado e ativo (perfil do caso
+        # medido de Moçambique -- mas sem hardcode do dígito exato)
+        _linha("258864038352", last_interaction_at=_t(0), phase="qualificado"),
+        # lead comum, singleton
+        _linha("552199988776", last_interaction_at=_t(0), phase="iniciou_conversa"),
+        # descartes
+        _linha("null"),
+        _linha("+14242123771"),
+    ]
+    grupos, descartes = agrupar_por_canonico(linhas)
+    fundidas = fundir_todos(grupos)
+    return len(linhas), grupos, fundidas, descartes
+
+
+def test_relatorio_soma_fecha_e_resumo_bate():
+    total_origem, grupos, fundidas, descartes = _cenario_relatorio()
+
+    texto = gerar_relatorio(total_origem, grupos, fundidas, descartes)
+
+    assert "Total na origem: **8**" in texto
+    assert "Migrados (linhas de origem com telefone canônico): **6**" in texto
+    assert "Descartados: **2**" in texto
+    assert "6 + 2 = 8 == 8 (fecha)" in texto
+    assert "Leads finais após fusão: **4**" in texto
+    assert "2 grupo(s) com mais de uma linha física" in texto
+
+
+def test_relatorio_reporta_max_last_interaction_at_dos_leads_migrados():
+    """O passo 7 do roteiro de cutover (`docs/CUTOVER.md`) compara este
+    valor contra o que o Postgres tem depois de `--executar` -- sem ele
+    impresso aqui, a comparação não tinha segundo lado. O grupo
+    `552187654321` funde `_t(0)` e `_t(50)`; `_t(50)` é o maior
+    `last_interaction_at` entre TODOS os quatro leads fundidos deste
+    cenário (não só dentro do próprio grupo)."""
+    total_origem, grupos, fundidas, descartes = _cenario_relatorio()
+
+    assert max_last_interaction_at(fundidas) == _t(50)
+
+    texto = gerar_relatorio(total_origem, grupos, fundidas, descartes)
+    assert f"max(last_interaction_at) entre os leads migrados: **{_t(50)}**" in texto
+
+
+def test_max_last_interaction_at_sem_fundidas_e_none():
+    assert max_last_interaction_at({}) is None
+
+
+def test_relatorio_levanta_erro_quando_soma_nao_fecha():
+    total_origem, grupos, fundidas, descartes = _cenario_relatorio()
+
+    with pytest.raises(ValueError):
+        gerar_relatorio(total_origem + 1, grupos, fundidas, descartes)
+
+
+def test_relatorio_nao_omite_nenhum_grupo_fundido():
+    """Guarda de mutação: cada canônico com mais de uma linha física precisa
+    ter sua própria seção `### {canonico}` -- se o loop de geração pular um
+    grupo, este teste cai.
+    """
+    total_origem, grupos, fundidas, descartes = _cenario_relatorio()
+
+    texto = gerar_relatorio(total_origem, grupos, fundidas, descartes)
+    secao_grupos = _secao(texto, "Grupos fundidos")
+
+    grupos_multiplos = {c for c, linhas in grupos.items() if len(linhas) > 1}
+    assert grupos_multiplos == {"551187654321", "552187654321"}
+    for canonico in grupos_multiplos:
+        assert f"### {canonico}" in secao_grupos
+
+
+def test_relatorio_destaca_lead_estrangeiro_migrado():
+    total_origem, grupos, fundidas, descartes = _cenario_relatorio()
+
+    texto = gerar_relatorio(total_origem, grupos, fundidas, descartes)
+    secao_destaques = _secao(texto, "Decisão humana necessária")
+
+    assert "258864038352" in secao_destaques
+    assert "estrangeiro" in secao_destaques.lower()
+
+
+def test_relatorio_destaca_descarte_que_colide_com_forma_local_br():
+    total_origem, grupos, fundidas, descartes = _cenario_relatorio()
+
+    texto = gerar_relatorio(total_origem, grupos, fundidas, descartes)
+    secao_destaques = _secao(texto, "Decisão humana necessária")
+
+    assert "+14242123771" in secao_destaques
+    assert "colidir com forma local br" in secao_destaques.lower()
+
+
+def test_relatorio_destaca_grupo_cuja_fusao_mudou_phase_e_agent_active():
+    total_origem, grupos, fundidas, descartes = _cenario_relatorio()
+
+    texto = gerar_relatorio(total_origem, grupos, fundidas, descartes)
+    secao_destaques = _secao(texto, "Decisão humana necessária")
+
+    assert "552187654321" in secao_destaques
+    assert "phase" in secao_destaques
+    assert "agent_active" in secao_destaques
+
+
+def test_relatorio_nao_destaca_grupo_que_nao_mudou_nada():
+    """Guarda contra falso positivo: o grupo `551187654321` foi fundido mas
+    não mudou `phase` nem `agent_active` -- não pode aparecer na seção de
+    decisão humana, só na de grupos fundidos.
+    """
+    total_origem, grupos, fundidas, descartes = _cenario_relatorio()
+
+    texto = gerar_relatorio(total_origem, grupos, fundidas, descartes)
+    secao_destaques = _secao(texto, "Decisão humana necessária")
+    secao_grupos = _secao(texto, "Grupos fundidos")
+
+    assert "551187654321" not in secao_destaques
+    assert "### 551187654321" in secao_grupos
+
+
+def test_relatorio_lista_todos_os_descartes_com_motivo():
+    total_origem, grupos, fundidas, descartes = _cenario_relatorio()
+
+    texto = gerar_relatorio(total_origem, grupos, fundidas, descartes)
+    secao_descartes = _secao(texto, "Descartes")
+
+    assert "telefone_ausente" in secao_descartes
+    assert "colide_com_forma_local_br" in secao_descartes
+    assert "+14242123771" in secao_descartes
+
+
+# --- Achados do fix round 1 --------------------------------------------------
+
+
+def test_relatorio_destaca_descarte_por_digitos_insuficientes():
+    """Fix round 1: `519985344` (DDD 51 com um dígito faltando) é um lead
+    real provável, não lixo -- e antes desta correção só o motivo `colide_
+    com_forma_local_br` aparecia na seção de decisão humana.
+    """
+    linhas = [
+        _linha("551187654321", last_interaction_at=_t(0)),
+        _linha("519985344"),  # digitos_insuficientes
+    ]
+    grupos, descartes = agrupar_por_canonico(linhas)
+    fundidas = fundir_todos(grupos)
+
+    texto = gerar_relatorio(len(linhas), grupos, fundidas, descartes)
+    secao_destaques = _secao(texto, "Decisão humana necessária")
+
+    assert "519985344" in secao_destaques
+    assert "dígitos insuficientes" in secao_destaques.lower()
+
+
+def test_relatorio_destaca_grupo_com_pipedriveid_conflitante():
+    """Fix round 1: `pipedriveid` vence por recência (mesma regra dos
+    outros campos coalescíveis) e pode desacoplar de `phase`, que vence
+    por rank -- um grupo com a linha ANTIGA em `agendou_sessao`/`DEAL-13` e
+    a RECENTE em `formulario_preenchido`/`DEAL-NOVO` funde para
+    `agendou_sessao` + `DEAL-NOVO`, e uma `update_crm` subsequente moveria
+    o card ERRADO no Pipedrive.
+    """
+    linhas = [
+        _linha(
+            "551187654321",
+            last_interaction_at=_t(0),
+            phase="agendou_sessao",
+            pipedriveid="DEAL-13",
+        ),
+        _linha(
+            "5511987654321",
+            last_interaction_at=_t(10),
+            phase="formulario_preenchido",
+            pipedriveid="DEAL-NOVO",
+        ),
+    ]
+    grupos, descartes = agrupar_por_canonico(linhas)
+    fundidas = fundir_todos(grupos)
+
+    texto = gerar_relatorio(len(linhas), grupos, fundidas, descartes)
+    secao_destaques = _secao(texto, "Decisão humana necessária")
+
+    assert "551187654321" in secao_destaques
+    assert "pipedriveid" in secao_destaques.lower()
+    assert "DEAL-NOVO" in secao_destaques
+
+
+def test_relatorio_nao_destaca_grupo_com_pipedriveid_unanime():
+    """Guarda contra falso positivo: as duas linhas concordam no
+    `pipedriveid`, então não há conflito a destacar."""
+    linhas = [
+        _linha("551187654321", last_interaction_at=_t(0), pipedriveid="DEAL-1"),
+        _linha("5511987654321", last_interaction_at=_t(10), pipedriveid="DEAL-1"),
+    ]
+    grupos, descartes = agrupar_por_canonico(linhas)
+    fundidas = fundir_todos(grupos)
+
+    texto = gerar_relatorio(len(linhas), grupos, fundidas, descartes)
+    secao_destaques = _secao(texto, "Decisão humana necessária")
+
+    assert "pipedriveid" not in secao_destaques.lower()
+
+
+# =============================================================================
+# Importação e validações bloqueantes (Task 4) -- só a parte PURA, sem banco.
+#
+# `importar_leads` em si (a escrita real) e a validação de `last_inbound_at`
+# (que só existe contra o Postgres) estão em
+# `tests/integration/test_migrar_supabase.py` -- "camada de banco testada
+# contra o Postgres real, nunca monkeypatchada" não é negociável neste
+# projeto. O que mora aqui é o que roda ANTES de qualquer escrita: soma
+# fecha, CHECK, session_ids do histórico, contagem de fases e a marcação de
+# `reuniao_legada` -- puro, sem I/O, testável em memória.
+# =============================================================================
+
+
+def test_marcar_reunioes_legadas_marca_so_quem_chega_em_agendou_sessao():
+    agendou = fundir_grupo(
+        "551100001111", [_linha("551100001111", phase="agendou_sessao")]
+    )
+    qualificado = fundir_grupo(
+        "551100002222", [_linha("551100002222", phase="qualificado")]
+    )
+
+    marcadas = marcar_reunioes_legadas(
+        {"551100001111": agendou, "551100002222": qualificado}
+    )
+
+    assert marcadas["551100001111"].metadata["reuniao_legada"] is True
+    assert "reuniao_legada" not in marcadas["551100002222"].metadata
+
+
+def test_marcar_reunioes_legadas_preserva_o_resto_do_metadata():
+    agendou = fundir_grupo(
+        "551100001111",
+        [
+            _linha(
+                "551100001111",
+                phase="agendou_sessao",
+                metadata={"origem_pipedrive": "deal-123"},
+            )
+        ],
+    )
+
+    marcadas = marcar_reunioes_legadas({"551100001111": agendou})
+
+    assert marcadas["551100001111"].metadata["origem_pipedrive"] == "deal-123"
+    # `linhas_fundidas` é recalculado por `fundir_grupo` a partir dos
+    # telefones reais do grupo -- não é o que este teste está verificando.
+    assert marcadas["551100001111"].metadata["linhas_fundidas"] == ["551100001111"]
+    assert marcadas["551100001111"].metadata["reuniao_legada"] is True
+
+
+def test_validar_soma_fecha_aceita_quando_bate():
+    grupos = {"551100001111": [_linha("551100001111")]}
+    descartes = [Descarte("null", "telefone_ausente", _linha(None))]
+
+    validar_soma_fecha(2, grupos, descartes)  # não levanta
+
+
+def test_validar_soma_fecha_aborta_quando_nao_bate():
+    grupos = {"551100001111": [_linha("551100001111")]}
+    descartes: list[Descarte] = []
+
+    with pytest.raises(MigracaoAbortada, match="soma não fecha"):
+        validar_soma_fecha(2, grupos, descartes)  # origem diz 2, só existe 1
+
+
+def test_validar_canonicos_no_check_aceita_canonicos_validos():
+    fundida = fundir_grupo("551187654321", [_linha("551187654321")])
+
+    validar_canonicos_no_check({"551187654321": fundida})  # não levanta
+
+
+@pytest.mark.parametrize(
+    "canonico_invalido",
+    [
+        "1234567890",  # 10 dígitos -- colide com forma local BR
+        "12345678901",  # 11 dígitos -- idem
+        "5511987654321",  # BR com o 9º dígito -- o CHECK proíbe
+        "55011987654321",  # zero de tronco
+    ],
+)
+def test_validar_canonicos_no_check_aborta_com_canonico_fora_do_check(
+    canonico_invalido,
+):
+    """`fundir_grupo` não valida o próprio argumento `canonico` -- só quem
+    chama (`agrupar_por_canonico`, via `normalizar_telefone`) garante que
+    ele é válido. Simula aqui o bug de um `canonico` inválido ter chegado
+    até a fusão, para provar que a Task 4 pega isso ANTES de gravar.
+    """
+    fundida = fundir_grupo(canonico_invalido, [_linha(canonico_invalido)])
+
+    with pytest.raises(MigracaoAbortada, match="CHECK"):
+        validar_canonicos_no_check({canonico_invalido: fundida})
+
+
+def test_validar_session_ids_historico_aceita_quando_todos_casam():
+    canonicos = {"551187654321"}
+
+    validar_session_ids_historico(
+        ["551187654321", "+5511987654321"], canonicos
+    )  # não levanta
+
+
+def test_validar_session_ids_historico_normaliza_antes_de_comparar():
+    """`session_id` do n8n pode vir com o 9º dígito -- tem que convergir
+    para o mesmo canônico do lead, não ser tratado como órfão."""
+    canonicos = {"551187654321"}
+
+    validar_session_ids_historico(["11987654321"], canonicos)  # não levanta
+
+
+def test_validar_session_ids_historico_aborta_com_orfao():
+    canonicos = {"551187654321"}
+
+    with pytest.raises(MigracaoAbortada, match="session_id"):
+        validar_session_ids_historico(["551199998888"], canonicos)
+
+
+def test_validar_session_ids_historico_aborta_quando_nao_normaliza():
+    canonicos = {"551187654321"}
+
+    with pytest.raises(MigracaoAbortada, match="session_id"):
+        validar_session_ids_historico(["null"], canonicos)
+
+
+def test_contagem_cumulativa_por_rank():
+    fases = ["formulario_preenchido", "qualificado", "agendou_sessao", "perdido", None]
+
+    contagem = _contagem_cumulativa_por_rank(fases)
+
+    # rank 3 (qualificado): qualificado, agendou_sessao e perdido -- 3.
+    assert contagem[3] == 3
+    # rank 4 (desqualificado/perdido): agendou_sessao e perdido -- 2.
+    assert contagem[4] == 2
+    # rank 5 (agendou_sessao): só agendou_sessao -- 1.
+    assert contagem[5] == 1
+
+
+def test_validar_fases_nao_retrocederam_aceita_igual_ou_maior():
+    esperado = {3: 5, 4: 2, 5: 1}
+
+    validar_fases_nao_retrocederam(esperado, {3: 5, 4: 2, 5: 1})  # igual, não levanta
+    # base viva: o banco pode mostrar MAIS (conversa real durante a janela).
+    validar_fases_nao_retrocederam(esperado, {3: 6, 4: 3, 5: 2})  # não levanta
+
+
+def test_validar_fases_nao_retrocederam_aborta_quando_persistido_e_menor():
+    esperado = {3: 5, 4: 2, 5: 1}
+
+    with pytest.raises(MigracaoAbortada, match="rank>=5"):
+        validar_fases_nao_retrocederam(esperado, {3: 5, 4: 2, 5: 0})
+
+
+# =============================================================================
+# Task 5 -- histórico e continuidade: extrair_turno_de_conversa,
+# montar_historico_por_sessao
+# =============================================================================
+#
+# `n8n_chat_histories.message` é o formato serializado do LangChain:
+# {type, content, additional_kwargs, response_metadata}. Medido contra a
+# origem (via MCP do Supabase, base real -- fix round 1, ver
+# `docs/evidencias/formato-historico-n8n.md`): `human` (3.316 linhas) nunca
+# tem `content` em JSON; `ai` (4.460 linhas) tem 3.316 com `content` que
+# PARECE JSON e 1.144 sem. Dos 3.316 `ai` com `content` JSON, 100% têm a
+# forma `{"output": {"messages": [...]}}` -- ANINHADA sob `output`, não
+# `{"messages": [...]}` no topo (a primeira versão deste módulo assumia o
+# topo, sem medir; corrigido no fix round 1). Dos 1.144 `ai` sem `content`
+# JSON, **1.137** são TEXTO PURO (ex.: `Calling update_crm1 with input:
+# {...}`) e **7** têm `content` igual a `[]` -- um array JSON, não uma
+# string (decomposição corrigida no fix round 2 -- a primeira versão desta
+# nota dizia "todos texto puro", que não era o que a base tinha). Os dois
+# grupos são descartados pelo MESMO teste (`content` não é `str`), então o
+# resultado da migração não muda -- só a decomposição estava errada. Nenhuma
+# das 8.920 linhas da base tem `tool_calls` em `additional_kwargs`. Os
+# fixtures abaixo reproduzem essas formas exatas, não uma aproximação.
+
+
+def _msg_human(texto: str) -> dict:
+    return {
+        "type": "human",
+        "content": texto,
+        "additional_kwargs": {},
+        "response_metadata": {},
+    }
+
+
+def _msg_ai_final(baloes: list[str]) -> dict:
+    """Um `ai` cujo `content` é o envelope de balões do output parser do
+    n8n -- ANINHADO sob `output`, a forma medida contra a base real (fix
+    round 1, `docs/evidencias/formato-historico-n8n.md`): das 3.316 linhas
+    `ai` com `content` JSON, 100% têm exatamente
+    `{"output": {"messages": [...]}}`, nenhuma com `messages` no topo."""
+    import json as _json
+
+    return {
+        "type": "ai",
+        "content": _json.dumps({"output": {"messages": baloes}}),
+        "additional_kwargs": {},
+        "response_metadata": {},
+    }
+
+
+def _msg_ai_tool_call() -> dict:
+    """Um `ai` de PEDIDO de chamada de ferramenta -- `content` é TEXTO
+    PURO (ex.: medido na origem: `Calling update_crm1 with input: {...}`),
+    não JSON e não vazio; `additional_kwargs.tool_calls` nunca aparece na
+    base real (0 das 8.920 linhas tem essa chave), então este módulo nunca
+    lê `additional_kwargs` para decidir nada."""
+    return {
+        "type": "ai",
+        "content": "Calling buscar_agenda with input: {}",
+        "additional_kwargs": {},
+        "response_metadata": {},
+    }
+
+
+def _msg_tool(resultado: str) -> dict:
+    return {
+        "type": "tool",
+        "content": resultado,
+        "additional_kwargs": {},
+        "response_metadata": {},
+    }
+
+
+def test_extrair_turno_de_conversa_mantem_human():
+    assert extrair_turno_de_conversa(_msg_human("Oi, quero saber mais")) == (
+        "human",
+        "Oi, quero saber mais",
+    )
+
+
+def test_extrair_turno_de_conversa_desembrulha_envelope_de_baloes_do_ai():
+    """O `content` do `ai` final é o JSON `{"messages": [...]}` -- este
+    teste morre sob a mutação "injeta o envelope sem desembrulhar": se
+    `extrair_turno_de_conversa` devolver o JSON cru em vez do texto dos
+    balões, as chaves `{"messages":` apareceriam no conteúdo, e o join com
+    linha em branco não bateria."""
+    turno = extrair_turno_de_conversa(
+        _msg_ai_final(["Oi, Fulano!", "Posso te fazer uma pergunta rápida?"])
+    )
+
+    assert turno == ("ai", "Oi, Fulano!\n\nPosso te fazer uma pergunta rápida?")
+    assert "messages" not in turno[1]
+    assert "{" not in turno[1]
+
+
+def test_extrair_turno_de_conversa_descarta_ai_de_chamada_de_tool():
+    """`content` vazio (ou qualquer texto que não parseie como JSON) é
+    pedido de chamada de ferramenta, não resposta final -- nunca entra."""
+    assert extrair_turno_de_conversa(_msg_ai_tool_call()) is None
+
+
+def test_extrair_turno_de_conversa_descarta_ai_com_content_lista():
+    """7 das 1.144 linhas `ai` sem resposta final têm `content` igual a
+    `[]` -- um array JSON dentro do JSONB, não uma string (achado do fix
+    round 2). `isinstance(bruto, str)` descarta antes de tentar
+    `json.loads`, que quebraria com `TypeError` numa lista."""
+    mensagem = {
+        "type": "ai",
+        "content": [],
+        "additional_kwargs": {},
+        "response_metadata": {},
+    }
+
+    assert extrair_turno_de_conversa(mensagem) is None
+
+
+def test_extrair_turno_de_conversa_descarta_ai_com_texto_puro_nao_json():
+    """Um `ai` com `content` de texto puro (não JSON) também é ruído --
+    cobre o caso de um `content` não vazio mas ainda assim não é o
+    envelope de balões."""
+    mensagem = {
+        "type": "ai",
+        "content": "Deixa eu checar sua agenda",
+        "additional_kwargs": {},
+        "response_metadata": {},
+    }
+    assert extrair_turno_de_conversa(mensagem) is None
+
+
+def test_extrair_turno_de_conversa_descarta_tool():
+    """`tool` nunca entra na conversa -- é resultado de execução de
+    ferramenta, nunca texto que o lead leu. Referencia tools cuja
+    assinatura mudou nesta migração (ver cabeçalho do módulo)."""
+    assert extrair_turno_de_conversa(_msg_tool('{"eventos": []}')) is None
+
+
+def test_extrair_turno_de_conversa_descarta_human_vazio():
+    assert extrair_turno_de_conversa(_msg_human("   ")) is None
+
+
+def test_extrair_turno_de_conversa_tipo_desconhecido_descarta():
+    assert extrair_turno_de_conversa({"type": "system", "content": "x"}) is None
+
+
+# --- `_desaninhar_output` (fix round 1) -------------------------------------
+#
+# A primeira versão deste módulo assumia `{"messages": [...]}` no topo do
+# `content` de um `ai` final -- sem medir contra a base real. Medido depois
+# (via MCP do Supabase, 27/07/2026): as 3.316 linhas `ai` com `content` JSON
+# têm TODAS a forma `{"output": {"messages": [...]}}`. `_desaninhar_output`
+# existe para reduzir essa forma à que `extrair_baloes` (elevec_sdr/saida.py,
+# NUNCA alterado por esta correção) já sabe ler.
+
+
+def test_desaninhar_output_extrai_o_objeto_interno():
+    import json as _json
+
+    bruto = _json.dumps({"output": {"messages": ["Oi!", "Tudo bem?"]}})
+
+    assert _desaninhar_output(bruto) == _json.dumps({"messages": ["Oi!", "Tudo bem?"]})
+
+
+def test_desaninhar_output_preserva_forma_sem_output():
+    """O formato do agente NOVO (`messages` no topo, sem embrulho) passa
+    intacto -- `_desaninhar_output` só age quando existe uma chave `output`
+    que é objeto."""
+    import json as _json
+
+    bruto = _json.dumps({"messages": ["Oi!"]})
+
+    assert _desaninhar_output(bruto) == bruto
+
+
+def test_desaninhar_output_preserva_json_nao_e_dict():
+    import json as _json
+
+    bruto = _json.dumps(["Oi!"])
+
+    assert _desaninhar_output(bruto) == bruto
+
+
+def test_desaninhar_output_preserva_quando_output_nao_e_objeto():
+    import json as _json
+
+    bruto = _json.dumps({"output": "texto solto, não objeto"})
+
+    assert _desaninhar_output(bruto) == bruto
+
+
+def test_extrair_turno_de_conversa_desembrulha_a_forma_real_aninhada_em_output():
+    """A forma MEDIDA na base real -- ver o cabeçalho da seção Task 5 no
+    módulo. Este é o teste que teria falhado contra a implementação
+    original (que buscava `messages` no topo): sem `_desaninhar_output`,
+    `extrair_baloes` não acha a lista, loga `extrair_baloes_sem_lista_
+    messages` e devolve o JSON cru como balão único."""
+    turno = extrair_turno_de_conversa(_msg_ai_final(["Oi, Diego!", "Tudo certo?"]))
+
+    assert turno == ("ai", "Oi, Diego!\n\nTudo certo?")
+    assert "output" not in turno[1]
+    assert "{" not in turno[1]
+
+
+def test_extrair_turno_de_conversa_ai_json_sem_lista_de_baloes_vira_balao_unico():
+    """Nenhuma linha da base real tem essa forma (medido: 0 de 3.316) --
+    mas o código não pode travar se aparecer. `content` JSON sem `messages`
+    nem no topo nem sob `output` cai no MESMO fallback que `extrair_baloes`
+    já usa para qualquer JSON sem a lista de balões: o texto JSON inteiro
+    vira um balão único (com aviso de log em `extrair_baloes`), nunca uma
+    exceção nem uma perda silenciosa da linha."""
+    mensagem = {
+        "type": "ai",
+        "content": '{"algum_campo": "sem messages em lugar nenhum"}',
+        "additional_kwargs": {},
+        "response_metadata": {},
+    }
+
+    turno = extrair_turno_de_conversa(mensagem)
+
+    assert turno is not None
+    papel, conteudo = turno
+    assert papel == "ai"
+    assert conteudo == '{"algum_campo": "sem messages em lugar nenhum"}'
+
+
+def _linha_hist(
+    id_origem: int, session_id: str, mensagem: dict
+) -> LinhaHistoricoOrigem:
+    return LinhaHistoricoOrigem(
+        id_origem=id_origem, session_id=session_id, mensagem=mensagem
+    )
+
+
+def test_montar_historico_filtra_ruido_e_preserva_ordem_cronologica():
+    """`tool` e o `ai` de chamada de tool nunca aparecem no resultado; o que
+    sobra vem na ordem de `id_origem`, não na ordem em que as linhas foram
+    passadas para a função."""
+    linhas = [
+        _linha_hist(3, "5511987654321", _msg_ai_final(["Segunda resposta"])),
+        _linha_hist(1, "5511987654321", _msg_human("Primeira mensagem")),
+        _linha_hist(2, "5511987654321", _msg_ai_tool_call()),
+        _linha_hist(4, "5511987654321", _msg_tool('{"ok": true}')),
+    ]
+
+    resultado = montar_historico_por_sessao(linhas)
+
+    assert resultado["551187654321"] == [
+        ("human", "Primeira mensagem"),
+        ("ai", "Segunda resposta"),
+    ]
+
+
+def test_montar_historico_janela_conta_turnos_depois_do_filtro_nao_linhas_brutas():
+    """DECISÃO DA TASK: a janela de 12 conta turnos DEPOIS de descartar
+    ruído de tool -- não as últimas 12 linhas brutas da origem. Aqui, 4
+    turnos reais de conversa ficam cercados por ruído de tool tanto ANTES
+    quanto DEPOIS deles (uma sessão que terminou com uma chamada de
+    ferramenta sem resposta final, ex.: o lead sumiu no meio). Se a janela
+    contasse linhas BRUTAS, as últimas 2 linhas seriam as 2 de ruído
+    FINAL, e o resultado ficaria vazio -- perdendo os 2 turnos reais mais
+    recentes. Contando depois do filtro, são exatamente esses 2 turnos que
+    sobrevivem."""
+    ruido_antes = [
+        _linha_hist(i, "5511987654321", _msg_tool('{"ok": true}')) for i in range(1, 11)
+    ]
+    conversa = [
+        _linha_hist(11, "5511987654321", _msg_human("m1")),
+        _linha_hist(12, "5511987654321", _msg_ai_final(["r1"])),
+        _linha_hist(13, "5511987654321", _msg_human("m2")),
+        _linha_hist(14, "5511987654321", _msg_ai_final(["r2"])),
+    ]
+    ruido_depois = [
+        _linha_hist(15, "5511987654321", _msg_ai_tool_call()),
+        _linha_hist(16, "5511987654321", _msg_tool('{"ok": true}')),
+    ]
+
+    resultado = montar_historico_por_sessao(
+        ruido_antes + conversa + ruido_depois, janela=2
+    )
+
+    assert resultado["551187654321"] == [("human", "m2"), ("ai", "r2")]
+
+
+def test_montar_historico_funde_duas_formas_de_session_id_no_mesmo_canonico():
+    """`session_id` bruto com e sem o 9º dígito convergem para o mesmo
+    canônico -- os turnos das duas formas se fundem em ORDEM CRONOLÓGICA
+    real (por `id_origem`), não como duas sessões separadas."""
+    linhas = [
+        _linha_hist(1, "5511987654321", _msg_human("com o 9")),
+        _linha_hist(2, "551187654321", _msg_ai_final(["sem o 9"])),
+    ]
+
+    resultado = montar_historico_por_sessao(linhas)
+
+    assert resultado == {"551187654321": [("human", "com o 9"), ("ai", "sem o 9")]}
+
+
+def test_montar_historico_session_id_que_nao_normaliza_nao_aparece():
+    linhas = [_linha_hist(1, "null", _msg_human("oi"))]
+
+    resultado = montar_historico_por_sessao(linhas)
+
+    assert resultado == {}
+
+
+def test_montar_historico_sessao_so_com_ruido_nao_aparece():
+    linhas = [
+        _linha_hist(1, "5511987654321", _msg_ai_tool_call()),
+        _linha_hist(2, "5511987654321", _msg_tool('{"ok": true}')),
+    ]
+
+    resultado = montar_historico_por_sessao(linhas)
+
+    assert resultado == {}
+
+
+@pytest.mark.parametrize("janela_invalida", [0, -1, -12])
+def test_montar_historico_janela_zero_ou_negativa_nao_devolve_nada(janela_invalida):
+    """`janela <= 0` significa "nada cabe" -- fix round 2. A versão
+    anterior tratava isso como "sem limite" (devolvia TUDO), o oposto do
+    que o parâmetro sugere."""
+    linhas = [
+        _linha_hist(1, "5511987654321", _msg_human("m1")),
+        _linha_hist(2, "5511987654321", _msg_ai_final(["r1"])),
+    ]
+
+    resultado = montar_historico_por_sessao(linhas, janela=janela_invalida)
+
+    assert resultado["551187654321"] == []
+
+
+def test_montar_historico_default_da_janela_e_12():
+    """Fixa o DEFAULT do parâmetro `janela` contra mutação -- 185 das 736
+    sessões reais têm mais de 12 turnos, então o default é carga real, não
+    decoração (medido pelo revisor). 13 turnos reais para uma sessão;
+    chamando SEM passar `janela`, o resultado tem que manter exatamente os
+    12 mais recentes (descartando só o mais antigo)."""
+    linhas = [
+        _linha_hist(i, "5511987654321", _msg_human(f"m{i}")) for i in range(1, 14)
+    ]
+
+    resultado = montar_historico_por_sessao(linhas)
+
+    turnos = resultado["551187654321"]
+    assert len(turnos) == 12
+    assert turnos[0] == ("human", "m2")
+    assert turnos[-1] == ("human", "m13")

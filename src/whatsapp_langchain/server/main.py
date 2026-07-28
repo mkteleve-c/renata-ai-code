@@ -19,6 +19,9 @@ from whatsapp_langchain.agents.loader import AgentNotFoundError
 from whatsapp_langchain.server.routes.admin import router as admin_router
 from whatsapp_langchain.server.routes.health import router as health_router
 from whatsapp_langchain.server.routes.webhook import router as webhook_router
+from whatsapp_langchain.server.routes.webhook_evolution import (
+    router as webhook_evolution_router,
+)
 from whatsapp_langchain.server.routes.webhook_meta import (
     router as webhook_meta_router,
 )
@@ -99,6 +102,7 @@ app.include_router(health_router)
 app.include_router(webhook_router)
 app.include_router(webhook_meta_router)
 app.include_router(webhook_uazapi_router)
+app.include_router(webhook_evolution_router)
 app.include_router(admin_router)
 
 # Webhook sincrono — apenas para dev/testes, nunca em producao.

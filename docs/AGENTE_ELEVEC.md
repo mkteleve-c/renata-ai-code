@@ -1,0 +1,482 @@
+# Agente `elevec_sdr` — a Renata
+
+Assistente de pré-vendas da **EleveC**. Qualifica leads por WhatsApp e agenda
+a *Consultoria de Alavancagem de Carreira* na agenda de **Silvio Hirata**.
+
+Porte do workflow n8n `#1 Agente SDR | 10/02/26 | V2.2` (id `i5CHQ5VgzrA65kuK`).
+A fonte de verdade do prompt é `docs/evidencias/prompt-renata-n8n.md`, extraída
+do sistema em produção — **não reescreva o SOP a partir deste documento**.
+
+```
+src/whatsapp_langchain/agents/catalog/elevec_sdr/
+├── agent.py      build_graph() — create_agent, temperature=0.3
+├── graph.py      export `graph` para o LangGraph Studio
+├── prompts.py    SYSTEM_PROMPT (o SOP verbatim + 3 mudanças documentadas)
+├── contexto.py   middleware que interpola {nome}/{origem}/{telefone}/{data_hoje}
+├── saida.py      extrair_baloes() — JSON estruturado → balões de WhatsApp
+└── tools/
+    ├── agenda.py    5 tools de Google Calendar
+    ├── crm.py       update_crm
+    ├── handover.py  human_handover
+    └── interno.py   o marcador [sistema]
+```
+
+Seleção pelo webhook: `POST /webhook/evolution?agent=elevec_sdr`.
+`thread_id = "{phone}:elevec_sdr"`.
+
+---
+
+## Quem a Renata atende — e quem ela NÃO atende
+
+Isto é escopo de produto, não detalhe de implementação, e determina quantos
+leads a migração toca.
+
+**Ela atende** o lead que preencheu o formulário, **não agendou sozinho** e
+está na faixa de **R$ 5 a 8 mil** de faturamento mensal — o roteamento é feito
+pelo formulário, antes de a conversa chegar aqui.
+
+**Ela não atende:**
+
+- quem já agendou pelo próprio formulário (esse vai direto para a agenda);
+- as faixas de faturamento fora de R$ 5–8 mil, que o time comercial trata por
+  outro caminho;
+- suporte a cliente ativo, cobrança, ou qualquer assunto pós-venda.
+
+Consequência prática registrada na Fase 4: os leads em `formulario_preenchido`
+no banco de origem **não são todos dela**. Conferir a distribuição por faixa
+antes de migrar, em vez de assumir que a fila inteira é da Renata.
+
+---
+
+## As 8 fases do SOP
+
+O prompt numera de 0 a 8. Fase 0 não é conversa — é a regra que impede a
+Renata de repetir a saudação quando o histórico já tem uma.
+
+| # | Fase | O que acontece |
+|---|---|---|
+| 0 | Identificação de contexto | Lê o histórico. Se já houve saudação, pula direto para a Fase 2. |
+| 1 | Acolhimento | Saudação com o primeiro nome + permissão para uma pergunta de diagnóstico. |
+| 2 | Diagnóstico & Filtro | "Qual o principal desafio ou objetivo na sua carreira hoje?" |
+| 3 | Aprofundamento | Avalia contra C1/C2. Resposta rasa → pede exemplos. Educa sobre o posicionamento e valida o entendimento. |
+| 4 | Ponte e Transição | Validação empática → conexão → fechamento assumido: "qual turno fica melhor?" |
+| 5 | Disponibilidade | `calendar_get_many` e oferta **apenas** de horários livres. |
+| 6 | **Portão de e-mail** | "Para eu te enviar o convite oficial, qual seu melhor e-mail?" |
+| 7 | **Portão de faturamento** | "Qual seu faturamento médio mensal hoje?" Não avança sem resposta clara. |
+| 8 | Agendamento | Reconsulta a disponibilidade, `calendar_agendar`, confirma. |
+
+### Critérios de desqualificação
+
+Se qualquer um bater, **não agende**. Use disrupção e requalificação antes de
+encerrar, e encerre de forma educada.
+
+- **C1 — Recolocação / "arrumar emprego"**: o lead quer indicação, vaga,
+  colocação rápida, ou que o Silvio consiga emprego por ele.
+  *"quero uma vaga"*, *"preciso de indicação"*, *"recolocação urgente"*.
+- **C2 — Fora do escopo**: o objetivo principal não é carreira corporativa,
+  posicionamento ou liderança. *"quero passar em concurso"*, *"quero abrir um
+  negócio do zero"*, *"quero terapia como foco"*.
+
+---
+
+## As 7 tools
+
+| Tool | O que faz |
+|---|---|
+| `calendar_get_many(periodo, a_partir_de)` | Horários livres, já com escassez aplicada. `manha`/`tarde`/`noite`/`qualquer`. |
+| `calendar_agendar(inicio, email, faturamento_mensal)` | Cria o evento e grava `google_event_id`. **Recusa sem e-mail e sem faturamento.** |
+| `calendar_update(novo_inicio, event_id)` | Reagenda. Reconsulta o novo horário antes de mover. |
+| `calendar_delete(event_id)` | Cancela e limpa o vínculo no cadastro. |
+| `calendar_get_event(event_id)` | Detalhes da consultoria marcada. |
+| `update_crm(phase, email, faturamento_mensal)` | Move o lead no funil e o card no Pipedrive. |
+| `human_handover(motivo)` | Desliga o agente para o lead e avisa o responsável. |
+
+O telefone **nunca** vem por argumento: todas resolvem o lead pelo
+`configurable` do turno (`telefone_do_turno`). Um `phone` parametrizável
+deixaria o modelo desqualificar o lead da conversa anterior.
+
+Toda tool devolve **string** em qualquer desfecho, inclusive erro — exceção
+que sobe derruba o turno; uma frase deixa a Renata seguir o SOP.
+
+### Fases aceitas por `update_crm`
+
+`qualificado`, `agendou_sessao`, `desqualificado`. `formulario_preenchido` e
+`iniciou_conversa` são do gate de ingestão; `perdido` é julgamento do time
+comercial. `agendou_sessao` e `desqualificado` desligam o follow-up;
+`desqualificado` **não move card** (o funil não tem estágio de descarte).
+
+---
+
+## Política de agenda
+
+Herdada do workflow `#3 Agenda` do n8n:
+
+- segunda a sexta, **slots de 60 minutos em hora cheia**;
+- manhã `8–11`, tarde `13–17`, noite `18–21`;
+- janela de **4 dias corridos a partir de D+1** — hoje nunca é oferecido;
+- escassez: no máximo **2 dias × 2 horários** (4 slots);
+- quando o lead não pede período, a preferência é **tarde → noite → manhã**, e
+  o segundo horário vem de outro período (`13, 18` é escolha de verdade;
+  `13, 14` é a mesma resposta duas vezes).
+
+**Ocupado é sobreposição de intervalo, nunca igualdade de hora** — a leitura
+real da agenda trouxe eventos de duração quebrada e sobrepostos entre si.
+Evento de dia inteiro bloqueia o dia inteiro; `status: "cancelled"` não ocupa
+nada.
+
+O `event_id` é **determinístico**, derivado de `(lead, slot)`: retry não
+duplica consultoria, ele colide em 409. O único `event_id` que
+`calendar_update`/`delete`/`get_event` aceitam é o gravado no lead — id
+divergente é recusado, não obedecido.
+
+---
+
+## Os portões validados em código
+
+O prompt chama a sequência de "INVIOLÁVEL" e "TERMINANTEMENTE PROIBIDO".
+Parágrafo pede; `if` garante. O que está no código:
+
+| Regra | Onde | O que acontece se violada |
+|---|---|---|
+| Não agendar sem e-mail | `calendar_agendar` | Recusa e manda voltar à Fase 6. |
+| Não agendar sem faturamento | `calendar_agendar` | Recusa e manda voltar à Fase 7. |
+| Não agendar hoje, fim de semana, meia hora ou fora da grade | `validar_slot` | Recusa com o motivo. |
+| Não agendar horário ocupado | reconsulta em `calendar_agendar` | Recusa e pede outro horário. |
+| Não marcar duas consultorias para o mesmo lead | `google_event_id` no cadastro | Manda usar `calendar_update`. |
+| Nunca reescrever a mesma `phase` | `where phase is distinct from` em `gravar_fase` | Casa zero linhas e **não move card**. |
+| `qualificado` nunca sobrescreve `agendou_sessao` | mesmo `where` | Recusa o retrocesso do funil. |
+| Card só se move se a fase gravou | `update_crm` | Sem gravação, sem card. |
+| Handover desliga o agente antes de dizer que desligou | `pausar_agente` | `rowcount == 0` reporta falha em vez de mentir. |
+
+Cobertura: `tests/unit/test_tool_agenda.py`, `tests/integration/test_tool_agenda_db.py`,
+`tests/integration/test_tool_crm.py`, `tests/integration/test_roteiro_sop.py`.
+
+---
+
+## O marcador `[sistema]`
+
+As tools devolvem ao modelo texto operacional — *"o card no Pipedrive não foi
+movido"*, *"acione o human_handover"*, *"cadastro do lead"*. Esse texto entra
+na conversa como resultado de tool, e nada impede o modelo de repassá-lo ao
+lead. No n8n o problema não existia: lá as tools eram nós do workflow.
+
+O contrato tem duas metades, e as duas precisam existir:
+
+1. **`tools/interno.py`** marca a string com o prefixo `[sistema] `.
+   `crm.py` e `handover.py` marcam **100%** dos retornos. `agenda.py` marca
+   **seletivamente** — as saídas de `calendar_get_many` e a confirmação de
+   agendamento carregam fato que o lead precisa, e marcar tudo diluiria o
+   sinal até ele não distinguir nada.
+2. **O bloco `### Resultado de tool (texto interno)` do prompt** diz o que
+   fazer com o marcador: agir sobre o texto e responder ao lead com
+   linguagem própria, nunca repetir, citar, traduzir ou resumir.
+
+Sem a metade 2, o prefixo é só mais um pedaço de texto que o modelo repete.
+
+---
+
+## Saída em balões
+
+A Renata é o único agente do catálogo que responde **JSON estruturado**:
+
+```json
+{"messages": ["Oi, Marcos!", "Posso te fazer uma pergunta rápida?"]}
+```
+
+Cada item vira um balão separado no WhatsApp, espaçados por `BALAO_DELAY_MS`.
+`extrair_baloes` (em `saida.py`) faz o parse do **texto final**, depois que o
+ciclo de tools terminou — é o mesmo mecanismo do `outputParserStructured` do
+n8n, e não `response_format` nativo (que quebra o schema quando há tool call
+pendente no mesmo turno).
+
+Desvio de schema cai para o **texto bruto inteiro**, nunca para uma lista
+mutilada: perder a formatação é melhor que entregar metade da resposta sem
+ninguém perceber. Todo fallback loga `warning`.
+
+---
+
+## Régua de follow-up
+
+Task assíncrona no Worker (`worker/followup.py`, subida por `iniciar_followup`
+em `worker/main.py`) que reengaja lead silencioso em três degraus, sem
+depender de o modelo lembrar de nada — mesma doutrina de "`if` garante, prompt
+só pede" do resto do agente. **Desligada por padrão** (`FOLLOWUP_ENABLED=false`)
+até o cutover: religar cedo demais dispara mensagem de verdade contra leads
+reais sem o resto da migração (webhook do ChatWoot, mapa de template por
+origem da Fase 5) pronto para sustentar o que ela solta.
+
+### Os três degraus, e por que a âncora é `last_inbound_at`
+
+| Degrau | Dispara em | Mensagem |
+|---|---|---|
+| 1 | inbound + 15 min | `"{primeiro nome}?"` ou `"Oi?"` |
+| 2 | inbound + 1h15 | *"Opa, imagino que esteja corrido aí!..."* |
+| 3 | inbound + 23h | `"{nome}, tudo bem? Ainda faz sentido..."` |
+
+Os três contam a partir de `leads_crm.last_inbound_at` — o instante do
+**último inbound do lead**, gravado só pelo gate de ingestão — e não do envio
+anterior (`last_interaction_at`). A diferença importa porque `last_interaction_at`
+também é atualizado pelo próprio follow-up, o que tornaria a escada
+**cumulativa**: medido no banco legado, o degrau 3 caía numa mediana de 24h28
+desde a criação do lead — depois de a janela de 24h da Cloud API já ter
+fechado, e a Meta rejeita envio fora da janela em vez de atrasá-lo. Ancorada
+no inbound, a escada é **absoluta**: os até 5 minutos de atraso de cada
+rodada (`FOLLOWUP_INTERVAL_SECONDS`) não se acumulam de um degrau para o
+outro.
+
+### O contador sobe antes do envio — divergência consciente do n8n
+
+`reivindicar` incrementa `followup_count` no mesmo `UPDATE` que trava o lote
+(`FOR UPDATE SKIP LOCKED`), **antes** de qualquer HTTP acontecer. O n8n
+incrementava só depois de o envio ter sucesso. Aqui, uma falha de envio (a
+Evolution fora do ar, timeout) faz o lead **pular um degrau** em vez de
+tentar de novo na próxima rodada — a alternativa, reenviar, arrisca mandar a
+mesma mensagem duas vezes se a falha foi só na resposta e a mensagem já
+tinha saído. Mandar duas vezes é pior que perder um follow-up.
+
+### Quem sai da janela de 24h
+
+Um lead cujo degrau venceu mas cujo `last_inbound_at` já passou de
+`24h − FOLLOWUP_JANELA_MARGEM_MINUTOS` **não é reivindicado** — ele não entra
+no `UPDATE`, então `followup_count` não avança e o degrau não é queimado à
+toa. Ele **não é reclamado como enviado nem como perdido**: fica parado no
+mesmo degrau até voltar a falar. Quando volta, `aplicar_gate` zera
+`followup_count` e atualiza `last_inbound_at` no mesmo inbound que já reseta
+a escada por outros motivos — o lead reentra do zero, não do meio.
+
+Na operação, isso é visível pelo campo `bloqueados_por_janela` do resumo de
+`rodada()` (`{"enviados", "falhas", "abortados", "bloqueados_por_janela"}`,
+logado a cada rodada). Sem esse contador, "a régua morreu" (bug) e "não havia
+ninguém para reengajar" (dia calmo) são indistinguíveis olhando só
+`enviados == 0`.
+
+### A régua respeita a `blocklist` — e isso importa mais aqui do que em qualquer outro lugar
+
+A checagem de `blocklist` entra dentro do próprio predicado de elegibilidade
+do claim (antes do `LIMIT`, para não causar starvation — um lote todo
+bloqueado nunca deixaria o próximo lead elegível ser alcançado) e é
+revalidada de novo em `ainda_vale_enviar`, imediatamente antes do envio. A
+régua é o **único caminho do sistema que fala com o lead sem ele ter
+falado primeiro** — toda outra mensagem que sai é resposta a um inbound.
+Um opt-out que a régua ignorasse seria a única forma de esta base contatar
+alguém que pediu para não ser contatado.
+
+### `send_template` existe, e o follow-up não o usa
+
+`EvolutionClient.send_template` (Task 2 da Fase 3) foi implementado para
+abrir a janela de 24h via template aprovado pela Meta — é o que a Fase 5
+vai usar para reengajar quem *já* saiu da janela. O follow-up desta fase
+não chama: os dois templates que a EleveC tem hoje na Meta
+(`boas_vindas_renata_linkedin_02`, `boas_vindas_renata_respondiapp_03`) são
+de **boas-vindas**, para o primeiro contato vindo de formulário. Mandar
+"boas-vindas" para um lead no meio de uma conversa — que é exatamente quem a
+régua persegue — é pior que não mandar nada. Reabrir uma janela fechada de
+verdade exige um template de retomada dedicado, aprovado pela Meta, e essa
+é decisão de produto do cliente, não deste código. Dívida registrada para a
+Fase 5.
+
+### `leads_crm.phone` sempre canônico — a invariante que sustenta o claim
+
+Ver a seção **"Invariante de telefone"**, mais abaixo. A régua depende dela
+diretamente: o claim (`_SQL_ELEGIVEIS_TRAVADOS` em `worker/followup.py`) é
+uma consulta única porque o CHECK do banco garante que cada pessoa é
+**uma linha só** — antes da migração `014`, o mesmo lead podia ter até três
+linhas físicas e o claim precisava de uma segunda consulta travada só para
+alcançar o "irmão" fora do lote, sob risco de mandar a mesma mensagem duas
+vezes para a mesma pessoa.
+
+### Melhoria de produto fora de escopo: perseguir quem cancelou
+
+`reverter_fase_apos_cancelamento` (`tools/crm.py`) devolve o lead de
+`agendou_sessao` para `qualificado` e religa `followup_active` quando
+`agent_active`. Isso **restaura a coerência do estado** — a coluna volta ao
+valor que teria se a reunião nunca tivesse existido — mas **não** coloca o
+lead de volta na régua: `qualificado` está fora do filtro de fases do claim
+de propósito. Numa migração, a direção segura de errar é não mandar mensagem
+que o sistema atual não manda. Perseguir quem cancelou para tentar remarcar
+é melhoria real, mas é decisão de produto a discutir com o cliente **depois**
+do cutover — não uma promessa em aberto desta fase.
+
+---
+
+## Variáveis de ambiente
+
+### Google Calendar (obrigatórias para agendar)
+
+```
+GOOGLE_CLIENT_ID=
+GOOGLE_CLIENT_SECRET=
+GOOGLE_REFRESH_TOKEN=
+GOOGLE_CALENDAR_ID=       # o e-mail do calendário
+```
+
+OAuth 2.0 de aplicação instalada. **Rotacionar o OAuth Client no Google Cloud
+Console invalida o refresh token** e derruba o agendamento até alguém
+reautorizar.
+
+### Pipedrive (funil comercial)
+
+```
+PIPEDRIVE_API_TOKEN=
+PIPEDRIVE_STAGE_QUALIFICADO=12
+PIPEDRIVE_STAGE_AGENDADO=13
+```
+
+Sem token, a fase ainda é gravada no banco e só o card não se move — deploy
+sem Pipedrive é escolha válida, e vira `crm_pipedrive_nao_configurado` no log,
+não incidente.
+
+### Handover
+
+```
+HANDOVER_NOTIFY_PHONE=    # E.164 ou só dígitos
+```
+
+Quem recebe o aviso quando `human_handover` desliga o agente. **Vazio significa
+handover silencioso**: o agente desliga, o lead fica esperando e ninguém é
+acionado.
+
+### Balões
+
+```
+BALAO_DELAY_MS=700        # espaçamento entre balões
+BALAO_MAX_COUNT=10        # teto; acima disso o resto concatena no último
+```
+
+O teto protege o `lease_seconds`: sem ele, uma resposta com dezenas de itens
+soma sleep suficiente para estourar o lease e, com mais de um worker,
+duplicar o envio.
+
+### Follow-up (régua de reengajamento)
+
+```
+FOLLOWUP_ENABLED=false                 # desligada até o cutover, de propósito
+FOLLOWUP_INTERVAL_SECONDS=300          # intervalo do loop no Worker
+FOLLOWUP_BATCH_SIZE=10                 # LIMIT reivindicado por rodada
+FOLLOWUP_NIVEL1_MINUTOS=15             # degrau 1, desde last_inbound_at
+FOLLOWUP_NIVEL2_MINUTOS=75             # degrau 2 (1h15)
+FOLLOWUP_NIVEL3_MINUTOS=1380           # degrau 3 (23h)
+FOLLOWUP_JANELA_MARGEM_MINUTOS=30      # folga antes das 24h da Cloud API
+```
+
+Ver a seção **"Régua de follow-up"**, acima, para a âncora em
+`last_inbound_at`, a divergência do contador e o que acontece com quem sai
+da janela de 24h. Sem cliente Evolution configurado, `iniciar_followup` não
+sobe a task (loga `followup_sem_canal`) mesmo com a flag ligada.
+
+### Fail-fast no boot
+
+As **seis** variáveis de Google + Pipedrive + handover formam um grupo só em
+`Settings._sdr_credentials_status()`, com a mesma doutrina de "toque parcial"
+dos canais de mensagem:
+
+- **nenhuma preenchida** → o SDR fica desabilitado e o boot passa. É o que
+  permite a deploys de `illumi_assistant`/`rhawk_assistant` subirem normalmente.
+- **alguma preenchida e outra faltando, em `OUTBOUND_MODE=real`** →
+  `ValueError` no boot da API e do Worker.
+- **`HANDOVER_NOTIFY_PHONE` preenchido mas irreconhecível** (`"ramal 42"`) →
+  também derruba. Era o caso pior: passa em qualquer checagem de "está
+  configurado" e só morre dentro do `except` do envio.
+- **`OUTBOUND_MODE=mock`** → isento, igual aos canais.
+
+---
+
+## Divergências de paridade com o n8n — decisão de deploy
+
+Duas configurações do harness **não** batem com o que a evidência registra do
+n8n. As duas são variáveis de ambiente, e as duas precisam de decisão
+explícita antes do cutover.
+
+| Item | n8n (evidência) | Default do harness | Onde decidir |
+|---|---|---|---|
+| Modelo | `x-ai/grok-4.3` | `x-ai/grok-4.1-fast` | `OPENROUTER_MODEL` |
+| Janela de contexto | 12 **mensagens** | `TRIM_KEEP_TURNS=5` (dev) / `SUMMARIZE_KEEP_MESSAGES=10` (prod) | `CONTEXT_STRATEGY` + a variável da estratégia |
+
+**Modelo.** O default do harness é compartilhado com `illumi_assistant` e
+`rhawk_assistant` — por isso não foi trocado no `config.py`. Um deploy que
+atende leads da EleveC precisa setar `OPENROUTER_MODEL=x-ai/grok-4.3`
+explicitamente; sem isso a Renata roda num modelo diferente daquele em que o
+SOP foi validado em produção.
+
+**Janela.** As unidades nem são as mesmas: `TRIM_KEEP_TURNS` conta turnos e
+`SUMMARIZE_KEEP_MESSAGES` conta mensagens. Os dois defaults guardam menos
+histórico que as 12 mensagens do n8n, e num SOP de 8 fases em que e-mail
+(Fase 6) e faturamento (Fase 7) chegam em turnos distintos, isso é a
+diferença entre lembrar e reperguntar.
+
+Os dois `.env.*.example` carregam o mesmo aviso, no bloco da variável.
+
+---
+
+## Rodar o SOP inteiro (roteiro de conversa)
+
+`tests/integration/test_roteiro_sop.py` percorre saudação → diagnóstico →
+aprofundamento → turno → horário → e-mail → faturamento → agendamento, e
+também o caminho de desqualificação C1.
+
+```bash
+# Encanamento, sem chave: tools reais, portões, banco, balões.
+uv run pytest tests/integration/test_roteiro_sop.py -v -s
+
+# O modelo de verdade — o único que responde se a Renata segue o SOP.
+OPENROUTER_LIVE_TESTS=1 uv run pytest tests/integration/test_roteiro_sop.py -v -s
+# ou: make test-roteiro
+```
+
+Nos dois modos, **Google Calendar, Pipedrive e o canal de saída são dublês**.
+O único recurso real é o Postgres local, e o lead de teste é apagado no
+teardown. Nenhuma escrita chega a serviço externo.
+
+---
+
+## Invariante de telefone (contrato para o importador da Fase 4)
+
+Desde `db/migrations/014_uma_linha_por_pessoa.sql`, `leads_crm.phone` é
+**sempre** a forma canônica (só dígitos, brasileiro sem o 9º dígito) —
+garantido pelo banco, não por convenção de quem escreve. `CHECK
+leads_crm_phone_canonico_check` proíbe três formas físicas: o 9º dígito do
+celular (`^55[0-9]{2}9[0-9]{8}$`), o zero de tronco (`^550`) e a forma
+local sem DDI (`^[0-9]{10,11}$` — `canonicalizar()` nunca produz essa forma
+para número brasileiro, mas um importador que não canonicalizasse antes de
+escrever poderia).
+
+**Consequência para o importador do Supabase:** ele precisa canonicalizar
+(`shared/phone.py::canonicalizar`) **antes** de inserir, não depois. Uma
+violação do CHECK numa carga em massa falha alto (a linha inteira é
+recusada pelo Postgres) em vez de criar silenciosamente uma segunda linha
+para o mesmo lead — esse é o comportamento desejado. Não trate uma
+`CheckViolation` aqui como bug do importador para contornar; é o banco
+recusando um telefone que chegou sem canonicalizar.
+
+**A cláusula da forma local sem DDI também recusa um estrangeiro legítimo
+de 10 ou 11 dígitos.** Não é alcançável hoje — `resolver_telefone` (o
+caminho de leitura do webhook) só aceita JIDs de 12 a 14 dígitos, então
+nenhum lead real chega com 10/11 — mas o importador da Fase 4, que lê direto
+do Supabase sem passar por `resolver_telefone`, pode encontrar um. Se
+encontrar, é uma restrição real do banco, não um bug do importador para
+contornar com um patch silencioso: registre o lead como descartado (mesmo
+padrão de `leads_descartados`) em vez de forçar a gravação.
+
+**As 3.368 linhas / 151 duplicatas medidas na base legada estão no
+Supabase, não em `leads_crm`.** O `leads_crm` do harness só é escrito por
+`aplicar_gate` (sempre grava canônico) — o bloco de consolidação da 014 é
+**inerte** ali; não há nada para ele consolidar num banco que nunca recebeu
+a base legada. Quem de fato consolida os grupos duplicados da base legada é
+o **importador da Fase 4**, na carga única que povoa `leads_crm` pela
+primeira vez. Isso faz dele uma **terceira cópia** das regras de fusão
+(`_vencedor_pausa`, precedência de `phase`, `max(followup_count)`,
+`min(last_inbound_at)`, `linhas_fundidas`), além de `shared/leads.py` e da
+014 — as três precisam andar juntas. A opção mais segura é o importador
+**reusar** a lógica de consolidação da 014 (ou uma função equivalente
+extraída para `shared/`) em vez de reimplementar as regras pela terceira
+vez; se reimplementar mesmo assim, documentar isso explicitamente no código
+do importador, com o mesmo aviso desta seção.
+
+---
+
+## Ver também
+
+- `docs/evidencias/prompt-renata-n8n.md` — o prompt de produção, verbatim
+- `docs/DATABASE.md` — `leads_crm`, o enum `lead_phase`, o gate de ingestão
+- `docs/EVOLUTION.md` — o canal por onde a Renata fala
+- `docs/ADDING_AGENTS.md` — criar outro agente no catálogo

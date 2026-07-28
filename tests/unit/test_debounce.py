@@ -92,6 +92,132 @@ def setup_media_with_pending(conn, new_id=50, flushed_count=1):
     conn.execute = AsyncMock(side_effect=[lock_cursor(), flush_cursor, insert_cursor])
 
 
+def setup_dedupe_e_debounce(conn, duplicada=None, existente=None, novo_id=42):
+    """Mock do caminho com `message_id` preenchido.
+
+    Ordem de executes: [lock, SELECT dedupe, SELECT debounce, UPDATE|INSERT].
+    Quando `duplicada` vem preenchida a função retorna na segunda chamada e as
+    demais nunca são consumidas.
+    """
+    dedupe_cursor = AsyncMock()
+    dedupe_cursor.fetchone = AsyncMock(
+        return_value=(duplicada,) if duplicada is not None else None
+    )
+    debounce_cursor = AsyncMock()
+    debounce_cursor.fetchone = AsyncMock(return_value=existente)
+    final_cursor = AsyncMock()
+    final_cursor.fetchone = AsyncMock(return_value=(novo_id,))
+
+    conn.execute = AsyncMock(
+        side_effect=[lock_cursor(), dedupe_cursor, debounce_cursor, final_cursor]
+    )
+
+
+class TestDedupePorMessageId:
+    """A chave de deduplicação e o registro do id absorvido pelo debounce."""
+
+    async def test_debounce_registra_o_message_id_absorvido(self, mock_pool):
+        """Numa rajada, o id da 2ª mensagem precisa ficar gravado na linha.
+
+        Sem isso, só a primeira mensagem da rajada tem proteção contra
+        reentrega — e reentrega é o comportamento padrão da Evolution.
+        """
+        pool, conn = mock_pool
+        setup_dedupe_e_debounce(conn, existente=(10, "oi"))
+
+        result = await enqueue_or_buffer(
+            pool,
+            phone_number="+5511999999999",
+            agent_id="assistant",
+            body="tudo bem?",
+            message_id="ID-B",
+        )
+
+        assert result.is_buffered is True
+        # calls: [lock, SELECT dedupe, SELECT debounce, UPDATE]
+        calls = conn.execute.call_args_list
+        update_sql = calls[3][0][0]
+        update_params = calls[3][0][1]
+        assert "message_ids_absorvidos" in update_sql
+        assert "ID-B" in update_params
+
+    async def test_lookup_de_dedupe_inclui_o_telefone(self, mock_pool):
+        """O id do WhatsApp só é único por chat — sem phone_number na chave,
+        a mensagem de outro lead com o mesmo id é descartada em silêncio."""
+        pool, conn = mock_pool
+        setup_dedupe_e_debounce(conn)
+
+        await enqueue_or_buffer(
+            pool,
+            phone_number="+5511999999999",
+            agent_id="assistant",
+            body="oi",
+            message_id="ID-A",
+        )
+
+        # calls: [lock, SELECT dedupe, ...]
+        calls = conn.execute.call_args_list
+        dedupe_sql = calls[1][0][0]
+        dedupe_params = calls[1][0][1]
+        assert "phone_number = %s" in dedupe_sql
+        assert "+5511999999999" in dedupe_params
+
+    async def test_lookup_de_dedupe_ve_os_ids_absorvidos(self, mock_pool):
+        pool, conn = mock_pool
+        setup_dedupe_e_debounce(conn)
+
+        await enqueue_or_buffer(
+            pool,
+            phone_number="+5511999999999",
+            agent_id="assistant",
+            body="oi",
+            message_id="ID-A",
+        )
+
+        dedupe_sql = conn.execute.call_args_list[1][0][0]
+        assert "message_ids_absorvidos" in dedupe_sql
+
+    async def test_alvo_do_on_conflict_bate_com_o_indice(self):
+        from whatsapp_langchain.shared.queue import ALVO_DE_CONFLITO
+
+        assert "(channel, agent_id, phone_number, message_id)" in ALVO_DE_CONFLITO
+
+
+class TestMidiaSemUrlNaoEAlvoDeDebounce:
+    """Linha de mídia da Evolution tem media_url NULL — o predicado de texto
+    precisa olhar também para provider_message_key."""
+
+    async def test_select_de_debounce_exclui_midia_da_evolution(self, mock_pool):
+        pool, conn = mock_pool
+        setup_no_existing(conn)
+
+        await enqueue_or_buffer(
+            pool,
+            phone_number="+5511999999999",
+            agent_id="assistant",
+            body="Texto",
+        )
+
+        select_sql = conn.execute.call_args_list[1][0][0]
+        assert "provider_message_key IS NULL" in select_sql
+
+    async def test_flush_exclui_midia_da_evolution(self, mock_pool):
+        pool, conn = mock_pool
+        setup_media_with_pending(conn)
+
+        await enqueue_or_buffer(
+            pool,
+            phone_number="+5511999999999",
+            agent_id="assistant",
+            body="",
+            media_url="https://api.twilio.com/media/img.jpg",
+            media_type="image/jpeg",
+        )
+
+        flush_sql = conn.execute.call_args_list[1][0][0]
+        assert "provider_message_key IS NULL" in flush_sql
+
+
 class TestTextDebounce:
     """Debounce de mensagens de texto (sem mídia)."""
 

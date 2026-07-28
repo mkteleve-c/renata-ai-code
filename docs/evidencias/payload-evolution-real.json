@@ -1,0 +1,105 @@
+{
+  "messages": {
+    "total": 15710,
+    "pages": 315,
+    "currentPage": 1,
+    "records": [
+      {
+        "id": "cms0okfht037fo24wlp9xyy11",
+        "key": {
+          "id": "wamid.[REDIGIDO]",
+          "fromMe": false,
+          "remoteJid": "557990000000@s.whatsapp.net"
+        },
+        "pushName": "[redigido]",
+        "messageType": "buttonMessage",
+        "message": {
+          "conversation": "[redigido]"
+        },
+        "messageTimestamp": 1785002776,
+        "instanceId": "c6fa5865-23ad-4b5c-a54b-f909ec667dd4",
+        "source": "unknown",
+        "contextInfo": null,
+        "MessageUpdate": []
+      },
+      {
+        "id": "cms0nsfog0379o24wtv2ow3y5",
+        "key": {
+          "id": "wamid.[REDIGIDO]",
+          "fromMe": false,
+          "remoteJid": "554890000000@s.whatsapp.net"
+        },
+        "pushName": "[redigido]",
+        "messageType": "conversation",
+        "message": {
+          "conversation": "[redigido]"
+        },
+        "messageTimestamp": 1785001471,
+        "instanceId": "c6fa5865-23ad-4b5c-a54b-f909ec667dd4",
+        "source": "unknown",
+        "contextInfo": null,
+        "MessageUpdate": []
+      },
+      {
+        "id": "cms0lhmt5036to24w9ioomxlm",
+        "key": {
+          "id": "wamid.[REDIGIDO]",
+          "fromMe": false,
+          "remoteJid": "5517900000000@s.whatsapp.net"
+        },
+        "pushName": "[redigido]",
+        "messageType": "conversation",
+        "message": {
+          "contextInfo": {
+            "stanzaId": "wamid.[REDIGIDO]"
+          },
+          "conversation": "[redigido]"
+        },
+        "messageTimestamp": 1784997606,
+        "instanceId": "c6fa5865-23ad-4b5c-a54b-f909ec667dd4",
+        "source": "unknown",
+        "contextInfo": {
+          "stanzaId": "wamid.[REDIGIDO]"
+        },
+        "MessageUpdate": []
+      },
+      {
+        "id": "cms14fm1203avo24wivqgggpm",
+        "key": {
+          "id": "wamid.[REDIGIDO]",
+          "fromMe": true,
+          "remoteJid": "553890000000@s.whatsapp.net"
+        },
+        "pushName": null,
+        "messageType": "conversation",
+        "message": {
+          "conversation": "[redigido]"
+        },
+        "messageTimestamp": 1785029429,
+        "instanceId": "c6fa5865-23ad-4b5c-a54b-f909ec667dd4",
+        "source": "unknown",
+        "contextInfo": null,
+        "MessageUpdate": []
+      },
+      {
+        "id": "cms12408o03a1o24w59uwlwhc",
+        "key": {
+          "id": "wamid.[REDIGIDO]",
+          "fromMe": true,
+          "remoteJid": "553890000000@s.whatsapp.net"
+        },
+        "pushName": null,
+        "messageType": "conversation",
+        "message": {
+          "conversation": "[redigido]"
+        },
+        "messageTimestamp": 1785025528,
+        "instanceId": "c6fa5865-23ad-4b5c-a54b-f909ec667dd4",
+        "source": "unknown",
+        "contextInfo": null,
+        "MessageUpdate": []
+      }
+    ]
+  },
+  "_evidencia_nota": "Amostra de 5 registros (de 50 retornados na pagina 1, limit do payload nao foi respeitado pelo endpoint) da instancia instancia-apioficial (WHATSAPP-BUSINESS). Dados pessoais (telefones em remoteJid/key.id/stanzaId, pushName, conteudo de mensagens) foram redigidos preservando estrutura e formato dos campos. Nenhum registro, nos 50 da pagina 1, trouxe key.remoteJidAlt preenchido -- o campo simplesmente nao existe no objeto key desta integracao."
+}

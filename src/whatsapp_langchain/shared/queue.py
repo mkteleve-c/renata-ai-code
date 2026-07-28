@@ -17,8 +17,11 @@ Uso:
 
 import hashlib
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import structlog
+from psycopg import AsyncConnection
+from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
 
 from whatsapp_langchain.shared.models import (
@@ -28,6 +31,85 @@ from whatsapp_langchain.shared.models import (
 )
 
 logger = structlog.get_logger()
+
+
+# Alvo explícito do ON CONFLICT: sem ele, o DO NOTHING engoliria em silêncio
+# qualquer unique constraint que a tabela venha a ganhar. Repete o predicado
+# do índice parcial da migração 012 para que o Postgres consiga inferi-lo.
+ALVO_DE_CONFLITO = (
+    "ON CONFLICT (channel, agent_id, phone_number, message_id) "
+    "WHERE message_id IS NOT NULL DO NOTHING"
+)
+
+# Texto para efeito de debounce é a linha sem NENHUM sinal de mídia —
+# espelha o `has_media` de `enqueue_or_buffer`. `media_url IS NULL` sozinho
+# não serve: uma linha de mídia da Evolution sem URL tem exatamente isso,
+# com a `provider_message_key` preenchida, e quando volta para `queued` num
+# retry viraria alvo de debounce (legenda corrompida com texto alheio, e a
+# mensagem nova herdando as tentativas e o pré-processamento da mídia).
+PREDICADO_DE_TEXTO = "media_url IS NULL AND provider_message_key IS NULL"
+
+
+async def _buscar_por_message_id(
+    conn: AsyncConnection[Any],
+    channel_value: str,
+    agent_id: str,
+    phone_number: str,
+    message_id: str | None,
+) -> int | None:
+    """Id da linha que já ingeriu esse (canal, agente, telefone, message_id).
+
+    `agent_id` faz parte da chave porque o mesmo payload entregue em
+    `?agent=a` e `?agent=b` são duas mensagens legítimas — sem ele, a
+    segunda seria tratada como reentrega da primeira. `phone_number` faz
+    parte pelo motivo inverso: o id do WhatsApp só é único por chat, e sem
+    ele a mensagem de OUTRO lead que repetisse o id sumia em silêncio.
+
+    `message_ids_absorvidos` entra na busca porque numa rajada só a primeira
+    mensagem vira linha — as seguintes são concatenadas por debounce, e sem
+    o registro do id absorvido a reentrega delas concatenaria o mesmo texto
+    de novo.
+    """
+    if not message_id:
+        return None
+
+    cursor = await conn.execute(
+        "SELECT id FROM message_queue "
+        "WHERE channel = %s AND agent_id = %s AND phone_number = %s "
+        "  AND (message_id = %s OR message_ids_absorvidos @> ARRAY[%s]::text[]) "
+        "LIMIT 1",
+        (channel_value, agent_id, phone_number, message_id, message_id),
+    )
+    row = await cursor.fetchone()
+    return row[0] if row is not None else None
+
+
+async def buscar_duplicata(
+    pool: AsyncConnectionPool,
+    phone_number: str,
+    agent_id: str,
+    message_id: str | None,
+    channel: MessagingChannel | str = MessagingChannel.TWILIO,
+) -> int | None:
+    """Id da linha que já ingeriu esse (canal, agente, telefone, message_id).
+
+    Mesma checagem que `enqueue_or_buffer` faz internamente, exposta para a
+    rota poder reconhecer reentrega ANTES de gastar recurso com ela — cota
+    de rate limit e escrita do gate. Reentrega é o mesmo evento: contá-la
+    como mensagem nova estoura a janela e faz a próxima mensagem de verdade
+    do lead evaporar com 200.
+    """
+    if not message_id:
+        return None
+
+    channel_value = (
+        channel.value if isinstance(channel, MessagingChannel) else str(channel)
+    )
+
+    async with pool.connection() as conn:
+        return await _buscar_por_message_id(
+            conn, channel_value, agent_id, phone_number, message_id
+        )
 
 
 async def enqueue_or_buffer(
@@ -42,15 +124,30 @@ async def enqueue_or_buffer(
     message_id: str | None = None,
     buffer_seconds: float = 2.0,
     outbound_token: str | None = None,
+    provider_message_key: dict[str, Any] | None = None,
 ) -> EnqueueResult:
     """Insere mensagem na fila ou agrupa com mensagem pendente (debounce).
 
     Regras de debounce (Fase 3):
-    - Debounce somente para texto (media_url IS NULL).
-    - Mensagem com mídia não faz debounce (entrada imediata).
+    - Debounce somente para texto (sem via de download de mídia).
+    - Mensagem com mídia não faz debounce (entrada imediata). Conta como
+      mídia quem tem `media_url` OU `media_type` + `provider_message_key`.
+    - Linha de mídia nunca é ALVO de debounce nem de flush, mesmo depois de
+      voltar para `queued` num retry: ver PREDICADO_DE_TEXTO.
     - Antes de inserir mídia, flush de texto pendente do mesmo phone+agent
       para que o worker processe o texto ANTES da mídia (ordenação por created_at).
     - Concorrência protegida por pg_advisory_xact_lock(hash(phone+agent)).
+
+    Idempotência: quando `message_id` vem preenchido, uma reentrega do mesmo
+    id no mesmo canal, agente e telefone não vira linha nova nem é concatenada
+    por debounce — devolve o id da linha original com `is_duplicate=True`.
+    Provedores reentregam o webhook em timeout ou resposta >= 400; sem isso o
+    lead receberia a resposta duas vezes. Vale também para a mensagem que o
+    debounce absorveu: o id dela é gravado em `message_ids_absorvidos`, sem o
+    que só a primeira mensagem de uma rajada ficaria protegida. O mesmo
+    payload em `?agent=a` e `?agent=b` continua gerando duas linhas, que é o
+    comportamento correto do template. O índice único parcial da migração 012
+    é a garantia final contra a corrida entre dois workers da API.
 
     Limitação conhecida: NumMedia > 1 no mesmo webhook fica fora do escopo.
 
@@ -64,12 +161,28 @@ async def enqueue_or_buffer(
         to_number: Número destinatário (opcional).
         message_id: ID externo da mensagem, ex: Twilio MessageSid (opcional).
         buffer_seconds: Segundos de debounce. Default: 2.0.
+        provider_message_key: Key completa da mensagem no provedor (ex: data.key
+            da Evolution). Identificador de diagnóstico — não é a via de
+            download na integração WHATSAPP-BUSINESS, que baixa por GET na
+            URL. Vazia para os demais canais.
 
     Returns:
-        EnqueueResult com message_id e se foi buffered.
+        EnqueueResult com message_id, se foi buffered e se era duplicata.
     """
     thread_id = f"{phone_number}:{agent_id}"
-    has_media = media_url is not None
+    # É mídia quando o payload identifica uma mídia de verdade: uma URL, ou
+    # `media_type` + a `provider_message_key` da Evolution. Sem nenhuma das
+    # duas, `media_type` sozinho é sucata — a uazapi manda isso no "payload
+    # reduzido" e essas mensagens seguem no branch de texto, como sempre
+    # seguiram. Uma linha de mídia sem URL não baixa (o worker responde ao
+    # lead que não deu), mas concatená-la por debounce no texto de outra
+    # mensagem seria pior: o registro do que o lead mandou some.
+    has_media = media_url is not None or (
+        media_type is not None and provider_message_key is not None
+    )
+    # "" é ausência de id disfarçada (a uazapi manda string vazia quando o
+    # payload não traz messageid) e não pode participar da deduplicação.
+    message_id = message_id or None
     channel_value = (
         channel.value if isinstance(channel, MessagingChannel) else str(channel)
     )
@@ -91,13 +204,34 @@ async def enqueue_or_buffer(
         # Liberado automaticamente no commit/rollback da transação.
         await conn.execute("SELECT pg_advisory_xact_lock(%s)", (lock_key,))
 
+        # Reentrega do provedor: o id já virou linha. Precisa ser checado
+        # aqui, antes do branch de debounce — o caminho de debounce faz
+        # UPDATE, não INSERT, e escaparia do índice único da migração 012,
+        # concatenando o mesmo texto duas vezes na mesma linha.
+        duplicada = await _buscar_por_message_id(
+            conn, channel_value, agent_id, phone_number, message_id
+        )
+        if duplicada is not None:
+            await conn.commit()
+            logger.info(
+                "message_duplicate_ignored",
+                message_id=duplicada,
+                provider_message_id=message_id,
+                phone=phone_number,
+                agent_id=agent_id,
+                channel=channel_value,
+            )
+            return EnqueueResult(
+                message_id=duplicada, is_buffered=False, is_duplicate=True
+            )
+
         if has_media:
             # Mídia: flush texto pendente e inserir imediatamente.
             # O flush antecipa o process_after de textos aguardando debounce,
             # garantindo que o worker os processe antes da mídia (via created_at).
             # Filtro por channel: textos de outros canais não são afetados.
             flushed = await conn.execute(
-                """
+                f"""
                 UPDATE message_queue
                 SET process_after = NOW(),
                     updated_at = NOW()
@@ -106,7 +240,7 @@ async def enqueue_or_buffer(
                   AND channel = %s
                   AND status = 'queued'
                   AND process_after > NOW()
-                  AND media_url IS NULL
+                  AND {PREDICADO_DE_TEXTO}
                 """,
                 (phone_number, agent_id, channel_value),
             )
@@ -121,12 +255,13 @@ async def enqueue_or_buffer(
 
             # Inserir mídia com process_after=NOW() (sem buffer)
             cursor = await conn.execute(
-                """
+                f"""
                 INSERT INTO message_queue
                     (message_id, phone_number, to_number, agent_id,
                      thread_id, incoming_message, media_url, media_type,
-                     outbound_token, channel, process_after)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                     outbound_token, channel, provider_message_key, process_after)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+                {ALVO_DE_CONFLITO}
                 RETURNING id
                 """,
                 (
@@ -140,10 +275,38 @@ async def enqueue_or_buffer(
                     media_type,
                     outbound_token,
                     channel_value,
+                    Jsonb(provider_message_key)
+                    if provider_message_key is not None
+                    else None,
                 ),
             )
             row = await cursor.fetchone()
-            assert row is not None
+
+            if row is None:
+                # Corrida perdida com outra requisição do mesmo message_id:
+                # o índice único suprimiu o INSERT. A linha vencedora é a
+                # resposta correta.
+                duplicada = await _buscar_por_message_id(
+                    conn, channel_value, agent_id, phone_number, message_id
+                )
+                await conn.commit()
+                if duplicada is None:
+                    raise RuntimeError(
+                        "INSERT de mídia suprimido sem linha correspondente "
+                        f"para message_id={message_id!r}"
+                    )
+                logger.info(
+                    "message_duplicate_ignored",
+                    message_id=duplicada,
+                    provider_message_id=message_id,
+                    phone=phone_number,
+                    agent_id=agent_id,
+                    channel=channel_value,
+                )
+                return EnqueueResult(
+                    message_id=duplicada, is_buffered=False, is_duplicate=True
+                )
+
             new_id = row[0]
             await conn.commit()
 
@@ -162,10 +325,10 @@ async def enqueue_or_buffer(
         # outbound própria.
         process_after = datetime.now(UTC) + timedelta(seconds=buffer_seconds)
 
-        # Busca texto pendente para debounce (media_url IS NULL garante
-        # que não debounce texto dentro de uma mensagem de mídia)
+        # Busca texto pendente para debounce. Ver PREDICADO_DE_TEXTO: linha
+        # com qualquer via de download de mídia fica de fora.
         cursor = await conn.execute(
-            """
+            f"""
             SELECT id, incoming_message
             FROM message_queue
             WHERE phone_number = %s
@@ -173,7 +336,7 @@ async def enqueue_or_buffer(
               AND channel = %s
               AND status = 'queued'
               AND process_after > NOW()
-              AND media_url IS NULL
+              AND {PREDICADO_DE_TEXTO}
             ORDER BY created_at DESC
             LIMIT 1
             """,
@@ -188,16 +351,37 @@ async def enqueue_or_buffer(
 
             # Atualiza o outbound_token apenas se vier preenchido — token novo
             # do mesmo phone+agent geralmente reflete a instância ativa atual.
+            #
+            # `message_ids_absorvidos` é o que dá à mensagem concatenada a
+            # mesma proteção contra reentrega que a primeira da rajada ganha
+            # pelo índice único: o UPDATE não passa por ON CONFLICT nenhum.
             await conn.execute(
                 """
                 UPDATE message_queue
                 SET incoming_message = %s,
                     process_after = %s,
                     outbound_token = COALESCE(%s, outbound_token),
+                    provider_message_key = COALESCE(
+                        %s, provider_message_key
+                    ),
+                    message_ids_absorvidos = CASE
+                        WHEN %s::text IS NULL THEN message_ids_absorvidos
+                        ELSE message_ids_absorvidos || %s::text
+                    END,
                     updated_at = NOW()
                 WHERE id = %s
                 """,
-                (new_body, process_after, outbound_token, existing_id),
+                (
+                    new_body,
+                    process_after,
+                    outbound_token,
+                    Jsonb(provider_message_key)
+                    if provider_message_key is not None
+                    else None,
+                    message_id,
+                    message_id,
+                    existing_id,
+                ),
             )
             await conn.commit()
 
@@ -212,12 +396,13 @@ async def enqueue_or_buffer(
 
         # Nova mensagem de texto na fila
         cursor = await conn.execute(
-            """
+            f"""
             INSERT INTO message_queue
                 (message_id, phone_number, to_number, agent_id, thread_id,
                  incoming_message, media_url, media_type, outbound_token,
-                 channel, process_after)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 channel, provider_message_key, process_after)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            {ALVO_DE_CONFLITO}
             RETURNING id
             """,
             (
@@ -231,11 +416,36 @@ async def enqueue_or_buffer(
                 None,
                 outbound_token,
                 channel_value,
+                Jsonb(provider_message_key)
+                if provider_message_key is not None
+                else None,
                 process_after,
             ),
         )
         row = await cursor.fetchone()
-        assert row is not None
+
+        if row is None:
+            duplicada = await _buscar_por_message_id(
+                conn, channel_value, agent_id, phone_number, message_id
+            )
+            await conn.commit()
+            if duplicada is None:
+                raise RuntimeError(
+                    "INSERT de texto suprimido sem linha correspondente "
+                    f"para message_id={message_id!r}"
+                )
+            logger.info(
+                "message_duplicate_ignored",
+                message_id=duplicada,
+                provider_message_id=message_id,
+                phone=phone_number,
+                agent_id=agent_id,
+                channel=channel_value,
+            )
+            return EnqueueResult(
+                message_id=duplicada, is_buffered=False, is_duplicate=True
+            )
+
         new_id = row[0]
         await conn.commit()
 
@@ -247,6 +457,25 @@ async def enqueue_or_buffer(
             channel=channel_value,
         )
         return EnqueueResult(message_id=new_id, is_buffered=False)
+
+
+async def contar_pendentes_por_canal(pool: AsyncConnectionPool) -> dict[str, int]:
+    """Conta mensagens ainda não terminais (queued/processing) por canal.
+
+    Usada no boot do worker para detectar fila que chega por um canal sem
+    cliente outbound configurado — situação em que o inbound aceita tudo e
+    cada mensagem morre em mark_failed.
+    """
+    async with pool.connection() as conn:
+        cursor = await conn.execute(
+            """
+            SELECT channel, COUNT(*)
+            FROM message_queue
+            WHERE status IN ('queued', 'processing')
+            GROUP BY channel
+            """
+        )
+        return {linha[0]: int(linha[1]) for linha in await cursor.fetchall()}
 
 
 async def claim_next(
@@ -318,6 +547,7 @@ async def claim_next(
                       status,
                       process_after, attempts, max_attempts, lease_until,
                       response, error, outbound_token, channel,
+                      provider_message_key,
                       created_at, updated_at, processed_at
             """,
             (lease_until,),
@@ -350,9 +580,10 @@ async def claim_next(
             error=row[18],
             outbound_token=row[19],
             channel=row[20],
-            created_at=row[21],
-            updated_at=row[22],
-            processed_at=row[23],
+            provider_message_key=row[21],
+            created_at=row[22],
+            updated_at=row[23],
+            processed_at=row[24],
         )
 
         logger.info(

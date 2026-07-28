@@ -38,3 +38,12 @@ Thumbs.db
 # Logs e dados locais
 *.log
 pgdata/
+
+# Scratch do subagent-driven-development
+.superpowers/
+
+# Relatório da migração do Supabase (Fase 4) -- telefone e nome de gente real
+relatorio_migracao.md
+
+# Override local de porta do compose
+docker-compose.override.yml

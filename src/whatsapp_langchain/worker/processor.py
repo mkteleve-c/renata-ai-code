@@ -32,6 +32,8 @@ Uso:
     )
 """
 
+import asyncio
+
 import structlog
 from langchain_core.messages import HumanMessage
 from langgraph.checkpoint.base import BaseCheckpointSaver
@@ -39,12 +41,14 @@ from langgraph.store.base import BaseStore
 from psycopg_pool import AsyncConnectionPool
 
 from whatsapp_langchain.agents.loader import load_graph
+from whatsapp_langchain.shared.config import settings
 from whatsapp_langchain.shared.models import MessageQueue, MessagingChannel
 from whatsapp_langchain.shared.queue import (
     mark_done,
     mark_failed,
     upsert_conversation,
 )
+from whatsapp_langchain.worker.evolution_client import EvolutionClient
 from whatsapp_langchain.worker.media import (
     AUTO_RESPONSE_MEDIA_FAILURE,
     preprocess_incoming_message,
@@ -55,7 +59,20 @@ from whatsapp_langchain.worker.uazapi_client import UazapiClient
 
 logger = structlog.get_logger()
 
-OutboundClient = TwilioClient | MetaClient | UazapiClient
+OutboundClient = TwilioClient | MetaClient | UazapiClient | EvolutionClient
+
+# Único agente do catálogo que devolve JSON estruturado (`{"messages": [...]}`)
+# no texto final — os demais (illumi_assistant, rhawk_assistant) respondem
+# texto puro e não podem passar por extrair_baloes. `extrair_baloes` é
+# importado sob demanda (lazy) dentro do branch que usa BALOES_AGENT_ID, não
+# aqui no topo: `load_graph(message.agent_id, ...)` já importa dinamicamente
+# o pacote `catalog.elevec_sdr` quando (e só quando) agent_id == "elevec_sdr"
+# — importar aqui em cima faria o worker carregar o catálogo da Renata
+# (agent.py, e nas próximas tasks os clientes de Calendar/CRM) no boot,
+# mesmo em deploys que nunca usam esse agente, e quebraria o modelo de
+# template do repositório (um fork que apaga catalog/elevec_sdr/ passaria a
+# tomar ModuleNotFoundError no boot do worker, não só ao rotear pra ela).
+BALOES_AGENT_ID = "elevec_sdr"
 
 
 def _normalize_outbounds(
@@ -79,6 +96,8 @@ def _normalize_outbounds(
             return {MessagingChannel.META: outbound}
         if isinstance(outbound, UazapiClient):
             return {MessagingChannel.UAZAPI: outbound}
+        if isinstance(outbound, EvolutionClient):
+            return {MessagingChannel.EVOLUTION: outbound}
         # TwilioClient ou mock genérico — assume Twilio (default histórico).
         return {MessagingChannel.TWILIO: outbound}
     raise ValueError(
@@ -112,12 +131,14 @@ async def _send_message(
     to: str,
     body: str,
     message: MessageQueue,
-) -> str:
+) -> str | None:
     """Wrapper que injeta o token outbound dinâmico para UazapiClient.
 
     Twilio e Meta têm credenciais estáticas no construtor — chamada padrão.
     Uazapi recebe o token da instância via webhook e armazenado em
     message.outbound_token; passamos como kwarg para o cliente usar.
+    A Evolution autentica pela apikey e devolve None em modo mock — daí o
+    retorno opcional.
     """
     if isinstance(outbound, UazapiClient):
         return await outbound.send_message(to, body, token=message.outbound_token)
@@ -135,6 +156,52 @@ async def _send_typing(
             to, message.message_id, token=message.outbound_token
         )
     return await outbound.send_typing(to, message.message_id)
+
+
+async def _send_baloes(
+    outbound: OutboundClient,
+    message: MessageQueue,
+    baloes: list[str],
+) -> None:
+    """Envia os balões em sequência, espaçados por `settings.balao_delay_ms`.
+
+    Cada balão é um `_send_message` independente. Se um deles falhar no
+    meio da sequência, os anteriores já foram entregues e **não são
+    reenviados aqui** — a exceção sobe para o `except Exception` de
+    `process_message`, que aciona `mark_failed` e o retry existente.
+
+    Efeito herdado (não corrigido nesta task, comum aos quatro canais e já
+    registrado como backlog na Fase 1): o retry do processor reenvia a
+    mensagem inteira a partir do zero, então uma falha no meio duplica os
+    balões que já chegaram ao lead quando o próximo attempt roda. Por isso
+    logamos o índice exato que falhou — é o dado que faltaria para
+    diagnosticar a duplicação no retry.
+
+    `extrair_baloes` já aplica um teto (`settings.balao_max_count`) que
+    concatena o excedente no último item, então `baloes` aqui nunca é maior
+    que o teto — importante porque o `sleep` entre balões roda dentro do
+    lease da mensagem (`settings.lease_seconds`); sem teto, uma resposta com
+    dezenas de itens somaria mais tempo de sleep que o lease, parando o
+    worker (hoje sem duplicar, porque o loop é serial e ninguém rouba o
+    lease — mas duplicaria de verdade com mais de um worker).
+    """
+    total = len(baloes)
+    delay_s = settings.balao_delay_ms / 1000
+    for idx, balao in enumerate(baloes):
+        try:
+            await _send_message(outbound, message.phone_number, balao, message)
+        except Exception:
+            logger.error(
+                "balao_send_failed",
+                message_id=message.id,
+                phone=message.phone_number,
+                channel=message.channel.value,
+                balao_index=idx,
+                balao_total=total,
+            )
+            raise
+        if idx < total - 1:
+            await asyncio.sleep(delay_s)
 
 
 async def process_message(
@@ -200,6 +267,8 @@ async def process_message(
             body=message.incoming_message,
             media_url=message.media_url,
             media_type=message.media_type,
+            canal=message.channel,
+            message_key=message.provider_message_key,
         )
 
         # Se mídia está desabilitada ou falhou, não chama o agente
@@ -269,10 +338,48 @@ async def process_message(
         # 4. Extrair resposta
         response_text = result["messages"][-1].content
 
-        # 5. Enviar resposta outbound antes de mark_done
-        await _send_message(client, message.phone_number, response_text, message)
+        # 5. Enviar resposta outbound antes de mark_done. Só a Renata
+        # (elevec_sdr) devolve JSON estruturado em balões — mesmo mecanismo
+        # do outputParserStructured do n8n: parse do TEXTO FINAL, depois que
+        # o ciclo de tools terminou, não `response_format` nativo (que
+        # quebra o schema quando há tool call pendente no mesmo turno). Os
+        # demais agentes do catálogo respondem texto puro; extrair_baloes
+        # não é acionado para eles, e o comportamento existente (um único
+        # send_message com o texto integral) fica idêntico.
+        if message.agent_id == BALOES_AGENT_ID:
+            # Import lazy e local ao branch: load_graph(message.agent_id, ...)
+            # acima já importou dinamicamente o pacote catalog.elevec_sdr
+            # para chegar até aqui (agent_id só é "elevec_sdr" se o grafo da
+            # Renata acabou de ser carregado), então este import não soma
+            # custo novo — só evita carregar o catálogo dela em deploys que
+            # nunca usam esse agent_id.
+            from whatsapp_langchain.agents.catalog.elevec_sdr.saida import (
+                extrair_baloes,
+            )
 
-        # 6. mark_done somente após envio confirmado
+            baloes = extrair_baloes(response_text)
+        else:
+            # response_text normalmente é str, mas `BaseMessage.content` no
+            # langchain_core é tipado `str | list[str | dict]` — um agente
+            # fora da Renata que algum dia devolver content blocks não pode
+            # quebrar o "\n".join(baloes) do upsert_conversation abaixo com
+            # TypeError (join exige que todo item da lista seja string).
+            baloes = [
+                response_text if isinstance(response_text, str) else str(response_text)
+            ]
+
+        await _send_baloes(client, message, baloes)
+
+        # 6. mark_done somente após envio confirmado. Grava o response_text
+        # CRU (o JSON completo, se for a Renata) — é o registro de auditoria
+        # do output exato do modelo, útil para diagnosticar problema de
+        # parsing depois. upsert_conversation, por outro lado, alimenta
+        # conversations.last_message, que o admin panel trunca para preview
+        # em /chats — gravar o JSON cru ali faria toda conversa da Renata
+        # aparecer como '{"messages": ["Oi! Tudo bem? Aqui é a Rena' na
+        # lista. Os balões unidos por "\n" são o texto que o lead de fato
+        # recebeu; para os demais agentes (baloes = [response_text]) o join
+        # é idêntico ao texto puro de sempre.
         await mark_done(
             pool,
             message.id,
@@ -285,7 +392,7 @@ async def process_message(
             pool,
             phone_number=message.phone_number,
             agent_id=message.agent_id,
-            last_message=response_text,
+            last_message="\n".join(baloes),
         )
 
         logger.info(
@@ -295,6 +402,7 @@ async def process_message(
             agent_id=message.agent_id,
             channel=message.channel.value,
             response_length=len(response_text),
+            balao_count=len(baloes),
         )
 
     except Exception as e:

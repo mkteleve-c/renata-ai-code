@@ -16,6 +16,7 @@ import structlog
 from langchain_core.messages import HumanMessage
 
 from whatsapp_langchain.shared.config import settings
+from whatsapp_langchain.shared.models import MessagingChannel
 
 logger = structlog.get_logger()
 
@@ -49,20 +50,43 @@ class MediaPreprocessResult:
 
 async def download_media(
     url: str,
+    canal: MessagingChannel | str = MessagingChannel.TWILIO,
+    message_key: dict | None = None,
 ) -> bytes:
-    """Faz download de mídia do Twilio.
+    """Baixa mídia da URL do payload; o canal decide como autenticar.
 
-    Autentica com API Key (api_key_sid:api_key_secret) — mesmas credenciais
-    usadas pelo TwilioClient para envio outbound.
+    Todo canal entrega uma URL baixável por GET — o que muda é o esquema de
+    autenticação. Twilio usa BasicAuth da API Key. A Evolution na integração
+    WHATSAPP-BUSINESS entrega a URL aberta da Cloud API
+    (`lookaside.fbsbx.com`) e aceita a apikey da instância como
+    `Authorization: Bearer`: medido contra a instância real, áudio devolveu
+    200 `audio/ogg` (magic bytes OggS) e imagem 200 `image/jpeg` (JFIF). A
+    mídia NÃO é criptografada nesta integração.
+
+    `message_key` não participa do download: `getBase64FromMediaMessage` é o
+    caminho de instância Baileys, onde a URL aponta para conteúdo cifrado.
+    O parâmetro fica na assinatura porque o processor o entrega a partir de
+    `message_queue.provider_message_key` e porque um herdeiro deste template
+    rodando Baileys troca este ramo por `EvolutionClient.baixar_midia`.
     """
-    auth = (
-        (settings.twilio_api_key_sid, settings.twilio_api_key_secret)
-        if settings.twilio_api_key_sid
-        else None
-    )
+    if not url:
+        raise ValueError(f"download de mídia exige URL (canal={canal})")
+
+    auth: tuple[str, str] | None = None
+    headers: dict[str, str] | None = None
+
+    if canal == MessagingChannel.EVOLUTION:
+        headers = {"Authorization": f"Bearer {settings.evolution_api_key}"}
+    elif settings.twilio_api_key_sid:
+        auth = (settings.twilio_api_key_sid, settings.twilio_api_key_secret)
 
     async with httpx.AsyncClient() as client:
-        response = await client.get(url, auth=auth, follow_redirects=True)
+        response = await client.get(
+            url,
+            auth=auth,
+            headers=headers,
+            follow_redirects=True,
+        )
         response.raise_for_status()
         return response.content
 
@@ -214,8 +238,16 @@ async def preprocess_incoming_message(
     body: str,
     media_url: str | None = None,
     media_type: str | None = None,
+    canal: MessagingChannel | str = MessagingChannel.TWILIO,
+    message_key: dict | None = None,
 ) -> MediaPreprocessResult:
-    """Normaliza entrada para texto antes da chamada ao agente."""
+    """Normaliza entrada para texto antes da chamada ao agente.
+
+    `canal` vem da mensagem da fila e decide como o download se autentica.
+    `message_key` é repassada a `download_media` sem participar do download
+    nos canais de hoje (ver a docstring de lá). Os defaults mantêm o
+    comportamento histórico (Twilio) para chamadores que não os informam.
+    """
     if not media_url and not media_type:
         return MediaPreprocessResult(
             should_invoke_agent=True,
@@ -223,7 +255,9 @@ async def preprocess_incoming_message(
             media_processing_status="none",
         )
 
-    # Payload de mídia incompleto: não invoca agente.
+    # Payload de mídia incompleto: não invoca agente. A URL é a via de
+    # download em todos os canais, Evolution incluída — sem ela não há bytes
+    # a buscar, e o lead recebe a auto-resposta em vez de silêncio.
     if not media_url or not media_type:
         return MediaPreprocessResult(
             should_invoke_agent=False,
@@ -259,7 +293,11 @@ async def preprocess_incoming_message(
         )
 
     try:
-        media_bytes = await download_media(media_url)
+        media_bytes = await download_media(
+            media_url or "",
+            canal=canal,
+            message_key=message_key,
+        )
 
         if kind == "image":
             description = await _describe_image(media_bytes, media_type)
@@ -311,12 +349,16 @@ async def build_human_message(
     body: str,
     media_url: str | None = None,
     media_type: str | None = None,
+    canal: MessagingChannel | str = MessagingChannel.TWILIO,
+    message_key: dict | None = None,
 ) -> HumanMessage:
     """Compatibilidade: retorna HumanMessage de texto (sem multimodal)."""
     pre = await preprocess_incoming_message(
         body=body,
         media_url=media_url,
         media_type=media_type,
+        canal=canal,
+        message_key=message_key,
     )
     text = pre.normalized_text or body or pre.auto_response or ""
     return HumanMessage(content=text)

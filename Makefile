@@ -103,6 +103,9 @@ test-demo-up: ## Sobe stack Docker e roda testes demonstrativos
 test-flows: ## Roda testes de fluxo realista (requer stack Docker)
 	uv run pytest tests/integration/test_realistic_flows.py -v -s
 
+test-roteiro: ## Roda o SOP da Renata com o LLM real (requer OPENROUTER_API_KEY valida)
+	OPENROUTER_LIVE_TESTS=1 uv run pytest tests/integration/test_roteiro_sop.py -v -s
+
 ##@ Limpeza
 clean: ## Remove arquivos de cache do Python
 	find . -type d -name __pycache__ -exec rm -rf {} +

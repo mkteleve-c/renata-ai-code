@@ -22,7 +22,7 @@ Projeto em **português brasileiro**. É um **template** — cada novo cliente h
 | LLM | OpenRouter — chat (`OPENROUTER_MODEL`), multimodal para imagem/áudio (`OPENROUTER_MIDIA_MODEL`) e embeddings (`EMBEDDING_MODEL`) — uma única API key |
 | Banco | PostgreSQL 16 + pgvector (checkpointer LangGraph + store semântico + schema `auth` do Better Auth). Em produção, **não exposto externamente** — visualização web via `pgweb` em `https://${DOMAIN}/banco/` (BasicAuth, modo `--lock-session` com `PGWEB_DATABASE_URL` pré-configurada — abre direto na lista de tabelas) ou SSH tunnel para acesso direto |
 | Frontend | Next.js 16 + Better Auth (admin panel: `/login`, `/queue`, `/chats`, `/chats/[phone]`, `/agents`, `/settings`) |
-| Inbound/Outbound WhatsApp | Twilio (HMAC-SHA1), Meta WhatsApp Cloud API (HMAC-SHA256) **ou** uazapi (uazapiGO, baseada em Baileys — token da instância via payload). Cada mensagem carrega `channel` na fila; o worker mantém um cliente por canal habilitado e roteia automaticamente. |
+| Inbound/Outbound WhatsApp | Twilio (HMAC-SHA1), Meta WhatsApp Cloud API (HMAC-SHA256), uazapi (uazapiGO, baseada em Baileys — token da instância via payload) **ou** Evolution API (integração `WHATSAPP-BUSINESS`, que é a Cloud API oficial por baixo; secret de webhook opcional — ver `docs/EVOLUTION.md`). Cada mensagem carrega `channel` na fila; o worker mantém um cliente por canal habilitado e roteia automaticamente. |
 | Deploy produção | Docker + Traefik **v3.6.15** + Let's Encrypt (`deploy/`) — v3.5 não funciona com Docker ≥25 |
 | Deploy alternativo | Railway (`docs/RAILWAY.md`) |
 
@@ -32,7 +32,8 @@ Projeto em **português brasileiro**. É um **template** — cada novo cliente h
 src/whatsapp_langchain/
 ├── server/        # FastAPI: webhooks (/webhook/twilio, /webhook/meta, /webhook/uazapi, /webhook/sync) + admin (/api/*) + /health
 ├── worker/        # consumer (FOR UPDATE SKIP LOCKED + lease + retry) + processor +
-│                  # clientes outbound (twilio_client, meta_client, uazapi_client) + media preprocessor
+│                  # clientes outbound (twilio_client, meta_client, uazapi_client) + media preprocessor +
+│                  # followup.py (régua de reengajamento do elevec_sdr, FOLLOWUP_ENABLED)
 ├── agents/        # catálogo, middleware de contexto, tools de memória
 │   ├── catalog/
 │   │   ├── illumi_assistant/    # agente da própria Illumi (doutrina estratégica interna)
@@ -42,7 +43,7 @@ src/whatsapp_langchain/
 └── shared/        # config (Settings + channel_status/validate_runtime_settings),
                    # db pool, queue ops, models (MessagingChannel), llm factory, structlog
 
-db/migrations/     # 001_initial → 006_message_channel (rodam no startup da API automaticamente)
+db/migrations/     # 001_initial → 014_uma_linha_por_pessoa (rodam no startup da API automaticamente)
 frontend/          # Next.js 16 admin panel (Better Auth, fetch server-side da API; proxy.ts faz auth gate)
 deploy/            # docker-compose.prod.yml + Traefik v3.6.15 + scripts (template para VPS)
 docs/              # ARCHITECTURE, GETTING_STARTED, ADDING_AGENTS, DATABASE, TWILIO, META, UAZAPI, DEPLOY, RAILWAY, STRESS_TESTING
@@ -64,8 +65,8 @@ tests/             # unit/ + integration/ (pytest, asyncio_mode=auto)
 8. **`/api/auth/*` pertence ao Better Auth no frontend**, NÃO à API. Não confundir. O frontend também expõe `/api/queue` como proxy autenticado por sessão Better Auth, que valida o cookie e chama o `/api/queue` da API internamente via `INTERNAL_API_URL` — chamadas externas a `https://DOMAIN/api/queue` caem nesse proxy do Next.js, não na API direto.
 9. **`OUTBOUND_MODE=mock` em dev**, `real` em produção. Em modo `real`, `settings.validate_runtime_settings()` no boot da API e do Worker faz fail-fast se algum canal está parcialmente configurado (toque parcial) ou se `INTERNAL_SERVICE_TOKEN` é fraco/ausente.
 10. **Em produção, validação de assinatura ATIVA** — Twilio (`VALIDATE_TWILIO_SIGNATURE=true` + `TWILIO_AUTH_TOKEN` + `TWILIO_WEBHOOK_URL`) ou Meta (`META_VALIDATE_SIGNATURE=true` + `META_APP_SECRET`). uazapi não assina o body — o próprio token da instância vem no payload e é o que autentica o outbound; restrinja por IP no Traefik se quiser hardening adicional.
-11. **Roteamento por canal é automático** — cada webhook (`/webhook/twilio`, `/webhook/meta`, `/webhook/uazapi`) grava `message_queue.channel` ao enfileirar; o worker mantém clientes outbound dos canais habilitados (todos os com credenciais preenchidas) e seleciona o cliente pelo `channel` da mensagem. Não há env `MESSAGING_CHANNEL`. Canal "tocado parcialmente" no `.env.prod` em modo real → fail-fast no boot. Para uazapi, o token da instância chega via webhook por mensagem e é persistido em `message_queue.outbound_token` (migração `005_uazapi_outbound_token.sql`).
-12. **Agentes vivem em `src/whatsapp_langchain/agents/catalog/<id>/`** — registrados em `langgraph.json`, selecionados via `?agent=<id>` na query string do webhook. Catálogo atual: **`illumi_assistant`** (interno Illumi, prompt = doutrina estratégica) e **`rhawk_assistant`** (cliente Top Hawks). Para criar mais → skill `create-agent`.
+11. **Roteamento por canal é automático** — cada webhook (`/webhook/twilio`, `/webhook/meta`, `/webhook/uazapi`, `/webhook/evolution`) grava `message_queue.channel` ao enfileirar; o worker mantém clientes outbound dos canais habilitados (todos os com credenciais preenchidas) e seleciona o cliente pelo `channel` da mensagem. Não há env `MESSAGING_CHANNEL`. Canal "tocado parcialmente" no `.env.prod` em modo real → fail-fast no boot. Para uazapi, o token da instância chega via webhook por mensagem e é persistido em `message_queue.outbound_token` (migração `005_uazapi_outbound_token.sql`).
+12. **Agentes vivem em `src/whatsapp_langchain/agents/catalog/<id>/`** — registrados em `langgraph.json`, selecionados via `?agent=<id>` na query string do webhook. Catálogo atual: **`illumi_assistant`** (interno Illumi, prompt = doutrina estratégica), **`rhawk_assistant`** (cliente Top Hawks) e **`elevec_sdr`** (a Renata, SDR da EleveC — porte do n8n, 7 tools de agenda/CRM/handover, resposta em balões; ver `docs/AGENTE_ELEVEC.md`). Para criar mais → skill `create-agent`. O `elevec_sdr` também tem uma **régua de follow-up** rodando como task assíncrona no Worker (`worker/followup.py`) — três degraus (15min/1h15/23h) ancorados em `leads_crm.last_inbound_at`, controlada por `FOLLOWUP_ENABLED` (**`false` por padrão, deliberadamente, até o cutover**). Detalhe completo em `docs/AGENTE_ELEVEC.md`.
 13. **Postgres NÃO é exposto publicamente** em produção. Acesso ao banco é via:
     - **`pgweb` em `https://${DOMAIN}/banco`** (visualizador web, BasicAuth via `PGWEB_AUTH_USER`/`PGWEB_AUTH_PASS` no `.env.prod`) — caminho oficial.
     - **SSH tunnel** para acesso direto (DBeaver, psql): `ssh -L 5432:localhost:5432 user@vps` (eventualmente exigindo bind manual `127.0.0.1:5432:5432` no compose).
@@ -97,6 +98,7 @@ make ci            # check + testes
 | Configurar Twilio | skill `twilio-setup` (e `docs/TWILIO.md`) |
 | Configurar Meta WhatsApp Cloud API | skill `meta-setup` |
 | Configurar/entender uazapi | `docs/UAZAPI.md` + `webhook_uazapi.py` |
+| Entender a Renata (agente SDR da EleveC) | `docs/AGENTE_ELEVEC.md` |
 | Deploy em VPS (Docker+Traefik) | `deploy/README.md` + skills `infra-setup`/`domain-setup`/`deploy` |
 | Deploy em Railway | `docs/RAILWAY.md` |
 | Debugar fila travada | skill `debug-queue` |

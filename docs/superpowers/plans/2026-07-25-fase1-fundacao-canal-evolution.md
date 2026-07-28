@@ -19,7 +19,13 @@
 - **Idioma do código e dos commits: português brasileiro.** Conventional Commits (`feat:`, `fix:`, `test:`, `docs:`, `chore:`).
 - **Sem comentários óbvios nem docstrings longas** — o código do harness é didático por design, mas não redundante.
 - **Todo commit termina com:** `Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>`
-- **Rodar `make check` antes de cada commit** (lint + format-check + typecheck).
+- **Lint e tipos antes de cada commit, escopados aos arquivos alterados:**
+  `uv run ruff check <arquivos>`, `uv run ruff format --check <arquivos>`,
+  `uv run pyright <arquivos>`.
+  **Não use `make check` como gate**: `stress/locustfile.py` já tem 9 erros de
+  lint no commit base desta branch, herdados do template. Exigir `make check`
+  limpo faria cada tarefa perseguir um problema que não é dela. Corrigir o
+  locustfile é trabalho separado, fora do escopo desta fase.
 - Valores fixos desta instância: servidor Evolution `https://evolution.ju39tu.easypanel.host`, instância `instancia-apioficial`, integração `WHATSAPP-BUSINESS`.
 
 ---
@@ -115,7 +121,13 @@ Módulo puro — sem banco, sem rede. É a peça de que todas as outras dependem
 - Produces:
   - `canonicalizar(bruto: str | None) -> str | None` — dígitos, BR sem o 9; `None` se não converge.
   - `variacoes(canonico: str) -> tuple[str, str]` — `(com_9, sem_9)`; para não-BR devolve `(canonico, canonico)`.
-  - `resolver_telefone(key: dict) -> str | None` — escolhe entre `remoteJid`/`remoteJidAlt` por score e devolve canônico.
+  - `resolver_telefone(key: dict) -> str | None` — valida e canonicaliza `key["remoteJid"]`.
+
+> **Resultado da Task 1:** `remoteJidAlt` está **ausente em 50 de 50** mensagens
+> reais desta instância — a integração `WHATSAPP-BUSINESS` não popula esse campo
+> herdado do Baileys. O score entre dois candidatos, previsto originalmente,
+> seria código morto. `resolver_telefone` lê apenas `remoteJid`, mantendo a
+> validação de formato e a rejeição de grupos.
   - `to_e164(canonico: str) -> str` — prefixa `+`.
   - `from_e164(e164: str) -> str` — remove `+`.
 
@@ -171,12 +183,13 @@ def test_variacoes_estrangeiro_sao_iguais():
     assert variacoes("14155550123") == ("14155550123", "14155550123")
 
 
-def test_score_prefere_jid_oficial():
-    key = {
-        "remoteJid": "551187654321@s.whatsapp.net",
-        "remoteJidAlt": "551187654321",
-    }
+def test_resolve_jid_com_sufixo_whatsapp():
+    key = {"remoteJid": "5511987654321@s.whatsapp.net", "fromMe": False}
     assert resolver_telefone(key) == "551187654321"
+
+
+def test_resolve_jid_sem_sufixo():
+    assert resolver_telefone({"remoteJid": "5511987654321"}) == "551187654321"
 
 
 def test_resolver_ignora_grupo():
@@ -184,7 +197,17 @@ def test_resolver_ignora_grupo():
 
 
 def test_resolver_sem_candidato_valido():
-    assert resolver_telefone({"remoteJid": "", "remoteJidAlt": None}) is None
+    assert resolver_telefone({"remoteJid": ""}) is None
+    assert resolver_telefone({}) is None
+
+
+def test_resolver_ignora_remote_jid_alt():
+    """A integração WHATSAPP-BUSINESS não popula remoteJidAlt (50/50 ausente).
+
+    Se um dia aparecer, não pode influenciar o resultado sem decisão explícita.
+    """
+    key = {"remoteJid": "5511987654321@s.whatsapp.net", "remoteJidAlt": "5599999999999"}
+    assert resolver_telefone(key) == "551187654321"
 
 
 def test_conversao_e164_ida_e_volta():
@@ -256,8 +279,14 @@ def variacoes(canonico: str) -> tuple[str, str]:
     return canonico, canonico
 
 
-def _score(valor: str | None) -> tuple[str, int] | None:
-    """Pontua um candidato a JID. Maior score vence."""
+def resolver_telefone(key: dict) -> str | None:
+    """Canonicaliza o remoteJid do payload da Evolution.
+
+    Só `remoteJid` é lido: `remoteJidAlt` não é populado pela integração
+    WHATSAPP-BUSINESS (verificado em 50 de 50 mensagens reais da instância).
+    Grupos (@g.us) e JIDs fora do tamanho esperado são rejeitados.
+    """
+    valor = key.get("remoteJid")
     if not valor:
         return None
 
@@ -269,23 +298,7 @@ def _score(valor: str | None) -> tuple[str, int] | None:
     if not 12 <= len(digitos) <= 14:
         return None
 
-    score = 2
-    if "@s.whatsapp.net" in texto:
-        score += 2
-    if digitos.startswith("55"):
-        score += 1
-    return digitos, score
-
-
-def resolver_telefone(key: dict) -> str | None:
-    """Escolhe o melhor JID do payload da Evolution e devolve o canônico."""
-    melhor: tuple[str, int] | None = None
-    for campo in ("remoteJidAlt", "remoteJid"):
-        if pontuado := _score(key.get(campo)):
-            if melhor is None or pontuado[1] > melhor[1]:
-                melhor = pontuado
-
-    return canonicalizar(melhor[0]) if melhor else None
+    return canonicalizar(digitos)
 
 
 def to_e164(canonico: str) -> str:
@@ -299,7 +312,7 @@ def from_e164(e164: str) -> str:
 - [ ] **Step 4: Rodar os testes**
 
 Run: `uv run pytest tests/unit/test_phone.py -v`
-Expected: PASS — 19 testes (7 + 5 vêm de `parametrize`).
+Expected: PASS — 21 testes (7 + 5 vêm de `parametrize`).
 
 Se `test_numero_estrangeiro_nao_perde_digito` falhar, a ordem das regexes está
 errada: `LOCAL_COM_9`/`LOCAL_SEM_9` só podem casar números de 10–11 dígitos, e
@@ -344,6 +357,7 @@ Arquivo `tests/integration/test_migracao_007.py`:
 """Verifica que a migração 007 cria o schema do SDR da EleveC."""
 
 import pytest
+from psycopg import errors
 
 from whatsapp_langchain.shared.db import get_pool
 
@@ -364,9 +378,14 @@ async def test_tabelas_do_sdr_existem():
 
 @pytest.mark.asyncio
 async def test_phone_rejeita_formato_invalido():
+    """Espera CheckViolation, não Exception genérica.
+
+    Com `Exception`, o teste passaria por erro de conexão, coluna inexistente
+    ou qualquer outra falha — sem provar que foi o CHECK de formato.
+    """
     pool = await get_pool()
     async with pool.connection() as conn:
-        with pytest.raises(Exception):
+        with pytest.raises(errors.CheckViolation):
             await conn.execute(
                 "insert into leads_crm (phone) values ('+5511987654321')"
             )
@@ -456,9 +475,14 @@ CREATE TABLE IF NOT EXISTS leads_descartados (
 );
 
 CREATE INDEX IF NOT EXISTS idx_leads_followup
-    ON leads_crm (followup_active, agent_active, last_interaction_at)
+    ON leads_crm (last_interaction_at, phase)
     WHERE followup_active AND agent_active;
 ```
+
+> As colunas do índice **não** repetem `followup_active`/`agent_active`: dentro
+> do predicado parcial elas já são sempre `true` e não discriminam nada. Quem
+> discrimina é `last_interaction_at` (o corte de tempo de cada nível) e `phase`
+> (o `NOT IN` que exclui leads fechados).
 
 - [ ] **Step 4: Aplicar e rodar os testes**
 
@@ -625,6 +649,14 @@ Expected: FAIL — `ModuleNotFoundError: No module named 'whatsapp_langchain.sha
 
 - [ ] **Step 3: Implementar o gate**
 
+> **O código abaixo é o ponto de partida, não a versão final.** A revisão desta
+> tarefa encontrou três Críticos de concorrência que ele não trata, e a
+> implementação entregue é mais completa: adquire `pg_advisory_xact_lock` como
+> primeira operação da transação, busca **todas** as variações do telefone (sem
+> `limit 1`) e consolida duplicatas legadas antes de renomear a chave.
+> **A fonte de verdade é `src/whatsapp_langchain/shared/leads.py` no repositório**,
+> não este trecho.
+
 Arquivo `src/whatsapp_langchain/shared/leads.py`:
 
 ```python
@@ -642,6 +674,12 @@ from typing import Any
 import structlog
 from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
+
+# Atenção: NUNCA fazer `conn.row_factory = dict_row` numa conexão emprestada
+# do pool. O AsyncConnectionPool não restaura o atributo ao devolver a conexão
+# (`_reset_connection` só faz rollback), então o estado vaza para o próximo
+# checkout e queries de tupla passam a devolver as chaves em vez dos valores —
+# falha silenciosa. Use `conn.cursor(row_factory=dict_row)` escopado.
 
 from whatsapp_langchain.shared.phone import canonicalizar, resolver_telefone, variacoes
 
@@ -668,7 +706,14 @@ async def aplicar_gate(
     com_9, sem_9 = variacoes(canonico)
 
     async with pool.connection() as conn:
-        conn.row_factory = dict_row
+        # Serializa o gate por lead. Sem isso, duas mensagens do mesmo telefone
+        # em paralelo produzem lost update, UniqueViolation no INSERT e
+        # ressurreição de followup_active durante handover. Mesmo idioma de
+        # shared/queue.py:92 — lock de transação, não de sessão, então não
+        # sofre com o reuso de conexões do pool.
+        await conn.execute(
+            "SELECT pg_advisory_xact_lock(hashtext(%s))", (canonico,)
+        )
 
         cur = await conn.execute(
             "select 1 from blocklist where phone = %s", (canonico,)
