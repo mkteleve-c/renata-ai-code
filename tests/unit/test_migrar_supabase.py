@@ -27,6 +27,7 @@ from scripts.migrar_supabase import (
     fundir_todos,
     gerar_relatorio,
     marcar_reunioes_legadas,
+    max_last_interaction_at,
     montar_historico_por_sessao,
     normalizar_telefone,
     validar_canonicos_no_check,
@@ -656,6 +657,25 @@ def test_relatorio_soma_fecha_e_resumo_bate():
     assert "6 + 2 = 8 == 8 (fecha)" in texto
     assert "Leads finais após fusão: **4**" in texto
     assert "2 grupo(s) com mais de uma linha física" in texto
+
+
+def test_relatorio_reporta_max_last_interaction_at_dos_leads_migrados():
+    """O passo 7 do roteiro de cutover (`docs/CUTOVER.md`) compara este
+    valor contra o que o Postgres tem depois de `--executar` -- sem ele
+    impresso aqui, a comparação não tinha segundo lado. O grupo
+    `552187654321` funde `_t(0)` e `_t(50)`; `_t(50)` é o maior
+    `last_interaction_at` entre TODOS os quatro leads fundidos deste
+    cenário (não só dentro do próprio grupo)."""
+    total_origem, grupos, fundidas, descartes = _cenario_relatorio()
+
+    assert max_last_interaction_at(fundidas) == _t(50)
+
+    texto = gerar_relatorio(total_origem, grupos, fundidas, descartes)
+    assert f"max(last_interaction_at) entre os leads migrados: **{_t(50)}**" in texto
+
+
+def test_max_last_interaction_at_sem_fundidas_e_none():
+    assert max_last_interaction_at({}) is None
 
 
 def test_relatorio_levanta_erro_quando_soma_nao_fecha():

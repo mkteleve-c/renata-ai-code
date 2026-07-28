@@ -156,7 +156,17 @@ def _servidor_postgrest(
 # --- --dry-run é o padrão, e não escreve -------------------------------------
 
 
-async def test_dry_run_nao_escreve_nada_no_banco(tmp_path):
+async def test_dry_run_nao_escreve_nada_no_banco(tmp_path, monkeypatch):
+    """Piso mínimo real (`_LEADS_MINIMO_ESPERADO`/`_HISTORICO_MINIMO_ESPERADO`)
+    zerado aqui -- este teste usa uma fixture pequena de propósito (2 leads),
+    e não é sobre o piso (esse comportamento tem testes dedicados abaixo, em
+    "Piso mínimo -- subdeclaração consistente"). Sem isto, `ler_leads_supabase`
+    aplicaria o piso real (3000) contra 2 linhas e abortaria."""
+    import scripts.migrar_supabase as migrar_supabase_mod
+
+    monkeypatch.setattr(migrar_supabase_mod, "_LEADS_MINIMO_ESPERADO", 0)
+    monkeypatch.setattr(migrar_supabase_mod, "_HISTORICO_MINIMO_ESPERADO", 0)
+
     handler = _servidor_postgrest(
         {
             "leads_crm": [
@@ -217,7 +227,14 @@ def test_main_traduz_flags_para_executar_corretamente(monkeypatch):
 # --- --executar escreve -------------------------------------------------
 
 
-async def test_executar_grava_leads_no_banco(tmp_path):
+async def test_executar_grava_leads_no_banco(tmp_path, monkeypatch):
+    """Piso mínimo real zerado -- ver docstring de
+    `test_dry_run_nao_escreve_nada_no_banco`. Este teste grava 1 lead só."""
+    import scripts.migrar_supabase as migrar_supabase_mod
+
+    monkeypatch.setattr(migrar_supabase_mod, "_LEADS_MINIMO_ESPERADO", 0)
+    monkeypatch.setattr(migrar_supabase_mod, "_HISTORICO_MINIMO_ESPERADO", 0)
+
     handler = _servidor_postgrest(
         {
             "leads_crm": [_lead(f"{_PREFIXO_TESTE}01", phase="qualificado")],
@@ -233,6 +250,57 @@ async def test_executar_grava_leads_no_banco(tmp_path):
 
     assert codigo == 0
     assert await _contar_leads_prefixo() == 1
+
+
+async def test_executar_preserva_relatorio_aprovado_em_vez_de_sobrescrever(
+    tmp_path, monkeypatch
+):
+    """O passo 5 do roteiro de cutover aprova o `relatorio_migracao.md` que o
+    `--dry-run` do passo 4 escreveu -- é a única evidência em disco do que
+    foi revisado. Se `--executar` sobrescrevesse esse arquivo sem preservar
+    o conteúdo aprovado, essa evidência desapareceria assim que a migração
+    de verdade rodasse. `executar_migracao` precisa renomear o arquivo
+    pré-existente para um `.aprovado-antes-de-executar.md` ANTES de escrever
+    o novo relatório."""
+    import scripts.migrar_supabase as migrar_supabase_mod
+
+    monkeypatch.setattr(migrar_supabase_mod, "_LEADS_MINIMO_ESPERADO", 0)
+    monkeypatch.setattr(migrar_supabase_mod, "_HISTORICO_MINIMO_ESPERADO", 0)
+
+    caminho_relatorio = tmp_path / "relatorio_migracao.md"
+    caminho_relatorio.write_text(
+        "# relatório aprovado no passo 5 -- não pode sumir", encoding="utf-8"
+    )
+
+    handler = _servidor_postgrest(
+        {
+            "leads_crm": [_lead(f"{_PREFIXO_TESTE}02", phase="qualificado")],
+            "n8n_chat_histories": [],
+        }
+    )
+
+    codigo = await executar_migracao(
+        executar=True,
+        transporte=httpx.MockTransport(handler),
+        caminho_relatorio=caminho_relatorio,
+    )
+
+    assert codigo == 0
+
+    backup = caminho_relatorio.with_name(
+        caminho_relatorio.stem
+        + ".aprovado-antes-de-executar"
+        + caminho_relatorio.suffix
+    )
+    assert backup.exists(), "relatório aprovado não foi preservado"
+    assert "não pode sumir" in backup.read_text(encoding="utf-8")
+
+    # O caminho original agora tem o relatório NOVO (regravado por esta
+    # execução), não mais o conteúdo aprovado antigo -- os dois textos
+    # coexistem em arquivos diferentes, nenhum se perde.
+    novo = caminho_relatorio.read_text(encoding="utf-8")
+    assert "não pode sumir" not in novo
+    assert "Relatório de migração" in novo
 
 
 # --- --dry-run e --executar são mutuamente exclusivos ------------------------
@@ -295,6 +363,109 @@ async def test_content_range_divergente_aborta():
             )
 
 
+async def test_content_range_subdeclarado_consistente_passa_incolume_pela_checagem():
+    """A checagem final de `_buscar_paginado` é autorreferencial: ela
+    compara a contagem lida contra a PRÓPRIA alegação do `Content-Range`.
+    Se o servidor mente um total MENOR e serve exatamente esse total menor
+    -- consistente com a própria mentira --, a checagem existente bate
+    (1.000 lidas == 1.000 alegadas) mesmo com 2.500 linhas reais disponíveis
+    no servidor. Sem `minimo_esperado`, isso passa em silêncio."""
+    total_real = 2500
+    leads = [{**_lead(f"linha-{i}"), "phone": f"linha-{i}"} for i in range(total_real)]
+    handler = _servidor_postgrest(
+        {"leads_crm": leads}, total_forcado={"leads_crm": _TAMANHO_PAGINA}
+    )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        resultado = await _buscar_paginado(
+            client, _URL_FALSA, _CHAVE_FALSA, _TABELA_LEADS, order_by="phone"
+        )
+
+    # o bug, sem o piso: truncou e ninguém percebeu
+    assert len(resultado) == _TAMANHO_PAGINA
+
+
+async def test_piso_minimo_pega_a_subdeclaracao_que_a_checagem_final_nao_pega():
+    """Mesmo cenário do teste acima, agora com `minimo_esperado` -- é a
+    segunda linha de defesa que fecha a lacuna."""
+    total_real = 2500
+    leads = [{**_lead(f"linha-{i}"), "phone": f"linha-{i}"} for i in range(total_real)]
+    handler = _servidor_postgrest(
+        {"leads_crm": leads}, total_forcado={"leads_crm": _TAMANHO_PAGINA}
+    )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(MigracaoAbortada, match="piso"):
+            await _buscar_paginado(
+                client,
+                _URL_FALSA,
+                _CHAVE_FALSA,
+                _TABELA_LEADS,
+                order_by="phone",
+                minimo_esperado=3000,
+            )
+
+
+async def test_minimo_esperado_default_zero_nao_afeta_tabelas_pequenas_de_teste():
+    """`minimo_esperado=0` (o default) não aborta nada -- é o que permite
+    todos os outros testes deste arquivo (tabelas de poucas linhas) usarem
+    `_buscar_paginado` sem precisar inventar um piso plausível."""
+    handler = _servidor_postgrest({"leads_crm": [_lead(f"{_PREFIXO_TESTE}01")]})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        resultado = await _buscar_paginado(
+            client, _URL_FALSA, _CHAVE_FALSA, _TABELA_LEADS, order_by="phone"
+        )
+
+    assert len(resultado) == 1
+
+
+async def test_ler_leads_supabase_usa_o_piso_real_da_tabela(monkeypatch):
+    """Fecha o elo: `ler_leads_supabase` (a função pública que
+    `executar_migracao` de fato chama) passa `_LEADS_MINIMO_ESPERADO` --
+    não só `_buscar_paginado` isolado sabe fazer a conta. Monkeypatcha o
+    piso pra baixo (a suíte não vai inflar uma fixture de milhares de
+    linhas só para testar isto)."""
+    import scripts.migrar_supabase as migrar_supabase_mod
+
+    monkeypatch.setattr(migrar_supabase_mod, "_LEADS_MINIMO_ESPERADO", 50)
+    leads = [{**_lead(f"linha-{i}"), "phone": f"linha-{i}"} for i in range(10)]
+    handler = _servidor_postgrest({"leads_crm": leads})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(MigracaoAbortada, match="piso"):
+            await migrar_supabase_mod.ler_leads_supabase(
+                client, _URL_FALSA, _CHAVE_FALSA
+            )
+
+
+async def test_ler_historico_supabase_usa_o_piso_real_da_tabela(monkeypatch):
+    import scripts.migrar_supabase as migrar_supabase_mod
+
+    monkeypatch.setattr(migrar_supabase_mod, "_HISTORICO_MINIMO_ESPERADO", 50)
+    handler = _servidor_postgrest({"n8n_chat_histories": []})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(MigracaoAbortada, match="piso"):
+            await migrar_supabase_mod.ler_historico_supabase(
+                client, _URL_FALSA, _CHAVE_FALSA
+            )
+
+
+async def test_url_malformada_nunca_propaga_traceback_cru():
+    """`httpx.InvalidURL` não herda de `httpx.RequestError` (confirmado
+    contra httpx 0.28.1) -- sem capturá-la também, um `SUPABASE_URL`
+    malformado propagava um traceback cru até `main()` em vez do `ERRO:`
+    legível de sempre. `http://[::1` é IPv6 malformado -- falha no parsing
+    da URL do lado do cliente, antes de qualquer transporte (nem precisa de
+    `MockTransport`)."""
+    async with httpx.AsyncClient() as client:
+        with pytest.raises(MigracaoAbortada, match="InvalidURL"):
+            await _buscar_paginado(
+                client, "http://[::1", _CHAVE_FALSA, _TABELA_LEADS, order_by="phone"
+            )
+
+
 # --- Credencial ------------------------------------------------------------
 
 
@@ -352,7 +523,16 @@ async def test_falha_de_transporte_nunca_vaza_a_credencial(capsys):
 # --- Resumo em stdout --------------------------------------------------------
 
 
-async def test_resumo_no_stdout_mostra_totais_e_descartes_por_motivo(tmp_path, capsys):
+async def test_resumo_no_stdout_mostra_totais_e_descartes_por_motivo(
+    tmp_path, capsys, monkeypatch
+):
+    """Piso mínimo real zerado -- ver docstring de
+    `test_dry_run_nao_escreve_nada_no_banco`. Este teste usa 2 linhas só."""
+    import scripts.migrar_supabase as migrar_supabase_mod
+
+    monkeypatch.setattr(migrar_supabase_mod, "_LEADS_MINIMO_ESPERADO", 0)
+    monkeypatch.setattr(migrar_supabase_mod, "_HISTORICO_MINIMO_ESPERADO", 0)
+
     handler = _servidor_postgrest(
         {
             "leads_crm": [_lead(f"{_PREFIXO_TESTE}01"), _lead("null")],

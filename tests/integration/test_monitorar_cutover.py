@@ -31,7 +31,7 @@ from scripts.monitorar_cutover import (
     medir_falhas_max_attempts,
     medir_fallback_baloes,
     medir_fila_parada,
-    medir_handover_leads_novos,
+    medir_handover_absoluto,
     medir_leads_criados,
     motivos_reversao,
     rodar_monitoramento,
@@ -300,42 +300,89 @@ async def test_lead_antigo_fora_da_janela_nao_conta():
     assert m.valor == "0"
 
 
-# --- 4. Handover entre leads novos ------------------------------------------
+# --- 4. Handover acumulado desde a linha de base ----------------------------
 
 
-async def test_sem_leads_novos_handover_ok():
+async def _handover_absoluto_atual(conn) -> int:
+    cur = await conn.execute("SELECT COUNT(*) FROM leads_crm WHERE NOT agent_active")
+    linha = await cur.fetchone()
+    assert linha is not None
+    return int(linha[0])
+
+
+async def test_handover_sem_novos_desde_a_base_ok():
     pool = await get_pool()
     async with pool.connection() as conn:
-        m = await medir_handover_leads_novos(conn, desde=_DESDE)
+        base = await _handover_absoluto_atual(conn)
+        m = await medir_handover_absoluto(conn, linha_de_base=base)
     assert m.status == "ok"
 
 
-async def test_handover_baixo_entre_leads_novos_ok():
+async def test_handover_leads_ativos_nao_afetam_o_delta():
+    pool = await get_pool()
+    async with pool.connection() as conn:
+        base = await _handover_absoluto_atual(conn)
     for i in range(5):
         await _inserir_lead(f"{_PREFIXO}4{i}", created_at=_AGORA, agent_active=True)
     pool = await get_pool()
     async with pool.connection() as conn:
-        m = await medir_handover_leads_novos(conn, desde=_DESDE)
+        m = await medir_handover_absoluto(conn, linha_de_base=base)
     assert m.status == "ok"
 
 
-async def test_handover_alto_entre_leads_novos_reverte():
-    for i in range(3):
-        await _inserir_lead(f"{_PREFIXO}5{i}", created_at=_AGORA, agent_active=False)
+async def test_handover_detecta_leads_com_created_at_antigo_preservado_da_migracao():
+    """A prova do bug real que este teste substitui: leads migrados vêm com
+    `created_at` PRESERVADO do Supabase (bem no passado, nunca `now()`) --
+    a versão antiga desta medição (escopada por `created_at`) nunca via
+    esses leads. A medição absoluta precisa contá-los de qualquer jeito,
+    porque não depende de `created_at` nem de nenhuma outra coluna de
+    tempo."""
     pool = await get_pool()
     async with pool.connection() as conn:
-        m = await medir_handover_leads_novos(conn, desde=_DESDE)
+        base = await _handover_absoluto_atual(conn)
+    for i in range(5):
+        await _inserir_lead(
+            f"{_PREFIXO}5{i}",
+            created_at=datetime(2020, 1, 1, tzinfo=UTC),
+            agent_active=False,
+        )
+    async with pool.connection() as conn:
+        m = await medir_handover_absoluto(conn, linha_de_base=base)
     assert m.status == "reverter"
+    assert "delta +5" in m.valor
 
 
-async def test_handover_amostra_pequena_nao_reverte_mesmo_com_taxa_alta():
-    """1 pausado em 1 lead novo é 100% -- mas amostra menor que o mínimo
-    não pode disparar reversão sozinha (ruído estatístico)."""
-    await _inserir_lead(f"{_PREFIXO}09", created_at=_AGORA, agent_active=False)
+async def test_handover_um_novo_e_atencao_nao_reverte():
     pool = await get_pool()
     async with pool.connection() as conn:
-        m = await medir_handover_leads_novos(conn, desde=_DESDE)
-    assert m.status != "reverter"
+        base = await _handover_absoluto_atual(conn)
+    await _inserir_lead(f"{_PREFIXO}09", created_at=_AGORA, agent_active=False)
+    async with pool.connection() as conn:
+        m = await medir_handover_absoluto(conn, linha_de_base=base)
+    assert m.status == "atencao"
+
+
+async def test_handover_quatro_novos_e_atencao_nao_reverte():
+    """Limiar de reversão é delta >= 5 -- 4 fica em atenção."""
+    pool = await get_pool()
+    async with pool.connection() as conn:
+        base = await _handover_absoluto_atual(conn)
+    for i in range(4):
+        await _inserir_lead(f"{_PREFIXO}6{i}", created_at=_AGORA, agent_active=False)
+    async with pool.connection() as conn:
+        m = await medir_handover_absoluto(conn, linha_de_base=base)
+    assert m.status == "atencao"
+
+
+async def test_handover_cinco_novos_reverte():
+    pool = await get_pool()
+    async with pool.connection() as conn:
+        base = await _handover_absoluto_atual(conn)
+    for i in range(5):
+        await _inserir_lead(f"{_PREFIXO}7{i}", created_at=_AGORA, agent_active=False)
+    async with pool.connection() as conn:
+        m = await medir_handover_absoluto(conn, linha_de_base=base)
+    assert m.status == "reverter"
 
 
 # --- 5. Taxa de fallback de balão único -------------------------------------
@@ -517,10 +564,24 @@ async def test_google_calendar_inalcancavel_fica_indisponivel_nao_bloqueia():
 # --- Orquestração e motivos_reversao ----------------------------------------
 
 
+async def _linha_de_base_atual() -> int:
+    """Linha de base "neutra" para testes de orquestração que não são sobre
+    handover -- a contagem absoluta AGORA, então `delta=0` e a métrica de
+    handover nunca contamina os motivos de reversão que esses testes
+    verificam."""
+    pool = await get_pool()
+    async with pool.connection() as conn:
+        return await _handover_absoluto_atual(conn)
+
+
 async def test_rodar_monitoramento_sem_dados_nao_reverte():
     pool = await get_pool()
     relatorio = await rodar_monitoramento(
-        pool=pool, settings=Settings(), desde=_DESDE, agora=_AGORA
+        pool=pool,
+        settings=Settings(),
+        desde=_DESDE,
+        agora=_AGORA,
+        linha_de_base_handover=await _linha_de_base_atual(),
     )
     assert isinstance(relatorio, Relatorio)
     assert motivos_reversao(relatorio) == []
@@ -532,7 +593,11 @@ async def test_rodar_monitoramento_agrega_motivo_de_reversao_da_fila_parada():
     )
     pool = await get_pool()
     relatorio = await rodar_monitoramento(
-        pool=pool, settings=Settings(), desde=_DESDE, agora=_AGORA
+        pool=pool,
+        settings=Settings(),
+        desde=_DESDE,
+        agora=_AGORA,
+        linha_de_base_handover=await _linha_de_base_atual(),
     )
     assert motivos_reversao(relatorio) != []
 
@@ -551,9 +616,30 @@ async def test_rodar_monitoramento_agrega_multiplos_motivos():
         )
     pool = await get_pool()
     relatorio = await rodar_monitoramento(
-        pool=pool, settings=Settings(), desde=_DESDE, agora=_AGORA
+        pool=pool,
+        settings=Settings(),
+        desde=_DESDE,
+        agora=_AGORA,
+        linha_de_base_handover=await _linha_de_base_atual(),
     )
     assert len(motivos_reversao(relatorio)) >= 2
+
+
+async def test_rodar_monitoramento_agrega_motivo_de_reversao_de_handover():
+    """Fecha o elo: a orquestração de fato passa `linha_de_base_handover`
+    para `medir_handover_absoluto` -- não só a função isolada é testada."""
+    base = await _linha_de_base_atual()
+    for i in range(5):
+        await _inserir_lead(f"{_PREFIXO}2{i}", created_at=_AGORA, agent_active=False)
+    pool = await get_pool()
+    relatorio = await rodar_monitoramento(
+        pool=pool,
+        settings=Settings(),
+        desde=_DESDE,
+        agora=_AGORA,
+        linha_de_base_handover=base,
+    )
+    assert motivos_reversao(relatorio) != []
 
 
 def test_motivos_reversao_ignora_atencao_e_ok():
@@ -578,6 +664,7 @@ async def test_transportes_default_nao_toca_rede_quando_google_nao_configurado()
         desde=_DESDE,
         agora=_AGORA,
         transportes=Transportes(),
+        linha_de_base_handover=await _linha_de_base_atual(),
     )
     calendario = next(
         m for m in relatorio.metricas if m.nome == "Eventos criados no Google Calendar"

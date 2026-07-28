@@ -93,6 +93,25 @@ async def test_migracao_ausente_falha_e_nomeia_o_arquivo():
             raise psycopg.Rollback()
 
 
+async def test_migrations_dir_vazio_falha_em_vez_de_passar_vacuamente(
+    tmp_path, monkeypatch
+):
+    """`esperadas=[]` (diretório errado/apagado) não pode virar `True :: 0/0
+    aplicadas` -- é o cenário em que a checagem é incapaz de confirmar
+    QUALQUER coisa, e ainda assim seria a única das doze a cobrir a 015. Sem
+    a guarda, este teste reprovaria com `c.ok is True`."""
+    import scripts.preflight_cutover as preflight_mod
+
+    monkeypatch.setattr(preflight_mod, "MIGRATIONS_DIR", tmp_path)
+
+    pool = await get_pool()
+    async with pool.connection() as conn:
+        c = await checar_migracoes(conn)
+
+    assert c.ok is False
+    assert str(tmp_path) in c.detalhe
+
+
 # --- CHECK de leads_crm.phone -----------------------------------------------
 
 
@@ -143,6 +162,36 @@ async def test_check_constraint_com_clausula_faltando_no_banco_vivo_falha():
             assert c.ok is False
             assert "55[0-9]{2}9[0-9]{8}" in c.detalhe
             assert "[0-9]{10,11}" in c.detalhe
+
+            raise psycopg.Rollback()
+
+
+async def test_check_constraint_invertida_falha_mesmo_com_as_tres_clausulas():
+    """A constraint viva recriada com `~` em vez de `!~` -- as três cláusulas
+    (o texto da regex) continuam presentes na definição, mas a constraint
+    passa a EXIGIR o formato que deveria PROIBIR (aceita em vez de rejeitar).
+    Uma checagem por substring pura (`padrao in definicao`) não vê essa
+    troca -- o texto do padrão não muda, só o operador antes dele. Esta é a
+    prova de que `checar_check_constraint` de fato lê o operador, não só a
+    presença do padrão -- ver `_clausula_nega_com_padrao`."""
+    pool = await get_pool()
+    async with pool.connection() as conn:
+        async with conn.transaction():
+            await conn.execute(
+                "alter table leads_crm drop constraint leads_crm_phone_canonico_check"
+            )
+            await conn.execute(
+                "alter table leads_crm add constraint "
+                "leads_crm_phone_canonico_check check ("
+                "phone ~ '^55[0-9]{2}9[0-9]{8}$' "
+                "AND phone ~ '^550' "
+                "AND phone ~ '^[0-9]{10,11}$'"
+                ") not valid"
+            )
+            c = await checar_check_constraint(conn)
+
+            assert c.ok is False
+            assert "invertida" in c.detalhe
 
             raise psycopg.Rollback()
 
