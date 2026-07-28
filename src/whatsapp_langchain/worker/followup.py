@@ -178,6 +178,12 @@ where phone = any(%s)
 returning phone, name, followup_count
 """
 
+# Mesmo `not exists` de blocklist de `_SQL_ELEGIVEIS_TRAVADOS`, pela mesma
+# razão: sem ele, um telefone em opt-out fora da janela inflava esta
+# métrica como se fosse "bloqueado por janela" — o número que
+# `docs/AGENTE_ELEVEC.md` vende como sinal limpo para distinguir "a régua
+# morreu" de "não havia ninguém elegível" ficava contaminado por
+# quem simplesmente pediu para parar.
 _SQL_BLOQUEADOS_POR_JANELA = """
 select count(*) from leads_crm
 where followup_active
@@ -194,6 +200,17 @@ where followup_active
          and last_inbound_at < now() - make_interval(mins => %(n3)s))
   )
   and last_inbound_at <= now() - make_interval(mins => %(janela)s)
+  and not exists (
+        select 1 from blocklist b
+        where b.phone = leads_crm.phone
+           or b.phone = (
+                case when leads_crm.phone ~ '^55[0-9]{10}$'
+                     then '55' || substring(leads_crm.phone from 3 for 2)
+                          || '9' || substring(leads_crm.phone from 5)
+                     else leads_crm.phone
+                end
+              )
+      )
 """
 
 _SQL_AINDA_VALE_ENVIAR = """

@@ -472,6 +472,26 @@ async def test_rodada_conta_os_bloqueados_por_janela(lead_factory):
     assert resumo["bloqueados_por_janela"] == 1
 
 
+async def test_bloqueados_por_janela_nao_conta_quem_esta_na_blocklist(
+    lead_factory, bloquear
+):
+    """Opt-out não é 'bloqueado por janela' — é outra coisa.
+
+    `docs/AGENTE_ELEVEC.md` vende `bloqueados_por_janela` como o número que
+    distingue 'a régua morreu' de 'não havia ninguém elegível'. Um telefone
+    em blocklist com a janela de 24h fechada casava as duas condições da
+    métrica antiga e inflava o contador como se fosse janela fechada —
+    mascarando uma régua de verdade parada atrás de opt-outs acumulados.
+    """
+    phone = await lead_factory(
+        "551100000081", followup_count=2, minutos_desde_inbound=25 * 60
+    )
+    await bloquear(phone)
+
+    resumo = await rodada(await get_pool(), _ClienteMudo())
+    assert resumo["bloqueados_por_janela"] == 0
+
+
 async def test_ainda_vale_enviar_falso_para_lead_inexistente():
     assert await ainda_vale_enviar(await get_pool(), "551100000099", 1) is False
 
