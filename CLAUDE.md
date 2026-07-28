@@ -101,6 +101,10 @@ make ci            # check + testes
 | Entender a Renata (agente SDR da EleveC) | `docs/AGENTE_ELEVEC.md` |
 | Deploy em VPS (Docker+Traefik) | `deploy/README.md` + skills `infra-setup`/`domain-setup`/`deploy` |
 | Deploy em Railway | `docs/RAILWAY.md` |
+| **Virar a chave do n8n para o harness** | `docs/CUTOVER.md` — roteiro de 12 passos, executado por **uma pessoa**, com plano de volta |
+| Migrar os dados do Supabase legado | `scripts/migrar_supabase.py` — `--dry-run` é o **padrão**; escrever exige `--executar` |
+| Saber se dá para virar a chave agora | `scripts/preflight_cutover.py` — 12 checagens bloqueantes, nenhuma escreve |
+| Monitorar a primeira hora pós-cutover | `scripts/monitorar_cutover.py` |
 | Debugar fila travada | skill `debug-queue` |
 | Stress test | skill `stress-test` (e `docs/STRESS_TESTING.md`) |
 | Mexer no UI/design do admin panel | skill `ui-ux-pro-max` |
