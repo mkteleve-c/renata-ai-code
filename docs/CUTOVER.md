@@ -475,9 +475,17 @@ Ou seja: n8n desligado, webhook repontado, todo lead real em silêncio
 absoluto, e os três portões verdes.
 
 ```bash
-railway variables --service api    --set 'ALLOWLIST_PHONES='
-railway variables --service worker --set 'ALLOWLIST_PHONES='
+railway variable delete ALLOWLIST_PHONES --service api
+railway variable delete ALLOWLIST_PHONES --service worker
 ```
+
+**`--set 'ALLOWLIST_PHONES='` NÃO funciona** — o Railway aceita o comando,
+responde sucesso e **mantém o valor antigo**. Medido em 29/07/2026: depois
+de rodar o `--set` vazio nos dois serviços e redeployar, `railway variables
+--kv` ainda devolvia os cinco números e o boot ainda logava
+`allowlist_ativa=true allowlist_permitidos=5`. É `variable delete`, e é por
+isso que o critério de sucesso abaixo é o LOG, não o comando ter rodado sem
+erro.
 
 **Como saber que deu certo:** o boot dos dois serviços loga
 `allowlist_ativa=false`. Com a allowlist ligada ele loga
