@@ -41,6 +41,13 @@ def _aplicar_mudancas_documentadas(bruto: str) -> str:
     3. Acrescenta a instrução do marcador [figurinha] ao bloco de formatação.
     4. Acrescenta o bloco `### Resultado de tool (texto interno)` antes da
        Sequência de Agendamento — a regra do marcador `[sistema]`.
+    5. Acrescenta a guarda do `não informado` na Fase 1. `NOME_AUSENTE`
+       (`contexto.py`) é o sentinel que entra em `{nome}` quando o lead não
+       tem `pushName` utilizável — e agora também quando `sanitizar_nome`
+       recusa um nome que parece injeção. Sem esta linha, "Oi, não
+       informado!" é uma saudação plausível para gente de verdade. A régua
+       de follow-up já se blindava disso em `primeiro_nome`
+       (`worker/followup.py`); a via do prompt não.
 
     Quando o prompt mudar, é ESTA função que muda. Afrouxar o golden (trocar
     a igualdade por um `in`, por exemplo) devolveria o SOP ao estado em que
@@ -97,11 +104,20 @@ def _aplicar_mudancas_documentadas(bruto: str) -> str:
     assert texto.count(ancora_sequencia) == 1
     texto = texto.replace(ancora_sequencia, regra_texto_interno + ancora_sequencia)
 
+    ancora_saudacao = "    - Oi, {Nome}!\n"
+    guarda_nome_ausente = (
+        '    - **Se `Nome` acima estiver como "não informado", cumprimente SEM'
+        ' nome ("Oi!", "Olá!"). Nunca escreva "não informado" numa mensagem —'
+        " é um marcador interno, não o nome de ninguém.**\n"
+    )
+    assert texto.count(ancora_saudacao) == 1
+    texto = texto.replace(ancora_saudacao, ancora_saudacao + guarda_nome_ausente)
+
     return texto
 
 
 def test_prompt_e_identico_a_evidencia_com_as_mudancas_documentadas():
-    """Golden test: SYSTEM_PROMPT == evidência + as 3 mudanças documentadas.
+    """Golden test: SYSTEM_PROMPT == evidência + as 5 mudanças documentadas.
 
     Qualquer deriva no SOP — apagar um parágrafo, reescrever uma frase,
     mudar a ordem de uma fase — quebra este teste, mesmo que nenhuma das

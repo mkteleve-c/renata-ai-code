@@ -399,7 +399,10 @@ async def _processar_mensagem(
 @router.post("/webhook/evolution")
 async def webhook_evolution_receive(
     request: Request,
-    agent: str = Query(description="ID do agente para processar a mensagem"),
+    agent: str = Query(
+        default="",
+        description="ID do agente para processar a mensagem",
+    ),
     _secret: None = Depends(verify_evolution_webhook_secret),
 ) -> dict[str, Any]:
     # Erro de configuração responde 200, não 4xx: um typo no `?agent=` do
@@ -407,6 +410,13 @@ async def webhook_evolution_receive(
     # faz a Evolution reentregar — loop indefinido por um erro que reentrega
     # nenhuma vai corrigir. ERROR e não WARNING porque nada vai funcionar até
     # alguém arrumar a URL.
+    #
+    # `default=""` existe por essa mesma doutrina: sem ele, a URL cadastrada
+    # SEM `?agent=` — o erro de configuração mais provável de todos — dava
+    # 422 do FastAPI antes de chegar aqui, e a Evolution reentregava para
+    # sempre, sem uma linha de log da aplicação. O caminho de erro mais
+    # provável era justamente o único que escapava do tratamento pensado
+    # para ele.
     if agent not in list_agents():
         logger.error(
             "evolution_agente_desconhecido",
