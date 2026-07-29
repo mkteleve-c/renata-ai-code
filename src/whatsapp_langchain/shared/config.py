@@ -209,6 +209,70 @@ class Settings(BaseSettings):
     embedding_dims: int = 1536
     memory_search_limit: int = 5
 
+    # --- Allowlist (janela de teste em produção) ---
+    # Trava oposta à blocklist: quando NÃO está vazia, ninguém fora dela é
+    # atendido. Existe para o intervalo entre "a Renata está ligada no
+    # número comercial de verdade" e "a Renata pode falar com qualquer um" —
+    # o webhook já aponta para cá, o tráfego real já chega, e só o telefone
+    # do teste pode receber resposta.
+    #
+    # Vazia = desligada, e tem que ser esse o default: uma allowlist que
+    # ligasse sozinha emudeceria o sistema inteiro sem erro nenhum.
+    allowlist_phones: list[str] = []
+
+    @field_validator("allowlist_phones", mode="before")
+    @classmethod
+    def _parse_allowlist(cls, valor: object) -> object:
+        """Canonicaliza cada entrada e descarta o que não é telefone.
+
+        O valor é digitado à mão no painel do Railway, no meio de um
+        cutover: `+55 81 99101-3614`, um JID colado do WhatsApp e espaço
+        sobrando de copy-paste precisam convergir para a mesma chave que o
+        gate usa. Guardar o texto cru faria a allowlist ficar ligada e
+        vazia de quem deveria estar nela — o sistema mudo, sem erro.
+
+        Entrada inválida é descartada em silêncio de propósito, em vez de
+        derrubar o boot: `ValidationError` aqui mata API e Worker juntos,
+        e o pior momento para isso é exatamente quando alguém está mexendo
+        nesta variável.
+        """
+        from whatsapp_langchain.shared.phone import canonicalizar
+
+        if isinstance(valor, str):
+            brutos = valor.split(",")
+        elif isinstance(valor, list):
+            brutos = [str(v) for v in valor]
+        else:
+            return valor
+
+        limpos = []
+        for bruto in brutos:
+            if canonico := canonicalizar(bruto.strip()):
+                if canonico not in limpos:
+                    limpos.append(canonico)
+        return limpos
+
+    @property
+    def allowlist_ativa(self) -> bool:
+        return bool(self.allowlist_phones)
+
+    def permite(self, telefone: str) -> bool:
+        """`True` se o telefone pode ser atendido.
+
+        Allowlist desligada libera todo mundo — o contrário faria a omissão
+        da variável silenciar o sistema. Ligada, compara pelas DUAS formas
+        (com e sem o 9º dígito), igual ao gate e à blocklist: cadastrar uma
+        forma e o lead chegar pela outra deixaria de fora justamente o
+        número do teste.
+        """
+        if not self.allowlist_phones:
+            return True
+
+        from whatsapp_langchain.shared.phone import canonicalizar
+
+        canonico = canonicalizar(telefone)
+        return canonico is not None and canonico in self.allowlist_phones
+
     @field_validator("followup_enabled", mode="before")
     @classmethod
     def _parse_followup_enabled(cls, valor: object) -> object:

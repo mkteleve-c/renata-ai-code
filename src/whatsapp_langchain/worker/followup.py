@@ -463,6 +463,18 @@ async def ainda_vale_enviar(pool: AsyncConnectionPool, phone: str, nivel: int) -
       passar pelo zeramento de `followup_count` que `aplicar_gate` faz hoje
       abriria esse mesmo ramo de novo.
     """
+    # A allowlist é checada aqui, no último portão antes do envio, e não no
+    # predicado de reivindicação: a régua é o único caminho que fala sem o
+    # lead ter falado primeiro, e numa janela de teste um follow-up para
+    # quem está fora da lista é exatamente o disparo que ela existe para
+    # impedir. Leads legados importados do Supabase entram na régua sem
+    # nunca terem passado pelo gate — é por aqui que eles são barrados.
+    if not settings.permite(phone):
+        logger.info(
+            "followup_abortado", phone=phone, nivel=nivel, motivo="fora_da_allowlist"
+        )
+        return False
+
     async with pool.connection() as conn:
         if phone in await _telefones_bloqueados(conn, {phone}):
             logger.info(

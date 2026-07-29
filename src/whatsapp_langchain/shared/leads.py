@@ -27,6 +27,7 @@ from psycopg.rows import DictRow, dict_row
 from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
 
+from whatsapp_langchain.shared.config import settings
 from whatsapp_langchain.shared.phone import resolver_telefone, variacoes
 
 logger = structlog.get_logger()
@@ -285,6 +286,14 @@ async def aplicar_gate(
             payload if payload is not None else {"key": key},
         )
         return ResultadoGate(False, "telefone_invalido")
+
+    # Antes de qualquer escrita, e antes até da blocklist: numa janela de
+    # teste o que importa é que ninguém fora da lista deixe rastro nenhum —
+    # nem lead criado, nem linha em leads_descartados que depois vira ruído
+    # na contagem do monitoramento da primeira hora.
+    if not settings.permite(canonico):
+        logger.info("gate_descartado", motivo="fora_da_allowlist", telefone=canonico)
+        return ResultadoGate(False, "fora_da_allowlist", canonico)
 
     com_9, sem_9 = variacoes(canonico)
 
