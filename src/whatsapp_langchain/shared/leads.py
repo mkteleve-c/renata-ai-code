@@ -287,14 +287,6 @@ async def aplicar_gate(
         )
         return ResultadoGate(False, "telefone_invalido")
 
-    # Antes de qualquer escrita, e antes até da blocklist: numa janela de
-    # teste o que importa é que ninguém fora da lista deixe rastro nenhum —
-    # nem lead criado, nem linha em leads_descartados que depois vira ruído
-    # na contagem do monitoramento da primeira hora.
-    if not settings.permite(canonico):
-        logger.info("gate_descartado", motivo="fora_da_allowlist", telefone=canonico)
-        return ResultadoGate(False, "fora_da_allowlist", canonico)
-
     com_9, sem_9 = variacoes(canonico)
 
     async with pool.connection() as conn, conn.cursor(row_factory=dict_row) as cur:
@@ -378,6 +370,42 @@ async def aplicar_gate(
             )
             logger.info("gate_descartado", motivo="agente_desligado", telefone=canonico)
             return ResultadoGate(False, "agente_desligado", canonico, lead_view)
+
+        # A allowlist entra DEPOIS de `from_me` e de `agente_desligado`, e
+        # não antes de tudo como na primeira versão. A trava existe para a
+        # Renata não FALAR com quem está fora da janela de teste — não para
+        # o sistema parar de saber o que aconteceu.
+        #
+        # Checá-la antes engolia o `from_me`, que é o único handover humano
+        # automático do sistema. Durante a janela, a equipe responde na mão
+        # todo lead fora da lista: com a checagem lá em cima, `agent_active`
+        # continuava `true` e, ao esvaziar a allowlist, a Renata voltaria a
+        # falar por cima de conversas que pessoas assumiram. Não era caso de
+        # borda — era o comportamento padrão de toda resposta manual.
+        #
+        # `last_inbound_at` sobe pelo mesmo motivo do ramo acima: é fato
+        # sobre o WhatsApp, não sobre o nosso funil. Congelá-lo faria o lead
+        # reaparecer, depois da janela, mentindo sobre quando falou pela
+        # última vez — e a janela de 24h da Cloud API é medida por ele.
+        # `followup_count` zera junto porque o lead falou, que é exatamente
+        # o que o caminho aceito faz.
+        #
+        # Lead inexistente segue sem rastro: nada é criado para quem está
+        # fora da lista.
+        if not settings.permite(canonico):
+            if lead_view:
+                await cur.execute(
+                    "update leads_crm set last_inbound_at = now(), "
+                    "followup_count = 0 where phone in (%s, %s)",
+                    (com_9, sem_9),
+                )
+            logger.info(
+                "gate_descartado",
+                motivo="fora_da_allowlist",
+                telefone=canonico,
+                lead_existente=bool(lead_view),
+            )
+            return ResultadoGate(False, "fora_da_allowlist", canonico)
 
         if legada is not None and mesclado is not None:
             lead = await _persistir_consolidacao(

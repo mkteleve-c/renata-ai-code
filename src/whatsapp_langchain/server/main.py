@@ -58,7 +58,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     pool = await get_pool()
     await run_migrations(pool)
     await bootstrap_langgraph_schema()
-    logger.info("server_ready")
+    logger.info(
+        "server_ready",
+        allowlist_ativa=settings.allowlist_ativa,
+        allowlist_permitidos=len(settings.allowlist_phones),
+        allowlist_descartadas=settings.allowlist_descartadas,
+    )
 
     yield
 

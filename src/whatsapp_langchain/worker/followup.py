@@ -151,6 +151,10 @@ where followup_active
          and last_inbound_at < now() - make_interval(mins => %(n3)s))
   )
   and last_inbound_at > now() - make_interval(mins => %(janela)s)
+  and (
+        cardinality(%(allowlist)s::text[]) = 0
+     or leads_crm.phone = any(%(allowlist)s::text[])
+  )
   and not exists (
         select 1 from blocklist b
         where b.phone = leads_crm.phone
@@ -200,6 +204,10 @@ where followup_active
          and last_inbound_at < now() - make_interval(mins => %(n3)s))
   )
   and last_inbound_at <= now() - make_interval(mins => %(janela)s)
+  and (
+        cardinality(%(allowlist)s::text[]) = 0
+     or leads_crm.phone = any(%(allowlist)s::text[])
+  )
   and not exists (
         select 1 from blocklist b
         where b.phone = leads_crm.phone
@@ -315,6 +323,7 @@ async def _reivindicar_na_conexao(
         "n2": n2_min,
         "n3": n3_min,
         "janela": _janela_minutos(janela_min),
+        "allowlist": settings.allowlist_phones,
         "limite": limite,
     }
     cur = await conn.execute(_SQL_ELEGIVEIS_TRAVADOS, params)
@@ -409,6 +418,7 @@ async def contar_bloqueados_por_janela(
         "n2": n2_min,
         "n3": n3_min,
         "janela": _janela_minutos(janela_min),
+        "allowlist": settings.allowlist_phones,
     }
     async with pool.connection() as conn:
         cur = await conn.execute(_SQL_BLOQUEADOS_POR_JANELA, params)

@@ -282,6 +282,9 @@ async def main() -> None:
         outbound_mode=outbound_mode,
         enabled_channels=[ch.value for ch in outbounds],
         followup_task=followup_task is not None,
+        allowlist_ativa=settings.allowlist_ativa,
+        allowlist_permitidos=len(settings.allowlist_phones),
+        allowlist_descartadas=settings.allowlist_descartadas,
     )
 
     try:

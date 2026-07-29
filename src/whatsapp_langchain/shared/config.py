@@ -13,9 +13,9 @@ A maior parte das configurações tem defaults sensatos para desenvolvimento loc
 Segredos compartilhados do painel/admin devem ser preenchidos explicitamente.
 """
 
-from typing import Annotated
+from typing import Annotated, Any
 
-from pydantic import SecretStr, field_validator
+from pydantic import SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from whatsapp_langchain.shared.phone import canonicalizar
@@ -227,6 +227,42 @@ class Settings(BaseSettings):
     # módulo -- API e Worker caem juntos, antes de qualquer log útil. Foi
     # exatamente assim que o primeiro deploy desta variável quebrou.
     allowlist_phones: Annotated[list[str], NoDecode] = []
+    # Entradas que `_parse_allowlist` recusou. Existe só para o boot poder
+    # contá-las: descartar em silêncio é a decisão certa (ver docstring
+    # abaixo), descartar sem deixar sinal não é. `ALLOWLIST_PHONES` com os
+    # números separados por ESPAÇO em vez de vírgula vira um token único de
+    # 25 dígitos, a lista fica vazia, `permite()` libera todo mundo — e a
+    # trava evapora no meio do cutover sem nenhuma linha de log.
+    allowlist_descartadas: Annotated[list[str], NoDecode] = []
+
+    @field_validator("allowlist_descartadas", mode="before")
+    @classmethod
+    def _parse_descartadas(cls, valor: object) -> object:
+        """Espelho de `_parse_allowlist`, guardando o que ele recusou.
+
+        Recebe o MESMO env var (via `validation_alias` de `ALLOWLIST_PHONES`
+        não seria possível sem colidir); por isso relê `allowlist_phones` do
+        input em `_povoar_descartadas` abaixo.
+        """
+        if isinstance(valor, list):
+            return [str(v) for v in valor]
+        return []
+
+    @model_validator(mode="before")
+    @classmethod
+    def _povoar_descartadas(cls, valores: Any) -> Any:
+        if not isinstance(valores, dict):
+            return valores
+        bruto = valores.get("allowlist_phones") or valores.get("ALLOWLIST_PHONES")
+        if isinstance(bruto, str):
+            recusadas = [
+                pedaco.strip()
+                for pedaco in bruto.split(",")
+                if pedaco.strip() and canonicalizar(pedaco.strip()) is None
+            ]
+            if recusadas:
+                valores = {**valores, "allowlist_descartadas": recusadas}
+        return valores
 
     @field_validator("allowlist_phones", mode="before")
     @classmethod
