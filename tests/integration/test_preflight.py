@@ -1,4 +1,4 @@
-"""`scripts/preflight_cutover.py` (Fase 5, Task 2) -- as doze checagens do
+"""`scripts/preflight_cutover.py` (Fase 5, Task 2) -- as treze checagens do
 pré-voo, cada uma isolada com um dublê para cada modo de falha.
 
 Serviços externos (Evolution, Google, Pipedrive, OpenRouter) são sempre
@@ -658,8 +658,8 @@ async def test_rodar_preflight_roda_as_doze_checagens_sem_tocar_rede_real():
         settings=settings, pool=pool, transportes=transportes
     )
 
-    assert len(checagens) == 12
-    assert len({c.nome for c in checagens}) == 12
+    assert len(checagens) == 13
+    assert len({c.nome for c in checagens}) == 13
 
 
 # --- main(): wiring e propagação do código de saída -------------------------

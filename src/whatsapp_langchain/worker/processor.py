@@ -388,12 +388,27 @@ async def process_message(
             media_processing_status=pre.media_processing_status,
             media_processing_error=pre.media_processing_error,
         )
-        await upsert_conversation(
-            pool,
-            phone_number=message.phone_number,
-            agent_id=message.agent_id,
-            last_message="\n".join(baloes),
-        )
+        # `upsert_conversation` alimenta só o preview do admin panel — não é
+        # entrega nem auditoria. Depois do `mark_done` acima, a mensagem já
+        # saiu e já está contabilizada; deixar uma falha aqui subir para o
+        # `except` faria `mark_failed` reprocessar uma linha `done` e o lead
+        # receber tudo de novo. A guarda `status <> 'done'` de `mark_failed`
+        # fecha esse caminho no banco, e este `try` o fecha aqui: um preview
+        # perdido não vale um WhatsApp duplicado.
+        try:
+            await upsert_conversation(
+                pool,
+                phone_number=message.phone_number,
+                agent_id=message.agent_id,
+                last_message="\n".join(baloes),
+            )
+        except Exception as conv_err:
+            logger.warning(
+                "upsert_conversation_falhou",
+                message_id=message.id,
+                phone=message.phone_number,
+                error=str(conv_err),
+            )
 
         logger.info(
             "message_processed",

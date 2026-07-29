@@ -651,6 +651,15 @@ async def mark_failed(
     Se ainda tem tentativas restantes, volta para 'queued' para retry.
     Caso contrário, marca como 'failed' definitivamente.
 
+    **Nunca mexe numa linha já `done`** (`AND status <> 'done'` nos dois
+    UPDATEs). `mark_done` fica dentro do mesmo `try` que `upsert_conversation`
+    em `worker/processor.py`: se a contabilidade de conversa falhar DEPOIS de
+    a resposta já ter saído e sido gravada, o `except` chama esta função. Sem
+    a guarda, uma linha `done` voltava para `queued`, era reivindicada de novo
+    e o lead recebia a resposta inteira pela segunda vez — sem que nada tenha
+    falhado no envio. Retry de falha de verdade (status `processing`) segue
+    normal: ali o lead não recebeu nada.
+
     Args:
         pool: Pool de conexões do psycopg.
         message_id: ID da mensagem na fila.
@@ -677,7 +686,7 @@ async def mark_failed(
                     lease_until = NULL,
                     process_after = NOW() + make_interval(secs => %s),
                     updated_at = NOW()
-                WHERE id = %s
+                WHERE id = %s AND status <> 'done'
                 """,
                 (error, backoff_seconds, message_id),
             )
@@ -699,7 +708,7 @@ async def mark_failed(
                     error = %s,
                     processed_at = NOW(),
                     updated_at = NOW()
-                WHERE id = %s
+                WHERE id = %s AND status <> 'done'
                 """,
                 (error, message_id),
             )

@@ -96,7 +96,7 @@ async def checar_migracoes(conn: AsyncConnection) -> Checagem:
 
     Deriva a lista esperada do próprio diretório que `run_migrations` lê
     (`MIGRATIONS_DIR`, `shared/db.py`) em vez de hardcodar "001..015" --
-    hoje são exatamente esses quinze arquivos, e a checagem continua
+    hoje são exatamente esses dezesseis arquivos, e a checagem continua
     correta se um 016 for acrescentado antes do próximo cutover.
 
     `esperadas` vazio -- `MIGRATIONS_DIR` inexistente, apagado, ou apontando
@@ -104,7 +104,8 @@ async def checar_migracoes(conn: AsyncConnection) -> Checagem:
     Sem esta guarda, `faltando = []` (nada esperado, nada pode faltar) e a
     checagem reporta `True :: 0/0 aplicadas`, verde, exatamente no cenário em
     que ela é incapaz de confirmar que a 015 (ou qualquer outra) foi
-    aplicada -- a única das doze checagens do pré-voo que cobre a 015.
+    aplicada -- a única das treze checagens do pré-voo que cobre migração
+    específica. Hoje o diretório tem dezesseis arquivos (001 a 016).
     """
     nome = "Migrações aplicadas"
     esperadas = sorted(p.name for p in MIGRATIONS_DIR.glob("*.sql"))
@@ -468,7 +469,7 @@ async def rodar_preflight(
     pool: AsyncConnectionPool,
     transportes: Transportes | None = None,
 ) -> list[Checagem]:
-    """Roda as doze checagens, na ordem do roteiro de cutover.
+    """Roda as treze checagens, na ordem do roteiro de cutover.
 
     As três de banco compartilham UMA conexão -- não porque precisem de
     transação em comum (nenhuma escreve), mas para não abrir três conexões
@@ -493,8 +494,46 @@ async def rodar_preflight(
         checar_internal_service_token(settings),
         checar_followup_desligado(settings),
         checar_handover_phone(settings),
+        checar_allowlist_vazia(settings),
         await checar_openrouter(settings, transportes.openrouter),
     ]
+
+
+def checar_allowlist_vazia(settings: Settings) -> Checagem:
+    """A única variável capaz de emudecer o sistema inteiro sem erro nenhum.
+
+    Com `ALLOWLIST_PHONES` preenchida, o gate descarta todo lead que não
+    esteja nela -- **antes de qualquer escrita**, então não sobra rastro em
+    `leads_crm`, em `leads_descartados` nem em `message_queue`. As seis
+    métricas de `monitorar_cutover.py` contam coisa ruim; zero mensagem
+    produz zero de tudo, e nenhum limiar de reversão dispara. O teste de
+    fumaça do passo 10 também passa, porque manda usar "um número próprio"
+    -- que é justamente o que está na allowlist.
+
+    Esta checagem existe porque nenhum outro portão do cutover a enxerga.
+
+    **Não bloqueia**: durante a janela de teste a allowlist DEVE estar
+    preenchida, e um pré-voo que falhasse ali impediria de testar. O que ela
+    faz é garantir que a linha apareça na tabela, para ninguém desligar o
+    n8n sem ter decidido conscientemente sobre ela. Ver `docs/CUTOVER.md`,
+    passo 11.5.
+    """
+    nome = "ALLOWLIST_PHONES (janela de teste)"
+    if settings.allowlist_descartadas:
+        return Checagem(
+            nome,
+            True,
+            f"ATENCAO: {len(settings.allowlist_descartadas)} entrada(s) recusada(s) "
+            f"-- se todas forem, a trava evapora e todo mundo passa",
+        )
+    if settings.allowlist_ativa:
+        return Checagem(
+            nome,
+            True,
+            f"ATENCAO: ligada com {len(settings.allowlist_phones)} numero(s) -- "
+            f"todo lead real segue descartado ate esvaziar (passo 11.5)",
+        )
+    return Checagem(nome, True, "vazia -- a Renata atende todo mundo")
 
 
 def codigo_de_saida(checagens: list[Checagem]) -> int:

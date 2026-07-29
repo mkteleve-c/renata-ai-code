@@ -238,7 +238,16 @@ async def _processar_mensagem(
     # Antes do gate: uma reação de lead que passasse por ele renovaria
     # last_interaction_at e zeraria followup_count, criando ou "reengajando"
     # um lead por um emoji que o agente nunca vê.
-    if not texto and not media_type and not eh_from_me:
+    #
+    # `fromMe` NÃO é exceção a este corte, apesar de ser exceção ao gate. O
+    # handover do atendente é implícito — responder pelo número comercial
+    # desliga a Renata para aquele lead, de forma irreversível por qualquer
+    # caminho automático (`_SQL_REATIVAR` exige `agent_reactivate_at < now()`
+    # e o gate grava `null`). O gatilho disso precisa ser uma mensagem DE
+    # VERDADE. Com a exceção que existia aqui, reagir com 👍 ou apagar a
+    # própria mensagem chegava ao gate e executava o handover: um emoji
+    # desligava o agente para sempre, com log em INFO e nenhum sinal de erro.
+    if not texto and not media_type:
         logger.info(
             "evolution_conteudo_nao_suportado",
             phone=key.get("remoteJid"),

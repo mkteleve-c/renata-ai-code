@@ -392,11 +392,25 @@ async def aplicar_gate(
         #
         # Lead inexistente segue sem rastro: nada é criado para quem está
         # fora da lista.
+        # `followup_active = false` junto, e este é o ponto sutil: sem ele,
+        # o `last_inbound_at = now()` acima torna o lead elegível ao degrau 1
+        # no INSTANTE em que a allowlist for esvaziada. Ele receberia "Fulano?"
+        # e, 1h depois, "imagino que esteja corrido aí" — cobrança sobre uma
+        # conversa que a empresa NUNCA respondeu, porque a janela de teste a
+        # descartou. Rajada de follow-up indevido no minuto seguinte ao
+        # cutover, para todo mundo que escreveu durante a janela.
+        #
+        # Desligar a régua é a escolha segura e se cura sozinha: `aplicar_gate`
+        # religa `followup_active = true` no caminho aceito, então o lead volta
+        # à régua na primeira mensagem que ele mandar depois da janela. Mesma
+        # doutrina de `_vencedor_pausa`: errar para o lado de não mandar
+        # mensagem é recuperável; mandar para quem não devia, não.
         if not settings.permite(canonico):
             if lead_view:
                 await cur.execute(
                     "update leads_crm set last_inbound_at = now(), "
-                    "followup_count = 0 where phone in (%s, %s)",
+                    "followup_count = 0, followup_active = false "
+                    "where phone in (%s, %s)",
                     (com_9, sem_9),
                 )
             logger.info(

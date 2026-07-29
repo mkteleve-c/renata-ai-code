@@ -175,6 +175,41 @@ async def test_inbound_de_fora_da_allowlist_ainda_move_last_inbound_at(
     assert followup_count == 0, "o lead falou — o contador de follow-up zera"
 
 
+async def test_quem_a_janela_descartou_nao_vira_rajada_ao_esvaziar_a_allowlist(
+    allowlist_ligada, limpar, monkeypatch
+):
+    """A regressão que o `last_inbound_at = now()` sozinho abria.
+
+    Com o relógio andando e `followup_active` intacto, o lead descartado
+    pela janela vira elegível ao degrau 1 no INSTANTE em que a allowlist é
+    esvaziada — e recebe cobrança sobre uma conversa que a empresa nunca
+    respondeu. Multiplicado por todo mundo que escreveu durante a janela,
+    é uma rajada de follow-up indevido no minuto seguinte ao cutover.
+    """
+    pool = await get_pool()
+    async with pool.connection() as conn:
+        await conn.execute(
+            "insert into leads_crm (phone, name, phase, last_inbound_at) "
+            "values (%s, 'Nunca Respondido', 'iniciou_conversa', "
+            "        now() - interval '2 hours')",
+            (DE_FORA_CANONICO,),
+        )
+
+    await aplicar_gate(pool, _jid(DE_FORA), push_name=None)
+
+    # O cutover acontece: allowlist esvaziada, régua ligada.
+    sem_trava = Settings(_env_file=None)
+    for mod in (config_mod, leads_mod, followup_mod):
+        monkeypatch.setattr(mod, "settings", sem_trava, raising=True)
+
+    reivindicados = await followup_mod.reivindicar(pool, n1_min=0)
+
+    assert all(r.phone != DE_FORA_CANONICO for r in reivindicados), (
+        "lead que a janela descartou foi cobrado por uma conversa "
+        "que a empresa nunca respondeu"
+    )
+
+
 async def test_regua_nao_reivindica_quem_esta_fora_da_allowlist(
     allowlist_ligada, limpar
 ):

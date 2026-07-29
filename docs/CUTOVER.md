@@ -148,11 +148,11 @@ railway run --service worker env DATABASE_URL="$DATABASE_URL_PUBLICA" \
   uv run python scripts/preflight_cutover.py
 ```
 
-Imprime uma tabela com as doze checagens e termina com código de saída `0`
+Imprime uma tabela com as treze checagens e termina com código de saída `0`
 só se todas passarem.
 
 **Como saber que deu certo:** a última linha diz
-`12/12 checagens passaram -- pré-voo ok.` e o processo sai com código `0`
+`13/13 checagens passaram -- pré-voo ok.` e o processo sai com código `0`
 (`echo $?` depois de rodar).
 
 **Se der errado:** **pare aqui.** A tabela lista exatamente o que falhou e
@@ -450,6 +450,53 @@ railway run --service worker env DATABASE_URL="$DATABASE_URL_PUBLICA" \
 Mantenha a fila à vista — literalmente, um terminal rodando o script em
 intervalos, ou `psql` aberto contra a `DATABASE_URL` pública (TCP Proxy) —
 durante pelo menos a primeira hora de tráfego real.
+
+### Passo 11.5 — Esvaziar `ALLOWLIST_PHONES` — o passo que nenhum portão cobra
+
+**Se você usou uma janela de teste, a Renata está atendendo SÓ os telefones
+de `ALLOWLIST_PHONES`. Todo lead real está sendo descartado em silêncio.**
+
+Este é o único passo do roteiro que nenhuma verificação automática pega, e
+vale entender por quê antes de confiar nelas:
+
+- **`preflight_cutover.py` fica verde.** A 13ª checagem avisa quando a
+  allowlist está preenchida, mas ela é um **aviso**, não um bloqueio — o
+  pré-voo precisa passar durante a janela de teste, senão ninguém consegue
+  testar. Leia a linha, não só o `12/13 passaram`.
+- **O teste de fumaça do passo 10 fica verde.** Ele manda usar "um número
+  próprio, não um lead real" — e o número próprio do operador é exatamente
+  o que está na allowlist.
+- **O monitoramento do passo 11 fica verde.** As seis métricas contam
+  coisa ruim (fila parada, falhas, handover, fallback de balões). O gate
+  descarta antes de qualquer escrita: zero mensagem produz zero fila, zero
+  falha, zero tudo. Nenhum limiar de reversão dispara.
+
+Ou seja: n8n desligado, webhook repontado, todo lead real em silêncio
+absoluto, e os três portões verdes.
+
+```bash
+railway variables --service api    --set 'ALLOWLIST_PHONES='
+railway variables --service worker --set 'ALLOWLIST_PHONES='
+```
+
+**Como saber que deu certo:** o boot dos dois serviços loga
+`allowlist_ativa=false`. Com a allowlist ligada ele loga
+`allowlist_ativa=true allowlist_permitidos=N`.
+
+```bash
+railway logs --service worker -d --lines 50 | grep worker_ready
+railway logs --service api    -d --lines 50 | grep server_ready
+```
+
+**Confira também `allowlist_descartadas` no mesmo log.** Se ele vier
+não-vazio, alguma entrada não era telefone — e se TODAS forem recusadas
+(separar por espaço em vez de vírgula faz isso), a lista fica vazia e a
+trava **evapora**, liberando todo mundo sem nenhum outro sinal.
+
+**Quem escreveu durante a janela não vira rajada.** O gate desliga
+`followup_active` de quem descartou, justamente para o relógio andar sem
+gerar cobrança sobre uma conversa que a empresa nunca respondeu. Esses leads
+voltam à régua sozinhos na primeira mensagem que mandarem depois daqui.
 
 ### Passo 12 — `FOLLOWUP_ENABLED` — decisão separada, não hoje
 

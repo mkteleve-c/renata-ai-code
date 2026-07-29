@@ -293,7 +293,8 @@ db/migrations/
 ├── 012_dedupe_por_telefone_e_absorvidos.sql # índice de dedupe (channel, agent_id, phone_number, message_id) + message_ids_absorvidos
 ├── 013_last_inbound_at.sql             # leads_crm.last_inbound_at — âncora dos degraus de follow-up
 ├── 014_uma_linha_por_pessoa.sql        # CHECK de telefone canônico em leads_crm
-└── 015_legacy_chat_history.sql         # ajustes de histórico legado importado
+├── 015_legacy_chat_history.sql         # ajustes de histórico legado importado
+└── 016_blocklist_opt_out_n8n.sql       # opt-outs importados do n8n (26 pessoas)
 ```
 
 Para adicionar uma nova migração, crie um arquivo SQL com o próximo número sequencial (ex: `016_nova_feature.sql`). A ordem alfabética dos nomes determina a ordem de aplicação.
@@ -721,7 +722,7 @@ Opcional em ambientes compartilhados:
 10. Atualizar `BETTER_AUTH_URL` com o domínio real do Frontend
 11. Confirmar 1 réplica na API **e** 1 réplica no Worker (já vem de `railway.api.json`/`railway.worker.json` — só confira que ninguém sobrescreveu pelo dashboard)
 12. Adicionar volume ao serviço DB (`/var/lib/postgresql/data`)
-13. Verificar migrações (rodam automaticamente no startup da API — checar logs por `migration_applying`; sequência atual vai de `001_initial.sql` a `015_legacy_chat_history.sql`)
+13. Verificar migrações (rodam automaticamente no startup da API — checar logs por `migration_applying`; sequência atual vai de `001_initial.sql` a `016_blocklist_opt_out_n8n.sql` -- a 016 é a que importa os 26 opt-outs, confira que ela aparece)
 14. Testar health check: `GET https://api-*.up.railway.app/health`
 15. Definir `ADMIN_EMAIL` e `ADMIN_PASSWORD` no serviço `frontend`
 16. Acessar `/login`, validar o bootstrap automático do primeiro admin e trocar a senha
