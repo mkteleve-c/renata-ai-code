@@ -13,8 +13,10 @@ A maior parte das configurações tem defaults sensatos para desenvolvimento loc
 Segredos compartilhados do painel/admin devem ser preenchidos explicitamente.
 """
 
+from typing import Annotated
+
 from pydantic import SecretStr, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 from whatsapp_langchain.shared.phone import canonicalizar
 
@@ -218,7 +220,13 @@ class Settings(BaseSettings):
     #
     # Vazia = desligada, e tem que ser esse o default: uma allowlist que
     # ligasse sozinha emudeceria o sistema inteiro sem erro nenhum.
-    allowlist_phones: list[str] = []
+    # `NoDecode` não é decoração: sem ele, um campo `list[str]` faz o
+    # pydantic-settings tentar decodificar o env var como JSON ANTES de
+    # qualquer validator. `ALLOWLIST_PHONES=5581991013614` vira um `int`,
+    # falha a validação de lista e levanta ValidationError no import deste
+    # módulo -- API e Worker caem juntos, antes de qualquer log útil. Foi
+    # exatamente assim que o primeiro deploy desta variável quebrou.
+    allowlist_phones: Annotated[list[str], NoDecode] = []
 
     @field_validator("allowlist_phones", mode="before")
     @classmethod
@@ -236,8 +244,6 @@ class Settings(BaseSettings):
         e o pior momento para isso é exatamente quando alguém está mexendo
         nesta variável.
         """
-        from whatsapp_langchain.shared.phone import canonicalizar
-
         if isinstance(valor, str):
             brutos = valor.split(",")
         elif isinstance(valor, list):
@@ -267,8 +273,6 @@ class Settings(BaseSettings):
         """
         if not self.allowlist_phones:
             return True
-
-        from whatsapp_langchain.shared.phone import canonicalizar
 
         canonico = canonicalizar(telefone)
         return canonico is not None and canonico in self.allowlist_phones

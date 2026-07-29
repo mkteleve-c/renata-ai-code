@@ -18,6 +18,36 @@ def _s(**kw) -> Settings:
     return Settings(_env_file=None, **kw)
 
 
+@pytest.mark.parametrize(
+    "valor",
+    [
+        "5581991013614",  # só dígitos: pydantic-settings lê como int JSON
+        "5581991013614,5511988887777",
+        "+55 81 99101-3614",
+        "",
+    ],
+)
+def test_carrega_da_variavel_de_ambiente_sem_derrubar_o_boot(monkeypatch, valor):
+    """O caminho que quebrou produção, e que os testes por kwarg não pegam.
+
+    Campo declarado `list[str]` faz o pydantic-settings tentar decodificar o
+    env var como JSON ANTES de qualquer validator: `ALLOWLIST_PHONES=5581991013614`
+    vira um `int` e levanta `ValidationError` no import de `config` — API e
+    Worker caem juntos, antes de qualquer log útil. Exatamente o que o
+    `NoDecode` existe para evitar.
+
+    Construir `Settings(allowlist_phones=...)` com kwarg pula esse decode
+    inteiro, então testar só por kwarg deixa o furo passar.
+    """
+    monkeypatch.setenv("ALLOWLIST_PHONES", valor)
+    s = Settings(_env_file=None)
+
+    assert isinstance(s.allowlist_phones, list)
+    if valor:
+        assert s.allowlist_ativa is True
+        assert s.permite("5581991013614") is True
+
+
 def test_vazia_por_padrao_significa_desligada():
     s = _s()
     assert s.allowlist_phones == []
