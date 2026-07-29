@@ -547,7 +547,7 @@ async def claim_next(
                       status,
                       process_after, attempts, max_attempts, lease_until,
                       response, error, outbound_token, channel,
-                      provider_message_key,
+                      provider_message_key, baloes_enviados,
                       created_at, updated_at, processed_at
             """,
             (lease_until,),
@@ -581,9 +581,10 @@ async def claim_next(
             outbound_token=row[19],
             channel=row[20],
             provider_message_key=row[21],
-            created_at=row[22],
-            updated_at=row[23],
-            processed_at=row[24],
+            baloes_enviados=row[22],
+            created_at=row[23],
+            updated_at=row[24],
+            processed_at=row[25],
         )
 
         logger.info(
@@ -595,6 +596,30 @@ async def claim_next(
             attempt=message.attempts,
         )
         return message
+
+
+async def registrar_balao_enviado(
+    pool: AsyncConnectionPool,
+    message_id: int,
+    enviados: int,
+) -> None:
+    """Grava quantos balões desta mensagem já chegaram ao lead.
+
+    Chamada DEPOIS de cada envio confirmado, em transação própria e curta:
+    se o processo morrer entre o `send_message` e este `UPDATE`, o retry
+    reenvia UM balão. Errar por um a mais é recuperável; errar pela
+    sequência inteira, que era o comportamento anterior, não é.
+
+    `GREATEST` para o contador nunca andar para trás: um retry que reenvie
+    menos balões que o attempt anterior não pode fazer o próximo retomar de
+    um ponto já entregue.
+    """
+    async with pool.connection() as conn:
+        await conn.execute(
+            "UPDATE message_queue SET baloes_enviados = GREATEST(baloes_enviados, %s) "
+            "WHERE id = %s",
+            (enviados, message_id),
+        )
 
 
 async def mark_done(

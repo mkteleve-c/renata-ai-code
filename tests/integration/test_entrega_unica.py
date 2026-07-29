@@ -12,7 +12,7 @@ travada.
 import pytest
 
 from whatsapp_langchain.shared.db import get_pool
-from whatsapp_langchain.shared.models import MessagingChannel
+from whatsapp_langchain.shared.models import MessageQueue, MessagingChannel
 from whatsapp_langchain.shared.queue import (
     claim_next,
     enqueue_or_buffer,
@@ -104,3 +104,66 @@ async def test_mark_failed_continua_funcionando_para_falha_de_verdade(limpar):
 
     assert status == "queued", "falha real precisa voltar para a fila"
     assert error == "Evolution 500"
+
+
+async def test_retry_retoma_os_baloes_em_vez_de_reenviar_tudo(limpar):
+    """Falha no meio da sequência não pode reentregar o que já chegou.
+
+    A Renata responde em balões; cada um é um `send_message` independente.
+    Antes da migração 017 o retry reinvocava o agente do zero e recomeçava
+    no índice 0 — o lead relia o que já tinha recebido, e com
+    `max_attempts = 3` o mesmo balão podia chegar três vezes.
+    """
+    from whatsapp_langchain.shared.queue import registrar_balao_enviado
+    from whatsapp_langchain.worker.processor import _send_baloes
+
+    pool = await get_pool()
+    resultado = await enqueue_or_buffer(
+        pool,
+        phone_number=TELEFONE,
+        agent_id="elevec_sdr",
+        body="oi",
+        channel=MessagingChannel.EVOLUTION,
+        buffer_seconds=0,
+    )
+    msg_id = resultado.message_id
+
+    # Primeira tentativa: dois balões chegam, o terceiro estoura.
+    await registrar_balao_enviado(pool, msg_id, 2)
+
+    # Relê a linha em vez de usar `claim_next`: a fila é global e outro
+    # teste da suíte pode reivindicar antes: o que importa aqui é que o
+    # progresso persiste e que `_send_baloes` o respeita.
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            "select baloes_enviados from message_queue where id = %s", (msg_id,)
+        )
+        persistido = (await cur.fetchone())[0]
+    assert persistido == 2, "o progresso não foi persistido"
+
+    message = MessageQueue(
+        id=msg_id,
+        phone_number=TELEFONE,
+        agent_id="elevec_sdr",
+        thread_id=f"{TELEFONE}:elevec_sdr",
+        incoming_message="oi",
+        channel=MessagingChannel.EVOLUTION,
+        baloes_enviados=persistido,
+    )
+
+    enviados: list[str] = []
+
+    class ClienteFake:
+        async def send_message(self, to: str, body: str) -> str:
+            enviados.append(body)
+            return "wamid.fake"
+
+    await _send_baloes(pool, ClienteFake(), message, ["um", "dois", "tres"])
+
+    assert enviados == ["tres"], f"o retry reenviou balões já entregues: {enviados}"
+
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            "select baloes_enviados from message_queue where id = %s", (msg_id,)
+        )
+        assert (await cur.fetchone())[0] == 3

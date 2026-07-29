@@ -46,6 +46,7 @@ from whatsapp_langchain.shared.models import MessageQueue, MessagingChannel
 from whatsapp_langchain.shared.queue import (
     mark_done,
     mark_failed,
+    registrar_balao_enviado,
     upsert_conversation,
 )
 from whatsapp_langchain.worker.evolution_client import EvolutionClient
@@ -159,6 +160,7 @@ async def _send_typing(
 
 
 async def _send_baloes(
+    pool: AsyncConnectionPool,
     outbound: OutboundClient,
     message: MessageQueue,
     baloes: list[str],
@@ -167,15 +169,21 @@ async def _send_baloes(
 
     Cada balão é um `_send_message` independente. Se um deles falhar no
     meio da sequência, os anteriores já foram entregues e **não são
-    reenviados aqui** — a exceção sobe para o `except Exception` de
-    `process_message`, que aciona `mark_failed` e o retry existente.
+    reenviados** — nem aqui, nem no retry.
 
-    Efeito herdado (não corrigido nesta task, comum aos quatro canais e já
-    registrado como backlog na Fase 1): o retry do processor reenvia a
-    mensagem inteira a partir do zero, então uma falha no meio duplica os
-    balões que já chegaram ao lead quando o próximo attempt roda. Por isso
-    logamos o índice exato que falhou — é o dado que faltaria para
-    diagnosticar a duplicação no retry.
+    `message_queue.baloes_enviados` (migração 017) guarda o progresso, e o
+    loop abaixo pula os índices já entregues. Sem isso, o retry reinvocava
+    o agente do zero e recomeçava o envio no índice 0: o lead relia os
+    balões que já tinha recebido, e com `max_attempts = 3` o mesmo balão
+    podia chegar três vezes. Uma resposta em balões torna esse modo de
+    falha visível de um jeito que a resposta única não tinha — ali, falha
+    significava que o lead não recebeu nada e o retry era simplesmente
+    correto.
+
+    O contador é gravado DEPOIS de cada envio confirmado, em transação
+    própria: se o processo morrer entre o envio e o `UPDATE`, o retry
+    reenvia UM balão. Errar por um a mais é recuperável; pela sequência
+    inteira, não era.
 
     `extrair_baloes` já aplica um teto (`settings.balao_max_count`) que
     concatena o excedente no último item, então `baloes` aqui nunca é maior
@@ -187,7 +195,17 @@ async def _send_baloes(
     """
     total = len(baloes)
     delay_s = settings.balao_delay_ms / 1000
+    ja_entregues = message.baloes_enviados
+    if ja_entregues:
+        logger.info(
+            "baloes_retomados",
+            message_id=message.id,
+            ja_entregues=ja_entregues,
+            balao_total=total,
+        )
     for idx, balao in enumerate(baloes):
+        if idx < ja_entregues:
+            continue
         try:
             await _send_message(outbound, message.phone_number, balao, message)
         except Exception:
@@ -198,8 +216,23 @@ async def _send_baloes(
                 channel=message.channel.value,
                 balao_index=idx,
                 balao_total=total,
+                ja_entregues=ja_entregues,
             )
             raise
+        # Best-effort, e de propósito: o balão JÁ chegou ao lead. Deixar
+        # uma falha de contabilidade abortar a sequência entregaria uma
+        # resposta pela metade para consertar um contador — troca ruim. O
+        # custo de não gravar é o retry reenviar este balão, que é
+        # exatamente o comportamento que existia antes da migração 017.
+        try:
+            await registrar_balao_enviado(pool, message.id, idx + 1)
+        except Exception as reg_err:
+            logger.warning(
+                "registrar_balao_enviado_falhou",
+                message_id=message.id,
+                balao_index=idx,
+                error=str(reg_err),
+            )
         if idx < total - 1:
             await asyncio.sleep(delay_s)
 
@@ -330,9 +363,12 @@ async def process_message(
             checkpointer=checkpointer,
             store=store,
         )
-        result = await graph.ainvoke(
-            {"messages": [human_message]},
-            config=invoke_config,
+        result = await asyncio.wait_for(
+            graph.ainvoke(
+                {"messages": [human_message]},
+                config=invoke_config,
+            ),
+            timeout=settings.agent_timeout_seconds,
         )
 
         # 4. Extrair resposta
@@ -368,7 +404,7 @@ async def process_message(
                 response_text if isinstance(response_text, str) else str(response_text)
             ]
 
-        await _send_baloes(client, message, baloes)
+        await _send_baloes(pool, client, message, baloes)
 
         # 6. mark_done somente após envio confirmado. Grava o response_text
         # CRU (o JSON completo, se for a Renata) — é o registro de auditoria

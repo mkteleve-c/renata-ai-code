@@ -89,6 +89,13 @@ class MessageQueue(BaseModel):
             "como getBase64FromMediaMessage."
         ),
     )
+    baloes_enviados: int = Field(
+        default=0,
+        description=(
+            "Quantos balões desta resposta já chegaram ao lead. O retry "
+            "retoma daqui em vez de reenviar a sequência inteira."
+        ),
+    )
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     processed_at: datetime | None = None

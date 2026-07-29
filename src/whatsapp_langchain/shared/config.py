@@ -160,6 +160,19 @@ class Settings(BaseSettings):
     # --- Worker ---
     poll_interval_seconds: float = 1.0
     lease_seconds: int = 60
+    # Teto de tempo do `graph.ainvoke` — sem ele, o worker congela inteiro.
+    # O cliente do OpenRouter sobe com `timeout=None` (verificado: o httpx
+    # por baixo fica `Timeout(timeout=None)`), o loop do worker é serial
+    # (`await process_message` inline, sem gather) e produção roda 1 réplica.
+    # Um socket pendurado — não um erro, um socket que não fecha — bloqueia
+    # o `await` para sempre e NENHUM lead é atendido até alguém reiniciar o
+    # container. Não há auto-cura: a limpeza de lease só roda quando o
+    # worker volta a chamar `claim_next`, o que ele nunca faz.
+    #
+    # Default acima do `lease_seconds` de propósito: estourar o lease é um
+    # problema menor (outro worker reprocessa) do que cortar um turno
+    # legítimo que estava só demorando por causa do ciclo de tools.
+    agent_timeout_seconds: float = 120.0
     max_attempts: int = 3
 
     # --- Follow-up (régua de reengajamento do SDR) ---
@@ -344,7 +357,8 @@ class Settings(BaseSettings):
     def resolved_outbound_mode(self) -> str:
         """Resolve o modo outbound (real|mock) compartilhado entre Twilio e Meta.
 
-        Precedência: outbound_mode > twilio_outbound_mode (legacy) > default por ambiente.
+        Precedência: outbound_mode > twilio_outbound_mode (legacy) >
+        default por ambiente.
         """
         mode = self.outbound_mode.strip().lower()
         if mode:
