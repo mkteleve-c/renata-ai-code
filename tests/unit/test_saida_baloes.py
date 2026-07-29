@@ -7,6 +7,17 @@ de schema (item não-string, `messages` que não é lista, JSON inválido, etc.)
 cai inteiro para o texto bruto — nunca uma resposta mutilada — e loga um
 warning com o motivo, porque o fallback manda JSON cru pro WhatsApp do lead
 e isso precisa ser visível no log, não descoberto por reclamação do cliente.
+
+Iteração 5 (revisão adversarial): a regra "nunca mutilar" continua valendo,
+e é ela que manda. O que mudou é que várias formas vizinhas do schema —
+`messages` como string, array direto sem envelope, chave no singular,
+preâmbulo sem cerca — são RECUPERÁVEIS POR INTEIRO, e mandar JSON cru para
+o lead nesses casos não protegia contra nada: não havia mutilação possível,
+só o texto num envelope errado. `_resgatar` (`saida.py`) só devolve quando
+encontra o conteúdo completo em string ou lista de strings, e loga
+`extrair_baloes_resgatado`. O dump cru continua sendo o último recurso, para
+o JSON em que não há texto a recuperar — e é isso que os testes de "cai pro
+bruto" que sobraram protegem.
 """
 
 from structlog.testing import capture_logs
@@ -29,9 +40,9 @@ def test_texto_solto_vira_balao_unico():
     ]
 
 
-def test_json_sem_a_chave_messages_vira_balao_unico():
-    bruto = '{"resposta": "oi"}'
-    assert extrair_baloes(bruto) == [bruto]
+def test_chave_inesperada_com_valor_unico_e_resgatada():
+    """Envelope de nome errado, sem ambiguidade sobre qual é o conteúdo."""
+    assert extrair_baloes('{"resposta": "oi"}') == ["oi"]
 
 
 def test_lista_vazia_nao_devolve_nada_vazio():
@@ -78,36 +89,28 @@ def test_fallback_json_invalido_loga_warning():
     assert any(log["event"] == "extrair_baloes_json_invalido" for log in logs)
 
 
-def test_messages_como_string_cai_pro_bruto_e_loga():
-    bruto = '{"messages": "oi"}'
+def test_messages_como_string_e_resgatada_com_log():
+    """Um balão só, escrito sem a lista. Nada a mutilar."""
     with capture_logs() as logs:
-        resultado = extrair_baloes(bruto)
-    assert resultado == [bruto]
-    assert any(log["event"] == "extrair_baloes_sem_lista_messages" for log in logs)
+        resultado = extrair_baloes('{"messages": "oi"}')
+    assert resultado == ["oi"]
+    assert any(log["event"] == "extrair_baloes_resgatado" for log in logs)
 
 
-def test_json_dentro_de_prosa_cai_pro_bruto_e_loga():
-    bruto = 'Aqui está: {"messages": ["oi"]}'
-    with capture_logs() as logs:
-        resultado = extrair_baloes(bruto)
-    assert resultado == [bruto]
-    assert any(log["event"] == "extrair_baloes_json_invalido" for log in logs)
+def test_json_dentro_de_prosa_e_extraido():
+    """Preâmbulo SEM cerca de markdown — o mais provável dos dois, porque o
+    modelo default (`grok-4.1-fast`) não usa markdown por padrão."""
+    assert extrair_baloes('Aqui está: {"messages": ["oi"]}') == ["oi"]
 
 
-def test_cerca_nao_fechada_cai_pro_bruto_e_loga():
-    bruto = '```json\n{"messages": ["oi"]}'
-    with capture_logs() as logs:
-        resultado = extrair_baloes(bruto)
-    assert resultado == [bruto]
-    assert any(log["event"] == "extrair_baloes_json_invalido" for log in logs)
+def test_cerca_nao_fechada_ainda_entrega_o_conteudo():
+    """A cerca aberta não fecha, mas o JSON dentro dela está inteiro."""
+    assert extrair_baloes('```json\n{"messages": ["oi"]}') == ["oi"]
 
 
-def test_lista_no_topo_cai_pro_bruto_e_loga():
-    bruto = '["oi", "tchau"]'
-    with capture_logs() as logs:
-        resultado = extrair_baloes(bruto)
-    assert resultado == [bruto]
-    assert any(log["event"] == "extrair_baloes_nao_e_objeto" for log in logs)
+def test_lista_no_topo_e_resgatada():
+    """Array direto, sem o envelope `{"messages": ...}`."""
+    assert extrair_baloes('["oi", "tchau"]') == ["oi", "tchau"]
 
 
 def test_output_aninhado_sem_messages_cai_pro_bruto_e_loga():

@@ -1182,13 +1182,14 @@ def test_extrair_turno_de_conversa_desembrulha_a_forma_real_aninhada_em_output()
     assert "{" not in turno[1]
 
 
-def test_extrair_turno_de_conversa_ai_json_sem_lista_de_baloes_vira_balao_unico():
+def test_extrair_turno_de_conversa_ai_json_sem_lista_de_baloes_e_resgatado():
     """Nenhuma linha da base real tem essa forma (medido: 0 de 3.316) --
     mas o código não pode travar se aparecer. `content` JSON sem `messages`
-    nem no topo nem sob `output` cai no MESMO fallback que `extrair_baloes`
-    já usa para qualquer JSON sem a lista de balões: o texto JSON inteiro
-    vira um balão único (com aviso de log em `extrair_baloes`), nunca uma
-    exceção nem uma perda silenciosa da linha."""
+    nem no topo nem sob `output` segue o MESMO caminho que `extrair_baloes`
+    usa em produção: desde a iteração 5 da revisão adversarial, um objeto de
+    chave única com valor textual é resgatado (o texto sai do envelope) em
+    vez de virar dump cru. O que este teste protege continua sendo o mesmo:
+    nunca uma exceção, nunca a perda silenciosa da linha."""
     mensagem = {
         "type": "ai",
         "content": '{"algum_campo": "sem messages em lugar nenhum"}',
@@ -1201,7 +1202,7 @@ def test_extrair_turno_de_conversa_ai_json_sem_lista_de_baloes_vira_balao_unico(
     assert turno is not None
     papel, conteudo = turno
     assert papel == "ai"
-    assert conteudo == '{"algum_campo": "sem messages em lugar nenhum"}'
+    assert conteudo == "sem messages em lugar nenhum"
 
 
 def _linha_hist(

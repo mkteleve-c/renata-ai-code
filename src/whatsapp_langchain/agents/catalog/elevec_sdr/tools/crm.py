@@ -318,6 +318,46 @@ async def gravar_fase(
     return "gravou"
 
 
+async def gravar_dados_sem_mudar_fase(
+    telefone: str,
+    email: str | None,
+    faturamento_mensal: str | None,
+) -> bool:
+    """Persiste e-mail/faturamento quando a fase NÃO muda.
+
+    Existe para desfazer um impasse concreto: `gravar_fase` só escreve na
+    transição de fase, e `update_crm` devolvia cedo em fase repetida. Um
+    e-mail inválido gravado antes (a coluna não valida nada) travava
+    `calendar_agendar`, que exige e-mail válido e dá precedência à coluna
+    sobre o argumento — e não havia caminho para corrigir a coluna, porque
+    reenviar `update_crm` com a mesma fase e o e-mail certo caía no return
+    antecipado. O modelo ficava em loop de "volte à Fase 6" e o lead se
+    perdia.
+
+    Não toca em `phase` nem move card no Pipedrive: só escreve os dois
+    campos, com o mesmo `coalesce(nullif(%s, ''), coluna)` de `gravar_fase`
+    — argumento vazio nunca apaga o que já está cadastrado.
+    """
+    canonico = canonico_do_lead(telefone)
+    try:
+        pool = await get_pool()
+        async with pool.connection() as conn:
+            cur = await conn.execute(
+                "update leads_crm set "
+                "  email = coalesce(nullif(%s, ''), email),"
+                "  faturamento_mensal = coalesce(nullif(%s, ''), faturamento_mensal) "
+                "where phone = %s",
+                (email or "", faturamento_mensal or "", canonico),
+            )
+    except Exception as erro:
+        logger.warning("crm_dados_nao_gravados", phone=canonico, erro=str(erro))
+        return False
+
+    gravou = cur.rowcount > 0
+    logger.info("crm_dados_gravados", phone=canonico, gravou=gravou)
+    return gravou
+
+
 async def reverter_fase_apos_cancelamento(telefone: str) -> tuple[str, str]:
     """Devolve o lead de `agendou_sessao` para `qualificado` — banco e card.
 
@@ -483,6 +523,17 @@ async def update_crm(
 
     if estado["phase"] == alvo:
         logger.info("crm_fase_inalterada", phase=alvo)
+        # Fase repetida não é motivo para descartar dado novo. Sem isto, um
+        # e-mail inválido já gravado era impossível de corrigir: a coluna
+        # vence o argumento em `calendar_agendar`, e o único caminho de
+        # escrita (`gravar_fase`) exige transição de fase. O lead ficava
+        # preso num loop de "volte à Fase 6".
+        if email or faturamento_mensal:
+            if await gravar_dados_sem_mudar_fase(telefone, email, faturamento_mensal):
+                return interno(
+                    f"O lead já está em '{alvo}'; a fase não mudou, mas os "
+                    "dados informados foram atualizados no cadastro."
+                )
         return interno(f"O lead já está em '{alvo}'. Nada a atualizar.")
 
     resultado = await gravar_fase(

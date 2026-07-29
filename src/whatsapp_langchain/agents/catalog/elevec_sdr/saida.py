@@ -43,6 +43,11 @@ CERCA_ANCORADA = re.compile(r"^```(?:json)?\s*(.*?)\s*```$", re.S | re.I)
 # depois de esgotar as opções mais seguras (ver `_candidatos_json`).
 CERCA_LIVRE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.S | re.I)
 
+# Primeiro objeto ou array JSON solto no texto, para o caso de preâmbulo sem
+# cerca de markdown ("Claro! {...}"). Guloso até o último fechamento, porque
+# um balão pode conter `}` no meio de uma string.
+JSON_SOLTO = re.compile(r"(\{.*\}|\[.*\])", re.S)
+
 # Tamanho da prévia de texto nos logs de fallback — o suficiente para
 # diagnosticar sem inflar o log com a resposta inteira.
 PREVIEW_LEN = 200
@@ -116,7 +121,58 @@ def _candidatos_json(bruto: str) -> list[str]:
         conteudo = livre.group(1).strip()
         if conteudo not in candidatos:
             candidatos.append(conteudo)
+    # 4. Primeiro `{...}` ou `[...]` solto no texto: preâmbulo SEM cerca
+    #    ("Claro! {...}"). O default `grok-4.1-fast` não usa markdown por
+    #    padrão, então o preâmbulo cercado era tratado e o mais provável dos
+    #    dois — o sem cerca — não era. Por último, pela mesma razão da cerca
+    #    livre: é o candidato com maior chance de falso positivo.
+    if solto := JSON_SOLTO.search(bruto):
+        conteudo = solto.group(1).strip()
+        if conteudo not in candidatos:
+            candidatos.append(conteudo)
     return candidatos
+
+
+# Chaves que o modelo usa quando erra o schema. Ordem = precedência.
+_CHAVES_DE_TEXTO = ("messages", "message", "mensagens", "texto", "resposta")
+
+
+def _resgatar(dados: Any) -> list[str] | None:
+    """Tira os balões de uma forma vizinha da esperada, ou `None`.
+
+    O schema é `{"messages": [str, ...]}`. Quando o modelo escorrega, o
+    texto continua lá — só numa forma próxima: `messages` como string,
+    array direto sem envelope, chave no singular. Antes, todo esse conjunto
+    caía no `return [bruto]` e a pessoa via `{"messages": "Oi! Tudo bem?"}`
+    no WhatsApp.
+
+    Resgatar não é adivinhar: só devolve quando encontra string de verdade
+    na estrutura. Sem isso, `None`, e o caller mantém o dump cru — que
+    continua sendo o certo para um JSON sem texto nenhum (melhor o cru,
+    visível no chat e no log, do que uma resposta vazia).
+    """
+
+    def _do_valor(valor: Any) -> list[str] | None:
+        if isinstance(valor, str):
+            limpo = valor.strip()
+            return [limpo] if limpo else None
+        if isinstance(valor, list) and valor and all(isinstance(v, str) for v in valor):
+            limpos = [v.strip() for v in valor if v.strip()]
+            return limpos or None
+        return None
+
+    if (direto := _do_valor(dados)) is not None:
+        return direto
+
+    if isinstance(dados, dict):
+        for chave in _CHAVES_DE_TEXTO:
+            if chave in dados and (resgatado := _do_valor(dados[chave])) is not None:
+                return resgatado
+        # Objeto de chave única com valor textual: o envelope tem nome
+        # inesperado, mas não há ambiguidade sobre qual é o conteúdo.
+        if len(dados) == 1:
+            return _do_valor(next(iter(dados.values())))
+    return None
 
 
 def extrair_baloes(texto: Any) -> list[str]:
@@ -145,6 +201,9 @@ def extrair_baloes(texto: Any) -> list[str]:
             tipo=type(dados).__name__,
             preview=_preview(bruto),
         )
+        if (resgatado := _resgatar(dados)) is not None:
+            logger.info("extrair_baloes_resgatado", origem="nao_e_objeto")
+            return resgatado
         return [bruto]
 
     mensagens = dados.get("messages")
@@ -154,6 +213,9 @@ def extrair_baloes(texto: Any) -> list[str]:
             tipo=type(mensagens).__name__,
             preview=_preview(bruto),
         )
+        if (resgatado := _resgatar(dados)) is not None:
+            logger.info("extrair_baloes_resgatado", origem="sem_lista")
+            return resgatado
         return [bruto]
 
     # Qualquer item que não seja string invalida a lista INTEIRA — não
@@ -167,6 +229,9 @@ def extrair_baloes(texto: Any) -> list[str]:
             tipos=[type(m).__name__ for m in mensagens],
             preview=_preview(bruto),
         )
+        if (resgatado := _resgatar(dados)) is not None:
+            logger.info("extrair_baloes_resgatado", origem="item_nao_string")
+            return resgatado
         return [bruto]
 
     baloes = [m.strip() for m in mensagens if m.strip()]

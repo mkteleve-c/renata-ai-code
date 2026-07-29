@@ -210,12 +210,38 @@ async def test_fase_igual_nao_reescreve_nada(limpar, turno, pipedrive):
     assert "já está" in saida
 
 
-async def test_fase_igual_nao_persiste_nem_email(limpar, turno, pipedrive):
+async def test_fase_igual_ainda_corrige_o_email(limpar, turno, pipedrive):
+    """Fase repetida não pode descartar dado novo.
+
+    Antes, este caminho devolvia cedo e não gravava nada — e como a coluna
+    `email` não valida formato e vence o argumento em `calendar_agendar`,
+    um e-mail inválido gravado uma vez travava o agendamento para sempre:
+    o único caminho de escrita (`gravar_fase`) exige transição de fase, e
+    reenviar `update_crm` com a mesma fase caía no return antecipado. O
+    modelo ficava em loop de "volte à Fase 6" e o lead se perdia.
+    """
+    await criar_lead(phase="qualificado", email="joao@gmail")
+
+    saida = await update_crm.ainvoke(
+        {"phase": "qualificado", "email": "joao@gmail.com"}
+    )
+
+    assert (await ler_lead())["email"] == "joao@gmail.com"
+    assert "atualizados" in saida
+
+
+async def test_fase_igual_sem_dados_novos_continua_sendo_no_op(
+    limpar, turno, pipedrive
+):
+    """Contraprova: sem e-mail nem faturamento, nada é escrito e a recusa
+    amigável continua igual — o card do Pipedrive não pode se mover duas
+    vezes por causa desta mudança."""
     await criar_lead(phase="qualificado", email="antigo@exemplo.com")
 
-    await update_crm.ainvoke({"phase": "qualificado", "email": "novo@exemplo.com"})
+    saida = await update_crm.ainvoke({"phase": "qualificado"})
 
     assert (await ler_lead())["email"] == "antigo@exemplo.com"
+    assert "Nada a atualizar" in saida
 
 
 # --- Follow-up --------------------------------------------------------------
