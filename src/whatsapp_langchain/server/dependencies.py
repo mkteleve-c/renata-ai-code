@@ -173,6 +173,33 @@ async def verify_evolution_webhook_secret(request: Request) -> None:
     raise HTTPException(status_code=401, detail="Invalid Evolution webhook secret")
 
 
+async def verify_chatwoot_webhook_secret(request: Request) -> None:
+    """Verifica o segredo do webhook do ChatWoot, quando configurado.
+
+    Mesma mecânica de `verify_evolution_webhook_secret`: o ChatWoot não
+    assina o body, então o header estático é o único gate. Sem ele, um POST
+    anônimo desliga o agente para o telefone que o atacante escolher — ou,
+    pior, RELIGA um lead que uma pessoa pausou de propósito, e a Renata volta
+    a falar por cima de um atendimento humano.
+
+    Opcional só em dev. Aceita `X-Chatwoot-Webhook-Secret` ou `apikey`.
+    """
+    esperado = settings.chatwoot_webhook_secret.strip()
+    if not esperado:
+        return
+
+    esperado_bytes = esperado.encode("utf-8")
+    for header in ("X-Chatwoot-Webhook-Secret", "apikey"):
+        recebido = request.headers.get(header)
+        if recebido and hmac.compare_digest(
+            recebido.strip().encode("utf-8"), esperado_bytes
+        ):
+            return
+
+    logger.warning("chatwoot_webhook_secret_invalido", path=str(request.url.path))
+    raise HTTPException(status_code=401, detail="Invalid ChatWoot webhook secret")
+
+
 async def check_rate_limit(phone_number: str) -> None:
     """Verifica rate limit por número de telefone.
 

@@ -115,6 +115,13 @@ class Settings(BaseSettings):
     # a rota passa a exigi-lo. Vazio = rota aberta (default de dev).
     evolution_webhook_secret: str = ""
 
+    # --- ChatWoot (etiqueta `pausar_agente` = handover humano) ---
+    # Mesma doutrina do secret da Evolution: o ChatWoot não assina o body, e
+    # o header estático é o único gate do inbound. Sem ele, um POST anônimo
+    # desliga o agente para o telefone que o atacante escolher — ou religa um
+    # que uma pessoa pausou de propósito. Vazio = rota aberta (default de dev).
+    chatwoot_webhook_secret: str = ""
+
     # --- Google Calendar (agenda de agendamento do SDR) ---
     # OAuth 2.0 por refresh token, de uma conta com permissão de escrita na
     # agenda. GOOGLE_CALENDAR_ID é o e-mail do calendário.
