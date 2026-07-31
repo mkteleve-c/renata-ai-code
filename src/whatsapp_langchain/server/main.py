@@ -66,6 +66,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         allowlist_ativa=settings.allowlist_ativa,
         allowlist_permitidos=len(settings.allowlist_phones),
         allowlist_descartadas=settings.allowlist_descartadas,
+        horario_comercial=(
+            f"{settings.horario_comercial_inicio}-{settings.horario_comercial_fim} seg-sex"
+            if settings.horario_comercial_ativo
+            else "desligado"
+        ),
+        calada_agora=settings.em_horario_comercial(),
     )
 
     yield
