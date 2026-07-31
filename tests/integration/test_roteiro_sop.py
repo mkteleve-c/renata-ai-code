@@ -497,7 +497,10 @@ async def test_roteiro_sop_com_llm_real(dubles, lead_no_banco, capsys):
     if dubles.calendario.criados:
         estado = await estado_do_lead()
         assert estado["email"], "agendou sem e-mail no cadastro"
-        assert estado["faturamento_mensal"], "agendou sem faturamento no cadastro"
+        # Faturamento NÃO é mais pré-condição do agendamento — a ordem foi
+        # invertida (mudança documentada nº 6 do golden). O que ele precisa
+        # ser é COLETADO, e isso o roteiro por faixa abaixo prova.
+        assert estado["faturamento_mensal"], "não coletou faturamento depois de agendar"
 
     assert "calendar_get_many" in chamadas, "não consultou a agenda"
     assert "update_crm" in chamadas, "não registrou nenhuma transição de fase"
@@ -517,5 +520,62 @@ async def test_roteiro_c1_com_llm_real(dubles, lead_no_banco):
     assert dubles.calendario.criados == [], "agendou um lead desqualificado"
     estado = await estado_do_lead()
     assert estado["google_event_id"] is None
+
+    conferir_nao_vazamento(turnos)
+
+
+# --- Live: o desfecho por faixa (mudança nº 6) ------------------------------
+
+_ATE_O_AGENDAMENTO = ROTEIRO_SOP[:-1]  # tudo menos a fala do faturamento
+
+
+@sem_live
+@pytest.mark.parametrize(
+    ("faixa", "fala", "espera_evento", "espera_handover", "fase"),
+    [
+        ("5-8k", "uns 6 mil por mês", True, False, "agendou_sessao"),
+        ("8-25k", "gira em torno de 20 mil", True, False, "agendou_sessao"),
+        (">25k", "uns 40 mil por mês", True, True, "agendou_sessao"),
+        ("<5k", "uns 3 mil por mês", False, True, "desqualificado"),
+    ],
+    # ids ASCII e sem espaço: sem eles o pytest gera `m\xeas` e o node id não
+    # casa em `-k` nem na linha de comando, o que impede rodar uma faixa
+    # isolada — e isolar é justamente como se descobre vazamento entre casos.
+    ids=["faixa_5_8k", "faixa_8_25k", "faixa_acima_25k", "faixa_abaixo_5k"],
+)
+async def test_desfecho_por_faixa_de_faturamento(
+    dubles, lead_no_banco, faixa, fala, espera_evento, espera_handover, fase
+):
+    """As faixas do `nXuIqeQ0tBialBsR` (YAY FORMS), com o modelo real.
+
+    O caso `<5k` é o que prova a decisão central: o corte de R$ 5 mil vale
+    mesmo depois de agendar, e o evento **não pode sobreviver**. Os outros
+    três provam o oposto — que ninguém acima do corte perde a reunião.
+    """
+    from whatsapp_langchain.agents.catalog.elevec_sdr.agent import build_graph
+
+    grafo = build_graph(checkpointer=InMemorySaver())
+    turnos = await conversar(
+        grafo,
+        [*_ATE_O_AGENDAMENTO, f"Hoje meu faturamento fica {fala}."],
+        f"FAIXA {faixa} — {fala}",
+    )
+    chamadas = [nome for turno in turnos for nome in turno.tool_calls]
+    estado = await estado_do_lead()
+
+    assert estado["faturamento_mensal"], "não registrou o faturamento"
+
+    if espera_evento:
+        assert estado["google_event_id"], f"{faixa}: perdeu a reunião indevidamente"
+        assert "calendar_delete" not in chamadas, f"{faixa}: cancelou sem motivo"
+    else:
+        assert estado["google_event_id"] is None, (
+            "abaixo de R$ 5 mil não pode ficar com reunião marcada"
+        )
+
+    assert ("human_handover" in chamadas) is espera_handover, (
+        f"{faixa}: handover esperado={espera_handover}, chamadas={chamadas}"
+    )
+    assert estado["phase"] == fase
 
     conferir_nao_vazamento(turnos)

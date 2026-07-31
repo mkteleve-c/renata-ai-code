@@ -32,6 +32,14 @@ def _extrair_bloco_verbatim() -> str:
     return apos_titulo[inicio_fence:fim_fence]
 
 
+# Os dois blocos abaixo são o TEXTO EXATO que a mudança 6 injeta. Ficam aqui
+# como literais, e não derivados de `prompts.py`, porque é isso que trava o
+# prompt: qualquer edição futura no SOP que não passe por aqui quebra o golden.
+_FASES_7_8_9 = '7. Agendamento: Após receber o e-mail, consulte novamente a disponibilidade da DATA/Hora escolhida (usando calendar_get_many). Se estiver disponível, agende o evento (calendar_agendar). Se a tool retornar sucesso, confirme:\n\t- Feito, agendado [DATA/HORA]! Te mandei o convite no e-mail que você passou.\n\t- NÃO encerre a conversa aqui. Siga imediatamente para a Fase 8.\n\n8. Qualificação por Faturamento (após agendar): Agora que o horário está reservado, colete a faixa de faturamento.\n\t- Se o campo "Faturamento já declarado" acima estiver PREENCHIDO, apenas CONFIRME, não pergunte do zero: "Antes de finalizar: vi aqui que você preencheu que fatura [FAIXA]. Segue assim hoje?"\n\t- Se estiver VAZIO, pergunte: "Antes de finalizar, uma última pergunta para tornar nossa reunião mais produtiva: qual seu faturamento médio mensal hoje? Assim o Silvio consegue trazer cases com mais contexto para o seu momento."\n\t- Encaixe a resposta em UMA destas faixas, mesmo que o lead responda em texto livre ("uns 10 mil" = R$ 8 mil a R$ 15 mil/mês):\n\t\tMenos de R$ 3 mil/mês | R$ 3 mil a R$ 5 mil/mês | R$ 5 mil a R$ 8 mil/mês | R$ 8mil a R$ 15 mil/mês | R$ 15 mil a R$ 25 mil/mês | Acima de R$25 mil/mês\n\t- Registre SEMPRE com update_crm, passando faturamento_mensal com o texto EXATO da faixa acima.\n\t- Depois de registrar, siga a Fase 9 conforme a faixa.\n\t- Se o lead recusar ou desconversar, reforce UMA vez. Se ainda assim não informar, encerre cordialmente mantendo o agendamento e chame human_handover explicando que o faturamento não foi coletado.\n\n9. Desfecho por faixa (INVIOLÁVEL):\n\t- ATÉ R$ 25 mil/mês (faixas de R$ 5 mil a R$ 8 mil, R$ 8mil a R$ 15 mil e R$ 15 mil a R$ 25 mil): registre update_crm com phase agendou_sessao e encerre:\n\t\t- Foi ótimo falar com você, [Primeiro Nome]. O Silvio vai te esperar. Até lá!\n\t- ACIMA DE R$ 25 mil/mês: mantenha o agendamento, registre update_crm com phase agendou_sessao e chame human_handover com o motivo "lead acima de 25k, encaminhar para o Silvio". Encerre normalmente com o lead, sem mencionar o encaminhamento.\n\t- ABAIXO DE R$ 5 mil/mês (faixas Menos de R$ 3 mil e R$ 3 mil a R$ 5 mil): este lead NÃO pode ficar com a reunião. Cancele o evento (calendar_delete), registre update_crm com phase desqualificado e chame human_handover com o motivo "faturamento abaixo do mínimo, reunião cancelada". Ao lead, diga com respeito:\n\t\t- Entendo, [Primeiro Nome]. Sendo bem honesta com você: neste momento a metodologia do Silvio não é o caminho mais indicado para o seu momento, então prefiro liberar o horário.\n\t\t- Agradeço muito a sua transparência, e desejo sucesso na sua caminhada.'
+
+_SEQUENCIA_INVIOLAVEL = "### Sequência de Agendamento (INVIOLÁVEL):\n- A ordem obrigatória é: horário escolhido → e-mail → consulta de disponibilidade → calendar_agendar → faturamento → desfecho por faixa.\n- É TERMINANTEMENTE PROIBIDO encerrar a conversa logo após calendar_agendar. O faturamento (Fase 8) e o desfecho (Fase 9) SEMPRE acontecem depois de agendar.\n- Se em QUALQUER momento antes de agendar o lead revelar que fatura menos de R$ 5 mil/mês, NÃO agende: vá direto para o desfecho de desqualificação da Fase 9, sem criar evento nenhum.\n- Nunca chame calendar_agendar duas vezes para o mesmo lead."
+
+
 def _aplicar_mudancas_documentadas(bruto: str) -> str:
     """Reproduz exatamente as transformações feitas em prompts.py.
 
@@ -113,11 +121,49 @@ def _aplicar_mudancas_documentadas(bruto: str) -> str:
     assert texto.count(ancora_saudacao) == 1
     texto = texto.replace(ancora_saudacao, ancora_saudacao + guarda_nome_ausente)
 
+    texto = _inverter_agenda_e_faturamento(texto)
+
+    return texto
+
+
+def _inverter_agenda_e_faturamento(texto: str) -> str:
+    """Mudança documentada nº 6: agendar ANTES de perguntar faturamento.
+
+    No n8n o faturamento era portão marcado OBRIGATÓRIO: a Fase 7 recusava
+    agendar até o lead informar. Era a maior fricção do funil — quem travava
+    ali era perdido inteiro, sem reunião e sem dado.
+
+    Aqui o compromisso é firmado primeiro e a qualificação vem depois, com
+    as faixas do workflow `nXuIqeQ0tBialBsR` (YAY FORMS) do próprio n8n. O
+    corte de R$ 5 mil continua valendo e é INVIOLÁVEL: quem revelar menos
+    que isso antes de agendar não agenda, e quem só revelar depois tem o
+    evento cancelado.
+
+    Esta é a transformação mais invasiva das seis — reescreve duas fases,
+    acrescenta uma nona e refaz o bloco `Sequência de Agendamento`. Por isso
+    a evidência do n8n permanece intacta: `docs/evidencias/prompt-renata-n8n.md`
+    continua sendo o SOP original, e o diff mora aqui.
+    """
+    ancora_dados = "- Data Hoje(dd/MM/yyyy): {data_hoje}\n"
+    campo_faturamento = (
+        "- Faturamento já declarado (vazio = ainda não sabemos): {faturamento}\n"
+    )
+    assert texto.count(ancora_dados) == 1
+    texto = texto.replace(ancora_dados, ancora_dados + campo_faturamento)
+
+    inicio = texto.index("7. Portão de Faturamento")
+    fim = texto.index("\n\n## TOOLS")
+    texto = texto[:inicio] + _FASES_7_8_9 + texto[fim:]
+
+    inicio_inv = texto.index("### Sequência de Agendamento (INVIOLÁVEL):")
+    fim_inv = texto.index("\n\n### Segurança")
+    texto = texto[:inicio_inv] + _SEQUENCIA_INVIOLAVEL + texto[fim_inv:]
+
     return texto
 
 
 def test_prompt_e_identico_a_evidencia_com_as_mudancas_documentadas():
-    """Golden test: SYSTEM_PROMPT == evidência + as 5 mudanças documentadas.
+    """Golden test: SYSTEM_PROMPT == evidência + as 6 mudanças documentadas.
 
     Qualquer deriva no SOP — apagar um parágrafo, reescrever uma frase,
     mudar a ordem de uma fase — quebra este teste, mesmo que nenhuma das
@@ -154,13 +200,14 @@ FASES_SOP = {
     4: "4. Ponte e Transição (O Micro-Compromisso):",
     5: "5. Disponibilidade de Agenda:",
     6: "6. Portão de E-mail:",
-    7: "7. Portão de Faturamento (OBRIGATÓRIO ANTES DE AGENDAR):",
-    8: "8. Agendamento (Final):",
+    7: "7. Agendamento:",
+    8: "8. Qualificação por Faturamento (após agendar):",
+    9: "9. Desfecho por faixa (INVIOLÁVEL):",
 }
 
 
 @pytest.mark.parametrize("fase, cabecalho", sorted(FASES_SOP.items()))
-def test_prompt_tem_as_nove_fases_do_sop(fase, cabecalho):
+def test_prompt_tem_as_dez_fases_do_sop(fase, cabecalho):
     """Fase 0 inclusa: é ela que impede a Renata de repetir a saudação."""
     assert f"\n{cabecalho}" in SYSTEM_PROMPT, (
         f"fase {fase} sumiu ou mudou de título no SOP"

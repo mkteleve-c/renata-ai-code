@@ -44,7 +44,7 @@ logger = structlog.get_logger()
 FUSO = ZoneInfo("America/Sao_Paulo")
 
 # Os quatro placeholders do prompt. `{Nome}` NÃO está aqui de propósito.
-CAMPOS = ("nome", "origem", "telefone", "data_hoje")
+CAMPOS = ("nome", "origem", "telefone", "data_hoje", "faturamento")
 
 # Lead sem nome é rotina — o gate grava `nullif(pushName, '')`. Sem sentinel,
 # o SOP renderiza "Oi, !" e pode ecoar o vazio para o lead.
@@ -136,13 +136,18 @@ def contexto_vazio(telefone: str = "") -> dict[str, str]:
         "origem": "",
         "telefone": telefone,
         "data_hoje": formatar_data_hoje(),
+        # Vazio, e não um sentinel: o SOP distingue "sei a faixa, confirmo"
+        # de "não sei, pergunto" justamente por este campo estar preenchido
+        # ou não. Um `NOME_AUSENTE` aqui faria a Renata "confirmar" um
+        # faturamento que ninguém declarou.
+        "faturamento": "",
     }
 
 
 async def carregar_contexto(
     pool: AsyncConnectionPool, phone_e164: str
 ) -> dict[str, str]:
-    """Lê nome e origem do lead em `leads_crm`. Nunca levanta.
+    """Lê nome, origem e faturamento do lead em `leads_crm`. Nunca levanta.
 
     `phone_e164` é a representação do harness (`+5511955554444`, em
     `message_queue.phone_number` e no `thread_id`); `leads_crm.phone` é a
@@ -165,7 +170,8 @@ async def carregar_contexto(
     try:
         async with pool.connection() as conn:
             cur = await conn.execute(
-                "select name, source from leads_crm where phone = %s",
+                "select name, source, faturamento_mensal "
+                "from leads_crm where phone = %s",
                 (canonico,),
             )
             linha = await cur.fetchone()
@@ -177,9 +183,12 @@ async def carregar_contexto(
         logger.info("contexto_lead_ausente", phone=canonico)
         return contexto
 
-    nome, origem = linha
+    nome, origem, faturamento = linha
     contexto["nome"] = sanitizar_nome(nome)
     contexto["origem"] = origem or ""
+    # Preenchido pelos formulários (YAY FORMS, LinkedIn) via n8n, ou por
+    # `update_crm` num turno anterior. Vazio = ninguém declarou ainda.
+    contexto["faturamento"] = (faturamento or "").strip()
     return contexto
 
 
