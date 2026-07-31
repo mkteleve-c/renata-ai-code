@@ -421,6 +421,33 @@ async def aplicar_gate(
             )
             return ResultadoGate(False, "fora_da_allowlist", canonico)
 
+        # Em horário comercial quem atende é gente, pelo ChatWoot. A Renata
+        # cobre a noite, a madrugada e o fim de semana.
+        #
+        # DEPOIS de `from_me` pelo mesmo motivo da allowlist, e aqui o risco
+        # é maior: o `fromMe` é o atendente respondendo, e ele acontece
+        # JUSTAMENTE dentro desta janela. Barrar antes dele faria o handover
+        # nunca registrar — todo dia útil, não ocasionalmente.
+        #
+        # `last_inbound_at` sobe igual: o lead falou, e o relógio da janela
+        # de 24h da Cloud API não pode congelar só porque quem respondeu foi
+        # humano.
+        if settings.em_horario_comercial():
+            if lead_view:
+                await cur.execute(
+                    "update leads_crm set last_inbound_at = now(), "
+                    "followup_count = 0, followup_active = false "
+                    "where phone in (%s, %s)",
+                    (com_9, sem_9),
+                )
+            logger.info(
+                "gate_descartado",
+                motivo="horario_comercial",
+                telefone=canonico,
+                lead_existente=bool(lead_view),
+            )
+            return ResultadoGate(False, "horario_comercial", canonico)
+
         if legada is not None and mesclado is not None:
             lead = await _persistir_consolidacao(
                 cur, canonico, mesclado, legada["phone"]

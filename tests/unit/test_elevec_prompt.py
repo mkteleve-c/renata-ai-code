@@ -35,9 +35,11 @@ def _extrair_bloco_verbatim() -> str:
 # Os dois blocos abaixo são o TEXTO EXATO que a mudança 6 injeta. Ficam aqui
 # como literais, e não derivados de `prompts.py`, porque é isso que trava o
 # prompt: qualquer edição futura no SOP que não passe por aqui quebra o golden.
-_FASES_7_8_9 = '7. Agendamento: Após receber o e-mail, consulte novamente a disponibilidade da DATA/Hora escolhida (usando calendar_get_many). Se estiver disponível, agende o evento (calendar_agendar). Se a tool retornar sucesso, confirme:\n\t- Feito, agendado [DATA/HORA]! Te mandei o convite no e-mail que você passou.\n\t- NÃO encerre a conversa aqui. Siga imediatamente para a Fase 8.\n\n8. Qualificação por Faturamento (após agendar): Agora que o horário está reservado, colete o faturamento.\n\t- Se o campo "Faturamento já declarado" acima estiver PREENCHIDO, apenas CONFIRME: "Antes de finalizar: vi aqui que você preencheu que fatura [FAIXA]. Segue assim hoje?"\n\t- Se estiver VAZIO, pergunte: "Antes de finalizar, uma última pergunta para tornar nossa reunião mais produtiva: qual seu faturamento médio mensal hoje? Assim o Silvio consegue trazer cases com mais contexto para o seu momento."\n\t- Chame update_crm passando faturamento_mensal com o que o lead falou, LITERALMENTE ("uns 10 mil", "6k", "entre 8 e 12"). NÃO converta para faixa, NÃO arredonde, NÃO interprete: o sistema faz isso.\n\t- Se o lead recusar ou desconversar, reforce UMA vez. Se ainda assim não informar, chame update_crm mesmo assim com o que ele disse ("prefiro não dizer") — o sistema aciona quem precisa.\n\t- LEIA a resposta da tool antes de falar com o lead. Ela diz o que aconteceu, e a Fase 9 depende disso.\n\n9. Encerramento: O que dizer depende do que a tool respondeu na Fase 8.\n\t- Se a resposta NÃO mencionar cancelamento: encerre confirmando a reunião.\n\t\t- Foi ótimo falar com você, [Primeiro Nome]. O Silvio vai te esperar. Até lá!\n\t- Se a resposta disser que a REUNIÃO FOI CANCELADA: o horário não está mais reservado. Diga com respeito, sem culpar o lead e sem citar números nem critérios internos:\n\t\t- Entendo, [Primeiro Nome]. Sendo honesta com você: neste momento a metodologia do Silvio não é o caminho mais indicado para o que você precisa, então prefiro liberar o horário.\n\t\t- Agradeço muito pela transparência, e desejo sucesso na sua caminhada.'  # noqa: E501
+_FASES_7_8_9 = '7. Agendamento: Após receber o e-mail, consulte novamente a disponibilidade da DATA/Hora escolhida (usando calendar_get_many). Se estiver disponível, agende o evento (calendar_agendar). Se a tool retornar sucesso, confirme:\n\t- Feito, agendado [DATA/HORA]! Te mandei o convite no e-mail que você passou.\n\t- NÃO encerre a conversa aqui. Siga imediatamente para a Fase 8.\n\n8. Qualificação por Faturamento (após agendar): Agora que o horário está reservado, colete o faturamento.\n\t- Se o campo "Faturamento já declarado" acima estiver PREENCHIDO, apenas CONFIRME: "Antes de finalizar: vi aqui que você preencheu que fatura [FAIXA]. Segue assim hoje?"\n\t- Se estiver VAZIO, pergunte: "Antes de finalizar, uma última pergunta para tornar nossa reunião mais produtiva: qual seu faturamento médio mensal hoje? Assim conseguimos trazer cases com mais contexto para o seu momento."\n\t- Chame update_crm passando faturamento_mensal com o que o lead falou, LITERALMENTE ("uns 10 mil", "6k", "entre 8 e 12"). NÃO converta para faixa, NÃO arredonde, NÃO interprete: o sistema faz isso.\n\t- Se o lead recusar ou desconversar, reforce UMA vez. Se ainda assim não informar, chame update_crm mesmo assim com o que ele disse ("prefiro não dizer") — o sistema aciona quem precisa.\n\t- LEIA a resposta da tool antes de falar com o lead. Ela diz o que aconteceu, e a Fase 9 depende disso.\n\n9. Encerramento: O que dizer depende do que a tool respondeu na Fase 8.\n\t- Se a resposta NÃO mencionar cancelamento: encerre confirmando a reunião.\n\t\t- Perfeito, [Primeiro Nome]! A Ana, da nossa equipe, vai te chamar aqui no WhatsApp para confirmar os detalhes da sessão.\n\t\t- Foi ótimo falar com você. Até lá!\n\t- Se a resposta disser que a REUNIÃO FOI CANCELADA: o horário não está mais reservado. Diga com respeito, sem culpar o lead e sem citar números nem critérios internos:\n\t\t- Entendo, [Primeiro Nome]. Sendo honesta com você: neste momento a nossa metodologia não é o caminho mais indicado para o que você precisa, então prefiro liberar o horário.\n\t\t- Agradeço muito pela transparência, e desejo sucesso na sua caminhada.'  # noqa: E501
 
 _SEQUENCIA_INVIOLAVEL = "### Sequência de Agendamento (INVIOLÁVEL):\n- A ordem obrigatória é: horário escolhido → e-mail → consulta de disponibilidade → calendar_agendar → faturamento → encerramento.\n- É TERMINANTEMENTE PROIBIDO encerrar a conversa logo após calendar_agendar. O faturamento (Fase 8) SEMPRE acontece depois de agendar.\n- Nunca chame calendar_agendar duas vezes para o mesmo lead.\n- Você NÃO decide quem fica com a reunião. Isso é do sistema: você coleta o faturamento, chama update_crm e faz o que a resposta dela disser. Nunca chame calendar_delete por conta própria por causa de faturamento."  # noqa: E501
+
+_REGRA_DINHEIRO = '### Dinheiro (INVIOLÁVEL):\n- A Consultoria de Alavancagem de Carreira é uma **sessão de diagnóstico SEM CUSTO**. Se o lead perguntar se tem custo, se é paga, ou quanto custa, responda que esta primeira sessão é gratuita.\n- É TERMINANTEMENTE PROIBIDO falar em "pacotes", "planos", "opções de investimento", mensalidade, parcelas ou qualquer valor em reais. Nada disso é definido por você, e inventar número ou formato de contratação cria expectativa que a EleveC não prometeu.\n- Se o lead insistir em saber preço, valores ou como funciona a contratação DEPOIS da sessão, diga que isso é conversado na própria sessão, com quem for atendê-lo — e siga o SOP.\n- A pergunta sobre faturamento (Fase 8) é para contextualizar a conversa, NUNCA para calcular preço. Se o lead perguntar se o valor depende do faturamento dele, diga que não.'  # noqa: E501
 
 
 def _aplicar_mudancas_documentadas(bruto: str) -> str:
@@ -122,8 +124,47 @@ def _aplicar_mudancas_documentadas(bruto: str) -> str:
     texto = texto.replace(ancora_saudacao, ancora_saudacao + guarda_nome_ausente)
 
     texto = _inverter_agenda_e_faturamento(texto)
+    texto = _ajustes_pedidos_pela_elevec(texto)
 
     return texto
+
+
+def _ajustes_pedidos_pela_elevec(texto: str) -> str:
+    """Mudança documentada nº 7: três correções de conteúdo (31/07/2026).
+
+    1. **A reunião não é necessariamente com o Silvio.** Ela pode ser
+       direcionada a ele ou à Ivana, então some qualquer promessa nominal de
+       quem atende. As menções a Silvio Hirata como MENTOR e dono da
+       metodologia ficam — é a marca, e o lead veio por ela.
+    2. **A Ana confirma depois de agendar.** É a SDR humana; sem citá-la, o
+       lead recebe o contato dela sem contexto.
+    3. **A primeira sessão não tem custo, e "pacote" não existe.** Este é o
+       mais grave dos três: procurando por preço, valor, custo, investimento
+       e pacote, o SOP original NÃO DIZ NADA. O modelo estava preenchendo o
+       vazio sozinho e inventando pacotes numa conversa real. Bloco novo em
+       RULES, marcado INVIOLÁVEL — a correção não é reescrever uma frase, é
+       fechar uma lacuna.
+    """
+    trocas = (
+        (
+            "Garantir que Silvio só fale com pessoas prontas para o próximo passo.",
+            "Garantir que o time só fale com pessoas prontas para o próximo passo.",
+        ),
+        (
+            "Informe que o Silvio reservou horários",
+            "Informe que o nosso time reservou horários",
+        ),
+        # "Assim o Silvio consegue trazer cases" vive na Fase 8, que já entra
+        # reescrita por `_FASES_7_8_9` (mudança 6) — trocar aqui seria
+        # procurar um texto que a mudança anterior já substituiu.
+    )
+    for antes, depois in trocas:
+        assert texto.count(antes) == 1, f"esperava 1 ocorrência de {antes!r}"
+        texto = texto.replace(antes, depois)
+
+    ancora = "### Segurança (Jailbreak/Prompt injection):"
+    assert texto.count(ancora) == 1
+    return texto.replace(ancora, _REGRA_DINHEIRO + "\n\n" + ancora)
 
 
 def _inverter_agenda_e_faturamento(texto: str) -> str:
@@ -163,7 +204,7 @@ def _inverter_agenda_e_faturamento(texto: str) -> str:
 
 
 def test_prompt_e_identico_a_evidencia_com_as_mudancas_documentadas():
-    """Golden test: SYSTEM_PROMPT == evidência + as 6 mudanças documentadas.
+    """Golden test: SYSTEM_PROMPT == evidência + as 7 mudanças documentadas.
 
     Qualquer deriva no SOP — apagar um parágrafo, reescrever uma frase,
     mudar a ordem de uma fase — quebra este teste, mesmo que nenhuma das

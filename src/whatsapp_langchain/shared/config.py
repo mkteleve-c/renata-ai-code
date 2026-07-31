@@ -13,7 +13,9 @@ A maior parte das configurações tem defaults sensatos para desenvolvimento loc
 Segredos compartilhados do painel/admin devem ser preenchidos explicitamente.
 """
 
+from datetime import datetime
 from typing import Annotated, Any
+from zoneinfo import ZoneInfo
 
 from pydantic import SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
@@ -21,6 +23,9 @@ from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 from whatsapp_langchain.shared.phone import canonicalizar
 
 MIN_PRODUCTION_SECRET_LENGTH = 32
+
+# O mesmo fuso que `contexto.py` usa para {data_hoje}.
+_FUSO_COMERCIAL = ZoneInfo("America/Sao_Paulo")
 
 # Formas aceitas para FOLLOWUP_ENABLED além do `true`/`false` nativo do
 # pydantic — o valor nativo já rejeita até `" false "` com espaço (ver
@@ -230,6 +235,62 @@ class Settings(BaseSettings):
     embedding_model: str = "openai/text-embedding-3-small"
     embedding_dims: int = 1536
     memory_search_limit: int = 5
+
+    # --- Horário comercial (quem atende é gente, não a Renata) ---
+    # Dentro da janela, o gate descarta a mensagem: o time responde pelo
+    # ChatWoot, que é a caixa de entrada humana. A Renata existe para a
+    # noite, a madrugada e o fim de semana, quando não há ninguém.
+    #
+    # Isto é `if` e não parágrafo no SOP pelo mesmo motivo de `faixas.py`:
+    # pedir ao modelo que não responda seria obedecido às vezes, e o erro
+    # aqui é visível para o lead — a Renata falando por cima de um atendente
+    # que já está digitando.
+    #
+    # `inicio == fim` desliga. Default desligado: o template é herdado por
+    # outros clientes, e uma janela que ligasse sozinha faria a Renata deles
+    # emudecer metade do dia útil sem ninguém ter pedido.
+    horario_comercial_inicio: int = 0
+    horario_comercial_fim: int = 0
+
+    @model_validator(mode="after")
+    def _validar_horario_comercial(self) -> "Settings":
+        if self.horario_comercial_inicio > self.horario_comercial_fim:
+            raise ValueError(
+                "HORARIO_COMERCIAL_INICIO não pode ser maior que "
+                "HORARIO_COMERCIAL_FIM — janela atravessando a meia-noite não "
+                "é suportada, e uma janela vazia deixaria a Renata atendendo "
+                "o dia inteiro sem ninguém perceber."
+            )
+        return self
+
+    @property
+    def horario_comercial_ativo(self) -> bool:
+        return self.horario_comercial_inicio != self.horario_comercial_fim
+
+    def em_horario_comercial(self, momento: datetime | None = None) -> bool:
+        """`True` quando o time humano está de plantão e a Renata cala.
+
+        Segunda a sexta, `inicio` inclusivo e `fim` exclusivo: 8h em ponto já
+        é expediente, 18h em ponto já não é. Sem convenção explícita o minuto
+        da virada fica indefinido e uma mensagem por dia se comporta de um
+        jeito que ninguém consegue explicar.
+
+        Fuso `America/Sao_Paulo`, o mesmo de `{data_hoje}` no prompt — e
+        `datetime` sem tz é interpretado nele, não em UTC. UTC deslocaria a
+        janela em 3 horas: calaria de madrugada e responderia à tarde.
+        """
+        if not self.horario_comercial_ativo:
+            return False
+
+        agora = momento or datetime.now(_FUSO_COMERCIAL)
+        if agora.tzinfo is None:
+            agora = agora.replace(tzinfo=_FUSO_COMERCIAL)
+        else:
+            agora = agora.astimezone(_FUSO_COMERCIAL)
+
+        if agora.weekday() > 4:  # sábado e domingo
+            return False
+        return self.horario_comercial_inicio <= agora.hour < self.horario_comercial_fim
 
     # --- Allowlist (janela de teste em produção) ---
     # Trava oposta à blocklist: quando NÃO está vazia, ninguém fora dela é

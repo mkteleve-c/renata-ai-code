@@ -273,3 +273,81 @@ async def test_regua_reivindica_normalmente_quem_esta_na_allowlist(
     assert any(r.phone == PERMITIDO_CANONICO for r in reivindicados), (
         "quem está na allowlist parou de ser reivindicado"
     )
+
+
+# --- Horário comercial: quem atende é gente --------------------------------
+
+
+@pytest.fixture
+def em_expediente(monkeypatch):
+    """Força "estamos em horário comercial" nos módulos que leem `settings`."""
+    s = Settings(_env_file=None, horario_comercial_inicio=8, horario_comercial_fim=18)
+    monkeypatch.setattr(s.__class__, "em_horario_comercial", lambda *_a, **_k: True)
+    for mod in (config_mod, leads_mod, followup_mod):
+        monkeypatch.setattr(mod, "settings", s, raising=True)
+    return s
+
+
+async def test_em_horario_comercial_a_renata_nao_atende(em_expediente, limpar):
+    pool = await get_pool()
+    r = await aplicar_gate(pool, _jid(DE_FORA), push_name="Lead Real")
+
+    assert r.aceito is False
+    assert r.motivo == "horario_comercial"
+
+
+async def test_horario_comercial_nao_engole_o_handover_humano(em_expediente, limpar):
+    """O `fromMe` acontece JUSTAMENTE em horário comercial — é o atendente
+    respondendo.
+
+    Se a janela barrasse antes dele, o handover nunca registraria: seria o
+    mesmo defeito que a allowlist tinha, agora garantido de acontecer todo
+    dia útil em vez de ocasionalmente.
+    """
+    pool = await get_pool()
+    async with pool.connection() as conn:
+        await conn.execute(
+            "insert into leads_crm (phone, name, agent_active, followup_active) "
+            "values (%s, 'Lead', true, true)",
+            (DE_FORA_CANONICO,),
+        )
+
+    r = await aplicar_gate(pool, {**_jid(DE_FORA), "fromMe": True}, push_name=None)
+    assert r.motivo == "from_me"
+
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            "select agent_active from leads_crm where phone = %s", (DE_FORA_CANONICO,)
+        )
+        assert (await cur.fetchone())[0] is False
+
+
+async def test_horario_comercial_ainda_move_last_inbound_at(em_expediente, limpar):
+    """O lead falou — o relógio da janela de 24h da Cloud API precisa andar,
+    mesmo que quem responda seja humano. Mesmo precedente do ramo
+    `agente_desligado` e da allowlist."""
+    pool = await get_pool()
+    async with pool.connection() as conn:
+        await conn.execute(
+            "insert into leads_crm (phone, name, last_inbound_at) "
+            "values (%s, 'Lead', now() - interval '5 hours')",
+            (DE_FORA_CANONICO,),
+        )
+
+    await aplicar_gate(pool, _jid(DE_FORA), push_name=None)
+
+    async with pool.connection() as conn:
+        cur = await conn.execute(
+            "select now() - last_inbound_at < interval '1 minute' "
+            "from leads_crm where phone = %s",
+            (DE_FORA_CANONICO,),
+        )
+        assert (await cur.fetchone())[0] is True
+
+
+async def test_fora_do_expediente_atende_normalmente(limpar):
+    """Contraprova: com a janela desligada (default), nada muda."""
+    pool = await get_pool()
+    r = await aplicar_gate(pool, _jid(DE_FORA), push_name="Lead Real")
+
+    assert r.aceito is True
