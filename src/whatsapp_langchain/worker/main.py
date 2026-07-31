@@ -286,7 +286,8 @@ async def main() -> None:
         allowlist_permitidos=len(settings.allowlist_phones),
         allowlist_descartadas=settings.allowlist_descartadas,
         horario_comercial=(
-            f"{settings.horario_comercial_inicio}-{settings.horario_comercial_fim} seg-sex"
+            f"{settings.horario_comercial_inicio}-"
+            f"{settings.horario_comercial_fim} seg-sex"
             if settings.horario_comercial_ativo
             else "desligado"
         ),
