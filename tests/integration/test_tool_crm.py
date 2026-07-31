@@ -508,7 +508,12 @@ async def test_persiste_email_e_faturamento(limpar, turno, pipedrive):
 
     lido = await ler_lead()
     assert lido["email"] == "ana@exemplo.com"
-    assert lido["faturamento_mensal"] == "uns 30 mil"
+    # O texto cru do lead NÃO chega ao banco: `update_crm` normaliza para a
+    # faixa do funil (`faixas.py`), que é o mesmo valor que os formulários
+    # gravam. Duas grafias do mesmo faturamento fariam o relatório não fechar
+    # — e é da faixa, não do texto, que dependem o cancelamento abaixo de
+    # R$ 5 mil e o encaminhamento acima de R$ 25 mil.
+    assert lido["faturamento_mensal"] == "Acima de R$25 mil/mês"
 
 
 async def test_campos_vazios_nao_apagam_o_cadastro(limpar, turno, pipedrive):

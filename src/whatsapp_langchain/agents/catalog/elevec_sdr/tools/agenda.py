@@ -25,8 +25,11 @@ mesma checagem de sobreposição cuida do resto, sem caso especial.
 certas listagens; tratá-los como ocupados esconderia horários livres.
 
 **Os portões do SOP são `if`, não parágrafo.** `calendar_agendar` recusa
-enquanto o lead não tiver e-mail *e* faturamento mensal, e devolve ao agente
-a fase para onde voltar (6 ou 7). O prompt chama a sequência de "INVIOLÁVEL"
+enquanto o lead não tiver e-mail, e devolve ao agente a fase para onde
+voltar. O faturamento deixou de ser portão daqui: ele é coletado DEPOIS de
+agendar, e `update_crm` é quem classifica a faixa e aplica a consequência
+(cancelar abaixo de R$ 5 mil, encaminhar acima de R$ 25 mil) — de novo por
+`if`, não por parágrafo. O prompt chama a sequência de "INVIOLÁVEL"
 e "TERMINANTEMENTE PROIBIDO" — três parágrafos pedem, um `if` garante. Como
 nenhuma outra tool grava esses dois campos (o n8n coletava e nunca
 persistia: 0 leads com e-mail no banco de origem), `calendar_agendar` aceita
@@ -870,20 +873,18 @@ async def calendar_get_many(periodo: str = "qualquer", a_partir_de: str = "") ->
 async def calendar_agendar(
     inicio: str,
     email: str = "",
-    faturamento_mensal: str = "",
 ) -> str:
     """Agenda a Consultoria de Alavancagem de Carreira no horário escolhido.
 
-    Só chame depois de ter (a) o e-mail do lead e (b) o faturamento médio
-    mensal. Sem os dois a tool recusa.
+    Só chame depois de ter o e-mail do lead — sem ele a tool recusa. O
+    faturamento NÃO é pré-requisito: ele é coletado depois de agendar, via
+    `update_crm`, que é quem classifica a faixa e decide o desfecho.
 
     Args:
         inicio: data e hora escolhidas, em `AAAA-MM-DDTHH:MM` (hora cheia,
             dia útil, a partir de amanhã).
         email: e-mail informado pelo lead. Passe sempre que tiver acabado de
             recebê-lo — é o que vai receber o convite.
-        faturamento_mensal: faturamento médio mensal como o lead falou
-            ("uns 30 mil"). Passe sempre que tiver acabado de recebê-lo.
 
     A tool reconsulta a disponibilidade antes de criar e recusa se o horário
     estiver ocupado.
@@ -902,15 +903,6 @@ async def calendar_agendar(
         return interno(
             "Ainda não tenho um e-mail válido deste lead — volte à Fase 6 e "
             "peça o melhor e-mail dele antes de agendar."
-        )
-
-    faturamento_final = _preferir_coluna(
-        lead.get("faturamento_mensal"), faturamento_mensal, "faturamento_mensal"
-    )
-    if not faturamento_final:
-        return interno(
-            "Ainda não tenho o faturamento médio mensal deste lead — volte à "
-            "Fase 7 e pergunte antes de agendar."
         )
 
     # Lead com evento vivo no cadastro não agenda de novo: marcar um segundo
@@ -1016,7 +1008,6 @@ async def calendar_agendar(
         telefone,
         google_event_id=event_id,
         email=email_final,
-        faturamento_mensal=faturamento_final,
     )
 
     # O convite só sai do `events.insert`; no caminho 409 nada é inserido.

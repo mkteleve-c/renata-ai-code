@@ -33,6 +33,7 @@ from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langgraph.checkpoint.memory import InMemorySaver
 
+from whatsapp_langchain.agents.catalog.elevec_sdr.faixas import FAIXAS
 from whatsapp_langchain.agents.catalog.elevec_sdr.saida import extrair_baloes
 from whatsapp_langchain.agents.catalog.elevec_sdr.tools import agenda, crm, handover
 from whatsapp_langchain.agents.catalog.elevec_sdr.tools.interno import PREFIXO_INTERNO
@@ -548,9 +549,19 @@ async def test_desfecho_por_faixa_de_faturamento(
 ):
     """As faixas do `nXuIqeQ0tBialBsR` (YAY FORMS), com o modelo real.
 
-    O caso `<5k` é o que prova a decisão central: o corte de R$ 5 mil vale
-    mesmo depois de agendar, e o evento **não pode sobreviver**. Os outros
-    três provam o oposto — que ninguém acima do corte perde a reunião.
+    **Isto é fumaça, não a garantia.** A garantia do desfecho é
+    determinística e mora em `test_desfecho_faixa.py` (8 casos) e
+    `test_faixa_faturamento.py` (40) — nenhum deles chama LLM, nenhum
+    oscila. Este teste existe para responder outra pergunta: percorrendo a
+    conversa inteira com o modelo de verdade, ela chega a coletar o
+    faturamento e passar para `update_crm`?
+
+    Ele PODE falhar por variância: o roteiro tem 8 falas enlatadas e, se o
+    modelo perguntar outra coisa num turno do meio, as respostas deixam de
+    encaixar e a conversa não chega ao agendamento. Falha aqui com o estado
+    vazio (`iniciou_conversa`, sem e-mail, sem evento) é isso — não é
+    regressão do desfecho. Falha com o estado PREENCHIDO e a consequência
+    errada, sim.
     """
     from whatsapp_langchain.agents.catalog.elevec_sdr.agent import build_graph
 
@@ -563,7 +574,9 @@ async def test_desfecho_por_faixa_de_faturamento(
     chamadas = [nome for turno in turnos for nome in turno.tool_calls]
     estado = await estado_do_lead()
 
-    assert estado["faturamento_mensal"], "não registrou o faturamento"
+    assert estado["faturamento_mensal"] in FAIXAS, (
+        f"gravou {estado['faturamento_mensal']!r} em vez de uma faixa do funil"
+    )
 
     if espera_evento:
         assert estado["google_event_id"], f"{faixa}: perdeu a reunião indevidamente"
@@ -573,8 +586,12 @@ async def test_desfecho_por_faixa_de_faturamento(
             "abaixo de R$ 5 mil não pode ficar com reunião marcada"
         )
 
-    assert ("human_handover" in chamadas) is espera_handover, (
-        f"{faixa}: handover esperado={espera_handover}, chamadas={chamadas}"
+    # O handover NÃO é mais chamada do modelo: `update_crm` o dispara por
+    # dentro, a partir da faixa. O que se observa aqui é o efeito —
+    # `agent_active` desligado — e não a boa vontade do modelo em lembrar.
+    assert (estado["agent_active"] is False) is espera_handover, (
+        f"{faixa}: handover esperado={espera_handover}, "
+        f"agent_active={estado['agent_active']}, chamadas={chamadas}"
     )
     assert estado["phase"] == fase
 

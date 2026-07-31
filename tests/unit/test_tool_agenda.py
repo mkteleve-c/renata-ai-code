@@ -194,7 +194,6 @@ def lead(**campos: Any) -> dict[str, Any]:
         "phone": "551155554444",
         "name": "Ana",
         "email": "ana@exemplo.com",
-        "faturamento_mensal": "uns 30 mil",
         "google_event_id": None,
     }
     base.update(campos)
@@ -508,12 +507,22 @@ async def test_agendar_recusa_sem_email(turno, ambiente):
     assert not ambiente.gravacoes
 
 
-async def test_agendar_recusa_sem_faturamento(turno, ambiente):
+async def test_agendar_sem_faturamento_agora_agenda(turno, ambiente):
+    """A inversão, no nível da tool.
+
+    O faturamento era portão: `calendar_agendar` recusava e mandava "volte à
+    Fase 7". Era a maior fricção do funil — quem travava ali era perdido
+    inteiro, sem reunião e sem dado. Agora ele é coletado DEPOIS, e é
+    `update_crm` que classifica a faixa e aplica a consequência.
+
+    Mudar só o prompt não teria bastado: o portão vivia aqui, e o modelo
+    contornava passando `faturamento_mensal` para esta tool — que gravava o
+    texto cru, sem faixa, e sem disparar desfecho nenhum.
+    """
     ambiente.lead = lead(faturamento_mensal="")
     saida = await calendar_agendar.ainvoke({"inicio": "2026-02-12T13:00"})
-    assert "fase 7" in saida.lower()
-    assert not ambiente.cliente.criados
-    assert not ambiente.gravacoes
+    assert "fase 7" not in saida.lower()
+    assert ambiente.cliente.criados, "recusou agendar por falta de faturamento"
 
 
 async def test_agendar_recusa_email_que_nao_e_email(turno, ambiente):
@@ -545,7 +554,6 @@ async def test_agendar_cria_evento_e_grava_google_event_id(turno, ambiente):
             "telefone": TELEFONE,
             "google_event_id": esperado,
             "email": "ana@exemplo.com",
-            "faturamento_mensal": "uns 30 mil",
         }
     ]
     assert "12/02" in saida
@@ -586,7 +594,6 @@ async def test_agendar_avisa_quando_o_vinculo_nao_grava(turno, ambiente):
         {
             "inicio": "2026-02-12T13:00",
             "email": "ana@exemplo.com",
-            "faturamento_mensal": "30 mil",
         }
     )
     # O evento EXISTE — negar isso ao lead seria mentira na direção oposta.
@@ -837,17 +844,26 @@ async def test_agendar_ignora_o_proprio_evento_na_reconsulta(turno, ambiente):
     assert ambiente.cliente.criados
 
 
-async def test_agendar_persiste_email_e_faturamento_novos(turno, ambiente):
+async def test_agendar_persiste_email_novo_e_nao_toca_faturamento(turno, ambiente):
+    """A tool grava o e-mail que acabou de receber, e só ele.
+
+    `faturamento_mensal` saiu da assinatura: quem o grava é `update_crm`,
+    depois de normalizar para a faixa. Deixar esta tool aceitá-lo era o furo
+    que fazia o texto cru ("uns 3 mil por mês") chegar ao banco sem passar
+    pela classificação — e, com ele, sem disparar o cancelamento da faixa
+    abaixo do corte.
+    """
     ambiente.lead = lead(email=None, faturamento_mensal=None)
     await calendar_agendar.ainvoke(
         {
             "inicio": "2026-02-12T13:00",
             "email": "novo@exemplo.com",
-            "faturamento_mensal": "40 mil",
         }
     )
     assert ambiente.gravacoes[0]["email"] == "novo@exemplo.com"
-    assert ambiente.gravacoes[0]["faturamento_mensal"] == "40 mil"
+    assert "faturamento_mensal" not in ambiente.gravacoes[0], (
+        "a tool não pode mais escrever faturamento — quem faz isso é update_crm"
+    )
     assert ambiente.cliente.criados[0]["participantes"] == ["novo@exemplo.com"]
 
 

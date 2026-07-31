@@ -230,22 +230,28 @@ async def test_agendar_grava_o_event_id_no_lead(limpar, turno, agenda_dublada):
     assert "human_handover" not in saida
 
 
-async def test_agendar_persiste_email_e_faturamento_do_argumento(
+async def test_agendar_persiste_o_email_do_argumento_e_nada_de_faturamento(
     limpar, turno, agenda_dublada
 ):
+    """Agendar grava o e-mail; faturamento não passa mais por aqui.
+
+    Aceitá-lo nesta tool era o furo que deixava o texto cru do lead chegar ao
+    banco sem virar faixa — e, sem faixa, sem cancelamento abaixo do corte
+    nem encaminhamento acima de R$ 25 mil. Agora só `update_crm` escreve
+    esse campo, depois de normalizar.
+    """
     await criar_lead()
 
     await calendar_agendar.ainvoke(
         {
             "inicio": "2026-02-12T13:00",
             "email": "ana@exemplo.com",
-            "faturamento_mensal": "uns 30 mil",
         }
     )
 
     lido = await ler_lead()
     assert lido["email"] == "ana@exemplo.com"
-    assert lido["faturamento_mensal"] == "uns 30 mil"
+    assert lido["faturamento_mensal"] is None
 
 
 async def test_agendar_sem_lead_no_banco_avisa_e_nao_perde_o_evento(

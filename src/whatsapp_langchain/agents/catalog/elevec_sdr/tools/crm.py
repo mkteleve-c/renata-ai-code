@@ -81,6 +81,11 @@ from whatsapp_langchain.shared.phone import canonico_do_lead
 from whatsapp_langchain.shared.pipedrive import PipedriveClient
 
 from ..contexto import telefone_do_turno
+from ..faixas import (
+    ABAIXO_DO_CORTE,
+    ACIMA_DE_25K,
+    faixa_de_faturamento,
+)
 from .interno import interno
 
 logger = structlog.get_logger()
@@ -476,6 +481,86 @@ async def mover_card(pipedriveid: Any, phase: str) -> tuple[bool, str]:
     return True, ""
 
 
+async def _aplicar_desfecho(
+    telefone: str,
+    faixa: str | None,
+    informado: str,
+) -> list[str]:
+    """Executa a consequência da faixa e devolve o que dizer ao modelo.
+
+    Três desfechos, e nenhum depende de o modelo lembrar:
+
+    - **abaixo de R$ 5 mil**: cancela a reunião e aciona humano. O lead não
+      pode ficar com horário na agenda do Silvio.
+    - **acima de R$ 25 mil**: mantém a reunião e aciona humano. Lead grande
+      merece closer, não robô — é o ramo `>25k | Silvio` do YAY FORMS.
+    - **faixa indecidível** ("prefiro não dizer", "depende do mês"): NÃO
+      cancela nada e aciona humano. `None` é "não sei", nunca "zero";
+      tratar como abaixo do corte cancelaria a reunião de alguém que talvez
+      faturasse 50 mil.
+
+    Só roda quando o lead informou algo — a maioria das chamadas de
+    `update_crm` é transição de fase pura e não pode virar handover por
+    acidente.
+    """
+    if not informado.strip():
+        return []
+
+    if faixa in ABAIXO_DO_CORTE:
+        await cancelar_reuniao_do_lead(telefone)
+        await acionar_handover(
+            f"faturamento {faixa} está abaixo do mínimo — reunião cancelada"
+        )
+        return ["Reunião cancelada e responsável avisado."]
+
+    if faixa == ACIMA_DE_25K:
+        await acionar_handover("lead acima de R$ 25 mil — encaminhar para o Silvio")
+        return ["Responsável avisado para assumir este lead."]
+
+    if faixa is None:
+        await acionar_handover(
+            f"não consegui classificar o faturamento informado ({informado!r})"
+        )
+        return ["Não consegui classificar o faturamento; responsável avisado."]
+
+    return []
+
+
+async def cancelar_reuniao_do_lead(telefone: str) -> bool:
+    """Cancela a consultoria do lead do turno. Nunca levanta.
+
+    Import tardio de propósito: `agenda.py` importa
+    `reverter_fase_apos_cancelamento` deste módulo, então um import no topo
+    fecharia o ciclo. Reusar a tool `calendar_delete` (em vez de falar com o
+    cliente do Calendar direto) mantém as guardas que ela já tem —
+    `resolver_event_id`, recusa de id divergente, limpeza do
+    `google_event_id`.
+    """
+    from .agenda import calendar_delete
+
+    try:
+        await calendar_delete.ainvoke({})
+    except Exception as erro:
+        logger.error("crm_cancelamento_falhou", phone=telefone, erro=str(erro))
+        return False
+    return True
+
+
+async def acionar_handover(motivo: str) -> bool:
+    """Desliga o agente e avisa o responsável. Nunca levanta.
+
+    Mesmo motivo do import tardio acima.
+    """
+    from .handover import human_handover
+
+    try:
+        await human_handover.ainvoke({"motivo": motivo})
+    except Exception as erro:
+        logger.error("crm_handover_falhou", motivo=motivo, erro=str(erro))
+        return False
+    return True
+
+
 @tool
 async def update_crm(
     phase: str,
@@ -493,14 +578,37 @@ async def update_crm(
             `desqualificado` (bateu num fator de desqualificação).
         email: e-mail do lead, se você acabou de recebê-lo. Registrar aqui
             evita ter que repeti-lo na hora de agendar.
-        faturamento_mensal: faturamento médio mensal como o lead falou
-            ("uns 30 mil"), se você acabou de recebê-lo.
+        faturamento_mensal: faturamento médio mensal EXATAMENTE como o lead
+            falou ("uns 30 mil", "6k", "entre 8 e 12"). Não normalize nem
+            escolha faixa — esta tool faz isso e aplica a consequência.
     """
+    # A faixa e o desfecho são decididos AQUI, não no prompt. Medido com LLM
+    # real: pedindo no prompt, o modelo grava "20 mil" cru numa rodada e a
+    # faixa certa noutra, e chama `human_handover` às vezes. Duas
+    # consequências dependem disso e as duas mexem com gente — abaixo de
+    # R$ 5 mil a reunião é cancelada, acima de R$ 25 mil o lead vai para o
+    # Silvio. "`if` garante, prompt só pede" (docs/AGENTE_ELEVEC.md).
+    faixa = faixa_de_faturamento(faturamento_mensal)
+    # O texto cru é preservado: `_aplicar_desfecho` precisa saber que o lead
+    # DISSE alguma coisa, mesmo quando não deu para classificar. Sobrescrever
+    # a variável fazia "prefiro não dizer" virar string vazia, e o desfecho
+    # concluía que ninguém tinha informado nada — o handover não saía.
+    informado_bruto = faturamento_mensal
+    if faturamento_mensal.strip():
+        faturamento_mensal = faixa or ""
+
     alvo = (phase or "").strip().lower()
     if alvo not in FASES_PERMITIDAS:
         return interno(
             f"Fase '{phase}' não existe. Use uma de: {', '.join(FASES_PERMITIDAS)}."
         )
+
+    # Abaixo do corte, a fase pedida pelo modelo não vale: o funil da EleveC
+    # desqualifica quem fatura menos de R$ 5 mil, e era isso que o nó
+    # `DESQUALIFICADO (<5k)` do YAY FORMS fazia antes de a Renata sequer
+    # entrar na conversa.
+    if faixa in ABAIXO_DO_CORTE:
+        alvo = "desqualificado"
 
     telefone = telefone_do_turno()
     if not telefone:
@@ -574,6 +682,7 @@ async def update_crm(
     moveu, aviso_card = await mover_card(estado["pipedriveid"], alvo)
 
     partes = [f"Fase atualizada para '{alvo}'."]
+    partes.extend(await _aplicar_desfecho(telefone, faixa, informado_bruto))
     if alvo in DESLIGAM_FOLLOWUP:
         partes.append("Follow-up automático desligado.")
     if moveu:
